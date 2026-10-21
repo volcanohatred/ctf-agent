@@ -2,6 +2,8 @@
 
 Autonomous CTF (Capture The Flag) solver that races multiple AI models against challenges in parallel — now with a **mounted skill knowledge base**, **wall-clock degradation**, and a **fully Dockerized control plane**.
 
+> 📦 **安装指南（中文，含国内镜像一键拉取）请见 [INSTALL.md](INSTALL.md)。**
+
 Forked from Veria Labs' ctf-agent (52/52, 1st place at BSidesSF 2026 CTF), extended with ideas from Cairn (dual-phase timeout harvesting, structured negative-knowledge blackboard).
 
 ## What's Different in This Fork
@@ -63,12 +65,11 @@ resumes with a fresh direction — no silent 6-hour stalls.
 ## Quick Start (Docker — recommended)
 
 ```bash
-# 0. Pull prebuilt images (fastest — Aliyun ACR, great for CN networks):
+# 0. Pull prebuilt images (Aliyun ACR — fast in CN):
 docker pull crpi-6el9nmdepucmhr6v.cn-hangzhou.personal.cr.aliyuncs.com/ctf-qq/ctf-agent:latest
 docker pull crpi-6el9nmdepucmhr6v.cn-hangzhou.personal.cr.aliyuncs.com/ctf-qq/ctf-sandbox:latest
 docker tag  crpi-6el9nmdepucmhr6v.cn-hangzhou.personal.cr.aliyuncs.com/ctf-qq/ctf-agent:latest   ctf-agent:latest
 docker tag  crpi-6el9nmdepucmhr6v.cn-hangzhou.personal.cr.aliyuncs.com/ctf-qq/ctf-sandbox:latest ctf-sandbox:latest
-#    (alternative: ctf-agent is also on GHCR — ghcr.io/volcanohatred/ctf-agent:latest)
 #    (or build locally: docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .)
 
 # 1. Configure

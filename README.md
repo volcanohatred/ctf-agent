@@ -63,12 +63,12 @@ resumes with a fresh direction — no silent 6-hour stalls.
 ## Quick Start (Docker — recommended)
 
 ```bash
-# 0. Either build locally (slow, ~1h for the sandbox image):
-docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
-docker build -t ctf-agent .
-#    ...or pull the prebuilt images from GHCR:
+# 0. Pull the prebuilt agent image (small) from GHCR:
 docker pull ghcr.io/volcanohatred/ctf-agent:latest
-docker pull ghcr.io/volcanohatred/ctf-sandbox:latest
+#    The 17 GB sandbox image is NOT published — build it locally once
+#    (~1 h depending on network):
+docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
+#    (The compose service builds ctf-agent automatically if absent.)
 
 # 1. Configure
 cp .env.example .env

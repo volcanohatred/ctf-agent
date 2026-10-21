@@ -63,24 +63,29 @@ resumes with a fresh direction — no silent 6-hour stalls.
 ## Quick Start (Docker — recommended)
 
 ```bash
-# 1. Build both images
+# 0. Either build locally (slow, ~1h for the sandbox image):
 docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
 docker build -t ctf-agent .
+#    ...or pull the prebuilt images from GHCR:
+docker pull ghcr.io/volcanohatred/ctf-agent:latest
+docker pull ghcr.io/volcanohatred/ctf-sandbox:latest
 
-# 2. Configure
+# 1. Configure
 cp .env.example .env
-# Edit .env: ANTHROPIC_API_KEY, GATEWAY_*, SKILLS_HOST_DIR, HOST_PROJECT_DIR
-#   - HOST_PROJECT_DIR: absolute path of THIS repo on the docker host
+# Edit .env:
+#   ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN  — unified gateway (Anthropic protocol)
+#   GATEWAY_BASE_URL / GATEWAY_API_KEY         — OpenAI-compatible endpoint (fallback)
+#   SKILLS_HOST_DIR — host path of your skill library root (contains ctf-web/ etc., optional)
+#   HOST_PROJECT_DIR — absolute path of THIS repo on the docker host
 #     (the agent spawns sandbox containers via the host docker socket)
-#   - SKILLS_HOST_DIR: host path of your skill library root (contains ctf-web/ etc.)
 
-# 3a. Full competition (coordinator mode)
+# 2a. Full competition (coordinator mode)
 docker compose run --rm --service-ports agent
 
-# 3b. Single challenge
-docker compose run --rm agent ctf-solve --challenge challenges/baby-pwn -v
+# 2b. Single challenge (bundled smoke test — no CTFd needed)
+docker compose run --rm agent ctf-solve --challenge challenges/example-static --no-submit -v
 
-# 3c. Offline benchmark over a local challenge set
+# 2c. Offline benchmark over a local challenge set
 docker compose run --rm agent ctf-bench --challenges-dir challenges --concurrency 2 -v
 
 # Operator hint to the running coordinator (second terminal)

@@ -7,8 +7,9 @@ logs/
 *.log
 *.jsonl
 
-# Challenge data (downloaded at runtime)
-challenges*/
+# Challenge data (downloaded at runtime) — except the bundled smoke-test sample
+challenges/*
+!challenges/example-static/
 
 # Python
 __pycache__/

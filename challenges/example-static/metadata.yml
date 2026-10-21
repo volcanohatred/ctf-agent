@@ -1,0 +1,7 @@
+name: example-static
+category: misc
+value: 10
+description: |
+  Smoke-test challenge for the offline pipeline (ctf-bench).
+  The file distfiles/note.txt contains a base64-encoded flag. Decode it and submit.
+flag: "flag{sm0k3_t3st_ok}"

@@ -1,0 +1,134 @@
+CTF SANDBOX TOOLS REFERENCE
+============================
+All tools pre-installed in the sandbox. cat /tools.txt to view this file.
+
+== NETWORKING ==
+nc / ncat          TCP/UDP connections. nc host port <<'EOF' for heredoc sessions.
+socat              Advanced relay (pty, ssl, exec). socat -,raw,echo=0 tcp:host:port
+rlwrap             Line editing around nc: rlwrap nc host port
+curl               HTTP client. -s silent, -k skip TLS, -d data, -H header.
+wget               HTTP download. wget -O file url.
+nmap / masscan     Port scanners. nmap -sV host, masscan -p1-65535 host --rate=10000
+hping3             Packet crafting. tcpdump / tshark for capture analysis.
+proxychains4       Proxy any tool: proxychains4 curl ...
+
+== BINARY ANALYSIS ==
+file / strings / xxd / hexedit
+binwalk            Firmware/embedded extraction. binwalk -e file
+objdump / readelf / nm   ELF inspection (binutils).
+radare2 (r2)       Reverse engineering. r2 -A binary; pdf @main; afl
+r2pipe             Python radare2 scripting (import r2pipe).
+lief               Python ELF/PE/Mach-O parsing. import lief
+jadx / apktool     Android APK decompile. jadx -d out app.apk
+pycdc              Python bytecode decompiler (3.9+). pycdc file.pyc
+uncompyle6         Python bytecode decompiler (<=3.8).
+flare-capa         Capability detection. capa binary
+yara               Pattern matching. yara rule.yar file
+
+== DEBUGGERS / EMULATION ==
+gdb + pwndbg       gdb ./binary (pwndbg loaded: checksec, telescope, rop)
+gdb-multiarch      Cross-arch debugging (ARM/MIPS binaries).
+gdbserver          Remote debugging. gdbserver :1234 ./binary
+ltrace / strace    Library/syscall tracing.
+qemu-user          Run foreign-arch binaries: qemu-arm ./binary
+qemu-system-x86/arm  Full VMs (kernel pwn). busybox/cpio/lz4 available for initramfs.
+angr / qiling      Python binary analysis & emulation frameworks.
+unicorn / keystone CPU emulator / assembler (Python).
+
+== PWN ==
+pwntools           from pwn import * — p64/remote/ROP/shellcraft.
+pwndbg             (see gdb)
+ropgadget / ropper ROP gadget finders.
+one_gadget         one_gadget libc.so.6 — find one-shot exec gadgets.
+seccomp-tools      seccomp-tools dump ./binary — analyze seccomp rules.
+pwninit            Auto patch binary with provided libc: pwninit
+patchelf           Patch ELF interpreter/RPATH for custom libc.
+gcc-multilib       32-bit compilation: gcc -m32 ...
+
+== STEGANOGRAPHY ==
+steghide / stegseek   JPEG/BMP/WAV embed-extract + password brute force.
+zsteg              PNG/BMP steg detector (LSB, bit planes).
+exiftool           EXIF/metadata reader.
+pngcheck           PNG structure checker. pngcheck -v file.png
+zbarimg            QR/barcode reader. zbarimg code.png
+qrencode           QR generator.
+stegano (py)       Python steg library.
+librosa (py)       Audio analysis (spectrograms etc).
+
+== IMAGE / MEDIA ==
+identify / convert / montage   ImageMagick.
+tesseract          OCR. tesseract image.png stdout --psm 6
+ffmpeg / sox       Audio/video. sox in.wav -n spectrogram -o spec.png
+opencv (cv2)       Python image processing (headless).
+
+== FILESYSTEM FORENSICS ==
+mmls / fls / icat / tsk_recover / fsstat   Sleuthkit disk analysis.
+foremost / scalpel         File carving.
+testdisk           Partition recovery.
+dcfldd             Forensic dd with hashing.
+volatility3        Memory forensics. vol -f mem.raw windows.info
+python-evtx        Windows event log parsing. pefile / oletools for PE/Office.
+cabextract         Windows cabinet files.
+poppler-utils      pdftotext, pdfimages. qpdf / mupdf-tools also available.
+
+== PASSWORD CRACKING ==
+john               john --wordlist=rockyou.txt hash.txt  (*2john extractors incl.)
+hashcat            hashcat -m <mode> hash.txt wordlist.txt
+fcrackzip          ZIP password brute force. fcrackzip -u -D -p rockyou.txt z.zip
+pdfcrack           PDF passwords.
+crunch             Wordlist generator.
+name-that-hash / hashid   Identify hash types.
+Wordlists: /usr/share/wordlists/rockyou.txt -> /opt/SecLists/...
+           Full SecLists at /opt/SecLists/ (Discovery/, Passwords/, ...)
+
+== CRYPTOGRAPHY ==
+openssl            enc, rsa, s_client, x509, dgst ...
+RsaCtfTool         Automated RSA attacks. RsaCtfTool -n N -e E --attack all
+crypto-attacks     /opt/crypto-attacks — Coppersmith/lattice attack library
+                   (import from its dir; fpylll+sympy already installed).
+sage               SageMath CAS (factor, ecm, LLL, small_roots, ...).
+cado-nfs           Number Field Sieve (large factoring/DLP). cado-nfs <N>
+flatter            Fast LLL lattice reduction. flatter < matrix
+gp (pari-gp)       Fast number theory CLI.
+cryptominisat      SAT solver (if available).
+hashpumpy (py)     Hash length extension. hashid/name-that-hash for ID.
+
+== WEB ==
+sqlmap             Automated SQLi: sqlmap -u URL --batch --dump
+ffuf / gobuster / dirb / wfuzz   Content & param fuzzing.
+                   Wordlists at /opt/SecLists/Discovery/Web-Content/
+nikto / whatweb / sslscan        Scanners & fingerprinting.
+jwt_tool           JWT attacks: jwt_tool <token> -T, -X a, -C -p wordlist
+flask-unsign (py)  Flask session cookie sign/verify/bruteforce.
+phpggc             PHP unserialize gadget chains: phpggc -l | phpggc Laravel/RCE1 system id
+GitTools           /opt/GitTools — Dumper/Extractor for exposed .git
+enum4linux         SMB/RPC enumeration (perl, /opt/enum4linux).
+impacket (py)      SMB/Kerberos/LDAP protocols. smbclient/ldap-utils too.
+wafw00f            WAF fingerprinting.
+nodejs/npm         Run JS payloads locally.
+php                php-cli for quick payload checks.
+adb                Android debug bridge (for APK challenges with devices).
+
+== BUILD / SCRIPTING ==
+gcc / g++ / make / cmake / autoconf
+python3 (+ venv)   pip list: pwntools pycryptodome sympy gmpy2 z3 fpylll angr
+                   capstone unicorn ropgadget flask volatility3 PyJWT pyghidra
+                   qiling frida lief scapy librosa sklearn opencv impacket sqlmap ...
+ruby               zsteg / one_gadget / seccomp-tools (gems).
+tmux / vim / less / jq / git / 7z / zip / unzip
+kaitaistruct (py)  Binary format parsing.
+
+== CONTAINERS (Podman) ==
+podman             Run challenge Docker images inside the sandbox.
+                   podman run -d -p 8080:80 challenge-image
+buildah            Build OCI images.
+
+== NOTES ==
+- Binaries run natively (x86-64). Use qemu-user for ARM/MIPS binaries.
+- Need a package not listed? Run `pip install <pkg>` or `apt-get install <pkg>`.
+- Distfiles are at /challenge/distfiles/ (read-only)
+- Write generated/repaired files to /challenge/workspace/ (writable)
+- Services on the host are reachable via host.docker.internal (bridge networking).
+- Skill library (if mounted) at /skills/ — read /skills/ctf-*/INDEX.md when stuck.
+- RsaCtfTool: /opt/RsaCtfTool/ | CADO-NFS: /opt/cado-nfs/ | SecLists: /opt/SecLists/
+- crypto-attacks: /opt/crypto-attacks/ | jwt_tool: /opt/jwt_tool/ | GitTools: /opt/GitTools/

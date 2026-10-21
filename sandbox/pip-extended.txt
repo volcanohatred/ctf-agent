@@ -1,0 +1,62 @@
+# Extended Python toolset for the CTF sandbox (best-effort install).
+# One package per line; the Dockerfile batch-installs these and falls back
+# to per-package installs so a single failure never kills the build.
+
+# crypto
+hashpumpy
+py_ecc
+ecdsa
+primefac
+
+# pwn / reverse
+ropper
+qiling
+frida-tools
+lief
+uncompyle6
+keystone-engine
+r2pipe
+
+# forensics / steg / misc
+stegano
+segno
+yara-python
+pefile
+oletools
+scapy
+dpkt
+librosa
+scikit-learn
+opencv-python-headless
+python-evtx
+dnspython
+dnslib
+exrex
+heatshrink2
+dissect.cobaltstrike
+pymongo
+brotli
+matplotlib
+openpyxl
+
+# web
+sqlmap
+flask-unsign
+httpx
+impacket
+arjun
+wafw00f
+
+# osint / hash-id
+shodan
+hashid
+name-that-hash
+
+# android
+objection
+
+# malware / reverse (large; includes ruleset)
+flare-capa
+
+# binary format parsing
+kaitaistruct

@@ -1,0 +1,154 @@
+"""Stdlib-only unit tests for the new core modules.
+
+Runs with plain `python tests/test_units.py` (no pytest required) and is also
+pytest-compatible. Heavy deps (pydantic-ai, aiodocker) are stubbed out.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+# Stub aiodocker before importing backend.sandbox (not installed locally).
+sys.modules.setdefault("aiodocker", types.ModuleType("aiodocker"))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from backend.message_bus import ChallengeMessageBus  # noqa: E402
+from backend.sandbox import to_host_path  # noqa: E402
+from backend.skills import SkillRouter  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# SkillRouter
+# ---------------------------------------------------------------------------
+
+def _make_fake_skills(root: Path) -> Path:
+    pwn = root / "ctf-pwn"
+    pwn.mkdir(parents=True)
+    (pwn / "INDEX.md").write_text(
+        "---\nname: ctf-pwn\ndescription: heap, stack, rop\n---\n"
+        "# ctf-pwn\n\n## Additional Resources\n"
+        "- `heap-techniques.md` — House of Orange, tcache poisoning\n"
+        "- `stack-basics.md` — ret2libc, canary\n",
+        encoding="utf-8",
+    )
+    (pwn / "heap-techniques.md").write_text("# heap\n", encoding="utf-8")
+    (pwn / "stack-basics.md").write_text("# stack\n", encoding="utf-8")
+
+    web = root / "ctf-web"
+    web.mkdir(parents=True)
+    (web / "INDEX.md").write_text("# ctf-web\n\n- `sqli.md` — union, blind\n", encoding="utf-8")
+    (web / "sqli.md").write_text("# sqli\n", encoding="utf-8")
+
+    wp = root / "zh-knowledge" / "CTF大赛WP集合" / "articles"
+    wp.mkdir(parents=True)
+    (wp / "heap-tcache-baby.meta.md").write_text(
+        "title: baby tcache\nvuln_type: heap\n"
+        "tags: [tcache, heap]\none_liner: tcache dup 劫持 free hook\n",
+        encoding="utf-8",
+    )
+    (wp / "heap-tcache-baby.md").write_text("# writeup\n", encoding="utf-8")
+    return root
+
+
+def test_triage_pwn() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        router = SkillRouter(skills_dir=str(_make_fake_skills(Path(td))))
+        assert router.enabled
+        packs = router.triage(
+            category="pwn", description="heap exploit with tcache", tags=[],
+            distfiles=["chal"],
+        )
+        assert packs and packs[0] == "ctf-pwn", packs
+
+
+def test_triage_by_extension() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        router = SkillRouter(skills_dir=str(_make_fake_skills(Path(td))))
+        packs = router.triage(category="", description="", distfiles=["capture.pcapng"])
+        assert "ctf-forensics" in packs, packs
+
+
+def test_triage_disabled_without_packs() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        router = SkillRouter(skills_dir=td)
+        assert not router.enabled
+        assert router.triage(category="pwn") == []
+        assert router.render_hint(["ctf-pwn"]) == ""
+
+
+def test_render_hint_levels() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        router = SkillRouter(skills_dir=str(_make_fake_skills(Path(td))))
+        h1 = router.render_hint(["ctf-pwn"], level=1)
+        assert "/skills/ctf-pwn/INDEX.md" in h1
+        assert "heap-techniques.md" in h1  # from the index excerpt
+        assert "level 1" in h1
+
+        h2 = router.render_hint(["ctf-pwn"], level=2)
+        assert "Full file list" in h2
+
+        h3 = router.render_hint(["ctf-pwn"], level=3, keywords=["tcache", "heap"])
+        assert "heap-tcache-baby.md" in h3, h3  # writeup match points at article
+        assert ".meta.md" not in h3
+
+
+def test_render_strips_frontmatter() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        router = SkillRouter(skills_dir=str(_make_fake_skills(Path(td))))
+        hint = router.render_hint(["ctf-pwn"], level=1)
+        assert "description: heap, stack, rop" not in hint
+
+
+# ---------------------------------------------------------------------------
+# Message bus (structured findings)
+# ---------------------------------------------------------------------------
+
+def test_bus_grouping() -> None:
+    async def _run() -> None:
+        bus = ChallengeMessageBus()
+        await bus.post("model-a", "ruled out format string — no write primitive", kind="excluded")
+        await bus.post("model-a", "libc base at 0x7f...", kind="fact")
+        await bus.broadcast("flag format is flag{...}")
+
+        unread = await bus.check("model-b")
+        assert len(unread) == 3  # model-b sees everything from model-a + broadcast
+        text = bus.format_unread(unread)
+        assert "Dead ends" in text and "Confirmed facts" in text and "Coordinator" in text
+        # cursor advanced
+        assert await bus.check("model-b") == []
+        # model-a does not see its own posts, only the broadcast
+        own = await bus.check("model-a")
+        assert len(own) == 1 and own[0].kind == "broadcast"
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# DooD path translation
+# ---------------------------------------------------------------------------
+
+def test_host_path_translation() -> None:
+    mapping = ("/app", "D:/code/ctf/proj")
+    assert to_host_path("/app/challenges/x/distfiles", mapping) == \
+        "D:/code/ctf/proj/challenges/x/distfiles"
+    assert to_host_path("/etc/passwd", mapping) == "/etc/passwd"
+    assert to_host_path("/app/x", None) == "/app/x"
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"PASS {fn.__name__}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"FAIL {fn.__name__}: {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)

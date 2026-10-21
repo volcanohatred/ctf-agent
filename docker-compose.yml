@@ -1,0 +1,48 @@
+# CTF Agent — docker-compose for the orchestrator container.
+#
+# Prerequisites:
+#   1. cp .env.example .env  and fill in keys (ANTHROPIC_API_KEY, GATEWAY_*, ...)
+#   2. Set HOST_PROJECT_DIR in .env to the ABSOLUTE path of this directory on
+#      the Docker host (e.g. D:/code/ctf/ctf-agent-main/ctf-agent-main or
+#      /home/you/ctf-agent). Required: the agent spawns sandbox containers via
+#      the host docker socket, and bind mounts must reference HOST paths.
+#   3. Build the sandbox image once:
+#        docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
+#
+# Usage:
+#   Full competition (coordinator mode):
+#     docker compose run --rm --service-ports agent
+#   Single challenge:
+#     docker compose run --rm agent ctf-solve --challenge challenges/baby-pwn -v
+#   Offline benchmark:
+#     docker compose run --rm agent ctf-bench --challenges-dir challenges -v
+#   Send a hint to the running coordinator:
+#     docker compose exec agent uv run --no-sync ctf-msg "focus on the JWT kid param"
+
+services:
+  agent:
+    build: .
+    image: ctf-agent
+    env_file:
+      - .env
+    environment:
+      # DooD: sandbox binds must use HOST paths
+      HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?Set HOST_PROJECT_DIR in .env (absolute project path on the docker host)}
+      # Skills: /skills inside containers; SKILLS_HOST_DIR is the host path
+      SKILLS_DIR: /skills
+      SKILLS_HOST_DIR: ${SKILLS_HOST_DIR:-}
+      # Tuning pass-through (host env overrides .env for one-off runs)
+      SOLVER_TIME_BUDGET_S: ${SOLVER_TIME_BUDGET_S:-1500}
+      SKILL_AFTER_BUMPS: ${SKILL_AFTER_BUMPS:-1}
+      SANDBOX_PROXY_URL: ${SANDBOX_PROXY_URL:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./challenges:/app/challenges
+      - ./logs:/app/logs
+      - ./.workspaces:/app/.workspaces
+      - ${SKILLS_HOST_DIR:-./skills}:/skills:ro
+    ports:
+      - "9400:9400"  # operator message endpoint (ctf-msg)
+    tty: true
+    stdin_open: true
+    restart: "no"

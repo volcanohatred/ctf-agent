@@ -1,0 +1,12 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+logs
+challenges
+.workspaces
+.env
+skills
+*.jsonl
+Dockerfile
+docker-compose.yml

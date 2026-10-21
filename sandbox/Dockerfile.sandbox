@@ -1,0 +1,272 @@
+# CTF challenge solver sandbox image �?full toolset.
+# Build once: docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TERM=xterm
+# PyPI mirror (fast in CN; also used by runtime `pip install`).
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ── APT mirror (faster & more reliable in CN; override with --build-arg) ─────
+# NOTE: plain http �?the ubuntu base image lacks ca-certificates at this stage
+# (packages remain GPG-verified via the archive signature).
+ARG APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
+# Proxy for apt itself (VM direct egress can be unreliable behind TUN-mode
+# system proxies). Empty = direct. Usually pass the same proxy as HTTP_PROXY.
+ARG APT_BUILD_PROXY=""
+RUN sed -i "s|http://archive.ubuntu.com|${APT_MIRROR}|g; \
+            s|http://security.ubuntu.com|${APT_MIRROR}|g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    # apt: route through the build-time proxy (the Docker VM's direct egress is
+    # unreliable under TUN-mode system proxies), serialized + retried.
+    # APT_BUILD_PROXY is passed as a build-arg; empty = direct.
+    && echo "APT build proxy: ${APT_BUILD_PROXY:-<direct>}" \
+    && if [ -n "${APT_BUILD_PROXY:-}" ]; then \
+         printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+           "${APT_BUILD_PROXY}" "${APT_BUILD_PROXY}" \
+           > /etc/apt/apt.conf.d/99build-proxy; \
+       fi \
+    && printf 'Acquire::Retries "8";\nAcquire::http::Queue-Mode "access";\nAcquire::https::Queue-Mode "access";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' \
+        > /etc/apt/apt.conf.d/99build-tuning
+
+# ── System packages �?split into chunks so a transient proxy/network failure
+# only retries one chunk (apt cache resumes partial downloads between tries) ──
+COPY sandbox/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-get update && apt-install \
+    gcc g++ make cmake autoconf automake libtool pkg-config flex bison \
+    python3 python3-pip python3-dev python3-venv \
+    ruby ruby-dev default-jre-headless \
+    git jq zip unzip p7zip-full p7zip-rar ca-certificates ncurses-term \
+    tmux vim less lsof procps psmisc sudo \
+    libgmp-dev libmpfr-dev libfplll-dev libeigen3-dev libz3-dev \
+    libhwloc-dev libbz2-dev \
+    gdb gdbserver gdb-multiarch ltrace strace \
+    binutils file xxd bsdmainutils hexedit \
+    gcc-multilib g++-multilib libc6-dbg patchelf nasm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-install \
+    netcat-openbsd ncat curl wget nmap socat rlwrap telnet proxychains4 \
+    masscan hping3 tcpdump iproute2 iputils-ping net-tools whois dnsutils \
+    sslscan whatweb nikto dirb gobuster wfuzz \
+    smbclient ldap-utils postgresql-client mariadb-client redis-tools \
+    php-cli sqlite3 nodejs npm adb \
+    openssl libssl-dev pari-gp \
+    && rm -rf /var/lib/apt/lists/*
+
+# qemu-system with --no-install-recommends (skips edk2/seabios bloat).
+# qemu-system-arm is optional (ARM kernel pwn is rare).
+RUN apt-get update && \
+    ok=0; for i in 1 2 3 4; do \
+      apt-get install -y --no-install-recommends \
+        qemu-user qemu-user-binfmt qemu-system-x86 \
+        busybox-static cpio lz4 debootstrap \
+      && { ok=1; break; }; \
+      echo "apt qemu attempt $i failed �?retrying in 10s"; sleep 10; \
+    done; [ "$ok" = 1 ] || exit 1; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-install \
+    binwalk upx-ucl apktool \
+    exiftool steghide pcapfix scalpel \
+    pngcheck imagemagick cabextract \
+    poppler-utils qpdf ghostscript mupdf-tools catdoc antiword yara \
+    xfsprogs sleuthkit foremost dcfldd testdisk \
+    ffmpeg sox \
+    tesseract-ocr tesseract-ocr-eng zbar-tools qrencode \
+    john hashcat fcrackzip pdfcrack crunch \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optional packages (not in every Ubuntu mirror/release; never fail the build)
+RUN apt-get update && for p in jadx ffuf cryptominisat unrar-free bulk-extractor exploitdb qemu-system-arm; do \
+      ok=0; for i in 1 2 3; do \
+        apt-get install -y "$p" && { ok=1; break; } || sleep 5; \
+      done; [ "$ok" = 1 ] || echo "APT-MISSING(non-fatal): $p"; \
+    done && rm -rf /var/lib/apt/lists/*
+
+# enum4linux �?not packaged for Ubuntu; install from source
+RUN git clone --depth=1 https://github.com/CiscoCXSecurity/enum4linux /opt/enum4linux \
+    && printf '#!/bin/bash\nperl /opt/enum4linux/enum4linux.pl "$@"\n' > /usr/local/bin/enum4linux \
+    && chmod +x /usr/local/bin/enum4linux
+
+# Retry helper for flaky network operations (proxy resets etc.)
+COPY sandbox/retry.sh /usr/local/bin/retry
+RUN chmod +x /usr/local/bin/retry
+
+# ── Podman (nested containers �?run challenge Docker images inside sandbox) ───
+# Ubuntu 24.04 ships podman in universe �?install directly (the kubic repo has
+# no noble build).
+RUN apt-get update && apt-install podman fuse-overlayfs slirp4netns uidmap \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "Podman install failed (non-fatal) �?nested containers will not be available"
+
+# ── SageMath via conda-forge (Ubuntu 24.04 no longer packages sagemath) ──────
+RUN retry 4 curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/miniforge3 \
+    && rm /tmp/miniforge.sh \
+    && (retry 3 /opt/miniforge3/bin/conda install -y sage) \
+    && /opt/miniforge3/bin/conda clean -afy \
+    && printf '#!/bin/bash\nexec /opt/miniforge3/bin/sage "$@"\n' > /usr/local/bin/sage \
+    && chmod +x /usr/local/bin/sage \
+    && sage -c 'print("sage OK:", factor(123456789))' \
+    || echo "sage install failed (non-fatal)"
+
+# ── radare2 ───────────────────────────────────────────────────────────────────
+RUN retry 4 git clone --depth=1 https://github.com/radareorg/radare2 /tmp/r2 \
+    && cd /tmp/r2 && bash sys/install.sh --install \
+    && ldconfig \
+    && r2 -v \
+    && rm -rf /tmp/r2
+
+# BLAS/LAPACK �?required by flatter (came transitively with apt sagemath before)
+RUN apt-get update && apt-install libopenblas-dev liblapack-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── flatter (fast lattice reduction �?Keegan Ryan's fork) ────────────────────
+RUN retry 4 git clone --depth=1 https://github.com/keeganryan/flatter /tmp/flatter \
+    && cmake -S /tmp/flatter -B /tmp/flatter/build \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/flatter/build -j$(nproc) \
+    && cmake --install /tmp/flatter/build \
+    && ldconfig \
+    && rm -rf /tmp/flatter
+
+# ── uv (fast Python package manager) ─────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
+
+# ── Ruby gems (pwn / steg) ────────────────────────────────────────────────────
+RUN gem install zsteg one_gadget seccomp-tools
+
+# ── stegseek (build from source �?pre-built .deb is amd64 only) ──────────────
+RUN apt-get update && apt-get install -y libmhash-dev libmcrypt-dev libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && retry 4 git clone --depth=1 https://github.com/RickdeJager/stegseek /tmp/stegseek \
+    && cmake -S /tmp/stegseek -B /tmp/stegseek/build \
+    && cmake --build /tmp/stegseek/build --target install \
+    && rm -rf /tmp/stegseek
+
+# ── pwndbg (gdb enhancements for pwn) ─────────────────────────────────────────
+RUN retry 4 git clone --depth=1 https://github.com/pwndbg/pwndbg /opt/pwndbg \
+    && cd /opt/pwndbg && DEBIAN_FRONTEND=noninteractive ./setup.sh \
+    || echo "pwndbg setup failed (non-fatal)"
+
+# ── pycdc (Python bytecode decompiler �?covers 3.9+ where uncompyle6 stops) ──
+RUN retry 4 git clone --depth=1 https://github.com/zrax/pycdc /tmp/pycdc \
+    && cmake -S /tmp/pycdc -B /tmp/pycdc/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/pycdc/build -j$(nproc) \
+    && cp /tmp/pycdc/build/pycdc /usr/local/bin/pycdc \
+    && rm -rf /tmp/pycdc \
+    || echo "pycdc build failed (non-fatal)"
+
+# ── Python CTF libraries (system python3; noble's pip 24.0 is sufficient) ────
+RUN pip3 install --no-cache-dir --break-system-packages \
+    pwntools \
+    pycryptodome \
+    sympy \
+    gmpy2 \
+    requests \
+    Pillow \
+    z3-solver \
+    pytesseract \
+    scipy \
+    numpy \
+    angr \
+    capstone \
+    unicorn \
+    ropgadget \
+    tqdm \
+    fpylll \
+    flask \
+    volatility3 \
+    PyJWT \
+    pyghidra
+
+# ── Extended Python toolset (per-package installs — a mega-batch makes pip's
+# resolver backtrack for ages on conflicts; failures are non-fatal) ───────────
+# Remove Debian-managed python packages first — pip cannot uninstall them
+# (no RECORD file) and dies trying when deps need newer versions.
+RUN rm -rf /usr/lib/python3/dist-packages/numpy* \
+           /usr/lib/python3/dist-packages/scipy* \
+           /usr/lib/python3/dist-packages/matplotlib* \
+           /usr/lib/python3/dist-packages/sympy* \
+           /usr/lib/python3/dist-packages/wheel* \
+           /usr/lib/python3/dist-packages/setuptools*
+COPY sandbox/pip-extended.txt /tmp/pip-extended.txt
+RUN grep -vE '^\s*(#|$)' /tmp/pip-extended.txt > /tmp/pip-list.txt \
+    && pip3 install --no-cache-dir --break-system-packages --upgrade numpy scipy sympy \
+    && while read -r p; do \
+         echo "=== pip: $p ==="; \
+         pip3 install --no-cache-dir --break-system-packages --prefer-binary "$p" \
+           || echo "PIP-FAIL(non-fatal): $p"; \
+       done < /tmp/pip-list.txt
+
+# ── PyTorch (CPU-only) + Keras ────────────────────────────────────────────────
+RUN retry 3 pip3 install --no-cache-dir --break-system-packages \
+        torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip3 install --no-cache-dir --break-system-packages keras
+
+# ── RsaCtfTool (catch-all automated RSA/factoring attacks) ────────────────────
+RUN retry 4 git clone --depth=1 https://github.com/RsaCtfTool/RsaCtfTool /opt/RsaCtfTool \
+    && pip3 install --no-cache-dir --break-system-packages /opt/RsaCtfTool
+
+# ── crypto-attacks (Coppersmith & lattice attacks library) ───────────────────
+RUN retry 4 git clone --depth=1 https://github.com/jvdsn/crypto-attacks /opt/crypto-attacks \
+    && (pip3 install --no-cache-dir --break-system-packages -r /opt/crypto-attacks/requirements.txt || true)
+
+# ── jwt_tool (JWT attack toolkit) ─────────────────────────────────────────────
+RUN retry 4 git clone --depth=1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool \
+    && (pip3 install --no-cache-dir --break-system-packages -r /opt/jwt_tool/requirements.txt || true) \
+    && printf '#!/bin/bash\npython3 /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool \
+    && chmod +x /usr/local/bin/jwt_tool
+
+# ── GitTools (exposed .git exploitation) & phpggc (PHP unserialize gadgets) ───
+RUN retry 4 git clone --depth=1 https://github.com/internetwache/GitTools /opt/GitTools
+RUN retry 4 git clone --depth=1 https://github.com/ambionics/phpggc /opt/phpggc \
+    && printf '#!/bin/bash\nphp /opt/phpggc/phpggc "$@"\n' > /usr/local/bin/phpggc \
+    && chmod +x /usr/local/bin/phpggc
+
+# ── SecLists (wordlists) + rockyou (classic password list) ───────────────────
+RUN retry 4 git clone --depth=1 https://github.com/danielmiessler/SecLists /opt/SecLists \
+    && rm -rf /opt/SecLists/.git \
+    && mkdir -p /usr/share/wordlists \
+    && retry 4 curl -fsSL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt \
+        -o /opt/SecLists/Passwords/Leaked-Databases/rockyou.txt \
+    && ln -sf /opt/SecLists/Passwords/Leaked-Databases/rockyou.txt /usr/share/wordlists/rockyou.txt
+
+# ── pwninit (auto libc/ld setup for pwn) ──────────────────────────────────────
+RUN retry 4 curl -fsSL https://github.com/io12/pwninit/releases/download/3.3.3/pwninit \
+       -o /usr/local/bin/pwninit \
+    && chmod +x /usr/local/bin/pwninit \
+    || echo "pwninit download failed (non-fatal)"
+
+# ── jadx fallback (if apt package was unavailable) ───────────────────────────
+RUN if ! command -v jadx >/dev/null 2>&1; then \
+      retry 4 curl -fsSL https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip -o /tmp/jadx.zip \
+      && unzip -q /tmp/jadx.zip -d /opt/jadx \
+      && ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx \
+      && rm /tmp/jadx.zip \
+      || echo "jadx fallback failed (non-fatal)"; \
+    fi
+
+# ── CADO-NFS (Number Field Sieve �?large integer factoring + DLP) ─────────────
+RUN retry 4 git clone --depth=1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git /opt/cado-nfs \
+    && cd /opt/cado-nfs && make -j$(nproc)
+RUN printf '#!/bin/bash\n\
+BUILD_PARENT=/opt/cado-nfs/build\n\
+H=$(hostname)\n\
+if [ ! -d "$BUILD_PARENT/$H" ]; then\n\
+  src=$(ls -d "$BUILD_PARENT"/* 2>/dev/null | head -1)\n\
+  [ -n "$src" ] && ln -sf "$src" "$BUILD_PARENT/$H"\n\
+fi\n\
+exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
+    && chmod +x /usr/local/bin/cado-nfs
+
+# ── Tools reference & agent onboarding ───────────────────────────────────────
+COPY sandbox/sandbox-tools.txt /tools.txt
+COPY sandbox/AGENTS.md /challenge/AGENTS.md
+
+WORKDIR /challenge

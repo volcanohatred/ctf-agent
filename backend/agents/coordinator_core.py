@@ -130,6 +130,19 @@ async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: 
     return f"Bumped {model_spec} on {challenge_name}"
 
 
+async def do_advise_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, advice: str) -> str:
+    """Drop guidance into a RUNNING solver's mailbox (picked up mid-run via its
+    tool hook — no need to wait for the current attempt to finish)."""
+    swarm = deps.swarms.get(challenge_name)
+    if not swarm:
+        return f"No swarm running for {challenge_name}"
+    solver = swarm.solvers.get(model_spec)
+    if not solver:
+        return f"No solver for {model_spec} in {challenge_name}"
+    await swarm.message_bus.post_advice(model_spec, advice)
+    return f"Advised {model_spec} on {challenge_name} (delivered at its next tool call)"
+
+
 async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20) -> str:
     """Read the last N trace events from a solver's JSONL log."""
     swarm = deps.swarms.get(challenge_name)

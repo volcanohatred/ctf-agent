@@ -128,6 +128,51 @@ def test_bus_grouping() -> None:
     asyncio.run(_run())
 
 
+def test_patrol_trace_activity() -> None:
+    """trace_activity parses a solver trace for last-ts + repeated signatures."""
+    import json
+    import time as _time
+
+    from backend.trace_read import trace_activity
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "t.jsonl"
+        events = []
+        for i in range(8):
+            events.append({"ts": _time.time() - 100 + i, "type": "tool_call",
+                           "tool": "bash", "args": {"command": "id"}})
+        events.append({"ts": _time.time(), "type": "tool_call",
+                       "tool": "bash", "args": {"command": "ls"}})
+        p.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+        last_ts, sigs = trace_activity(str(p))
+        assert last_ts > 0
+        assert len(sigs) == 9
+        # 8 identical 'bash:{"command": "id"}' signatures → looping detected shape
+        assert sigs.count(sigs[0]) == 8
+        # empty / missing file → safe defaults
+        assert trace_activity(str(Path(td) / "nope.jsonl")) == (0.0, [])
+
+
+def test_advice_mailbox() -> None:
+    """Coordinator→solver advice is queued per-solver and drained once."""
+    async def _run() -> None:
+        bus = ChallengeMessageBus()
+        await bus.post_advice("model-a", "try the tcache poison")
+        await bus.post_advice("model-a", "and check the GOT")
+        await bus.post_advice("model-b", "unrelated")
+
+        # model-a drains both, once
+        got = await bus.check_advice("model-a")
+        assert got == ["try the tcache poison", "and check the GOT"], got
+        # drained — empty on second check
+        assert await bus.check_advice("model-a") == []
+        # model-b unaffected
+        assert await bus.check_advice("model-b") == ["unrelated"]
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # DooD path translation
 # ---------------------------------------------------------------------------

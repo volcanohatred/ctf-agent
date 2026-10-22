@@ -32,11 +32,18 @@ MAX_FINDINGS = 200
 
 @dataclass
 class ChallengeMessageBus:
-    """Append-only shared findings list with per-model cursors."""
+    """Append-only shared findings list with per-model cursors.
+
+    Also carries a per-solver "advice" mailbox: the coordinator can drop
+    guidance that a RUNNING solver picks up mid-turn (via its tool hook),
+    instead of waiting for the next bump/restart. This is the fast channel
+    for coaching weaker models.
+    """
 
     findings: list[Finding] = field(default_factory=list)
     cursors: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _advice: dict[str, list[str]] = field(default_factory=dict)
 
     async def post(self, model: str, content: str, kind: str = KIND_FACT) -> None:
         """Post a finding from a solver."""
@@ -58,6 +65,22 @@ class ChallengeMessageBus:
     async def broadcast(self, content: str, source: str = "coordinator") -> None:
         """Coordinator broadcasts a message to all solvers."""
         await self.post(source, content, kind=KIND_BROADCAST)
+
+    async def post_advice(self, model: str, content: str) -> None:
+        """Drop guidance addressed to ONE running solver (mid-run pickup)."""
+        async with self._lock:
+            self._advice.setdefault(model, []).append(content)
+            # keep bounded
+            if len(self._advice[model]) > 10:
+                self._advice[model] = self._advice[model][-10:]
+
+    async def check_advice(self, model: str) -> list[str]:
+        """Drain pending advice for a solver (each item delivered once)."""
+        async with self._lock:
+            items = self._advice.get(model, [])
+            if items:
+                self._advice[model] = []
+            return items
 
     def format_unread(self, findings: list[Finding]) -> str:
         """Format findings for injection into a solver prompt, grouped by kind."""

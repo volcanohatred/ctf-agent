@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
+from backend.trace_read import trace_activity
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +105,24 @@ async def run_event_loop(
         "Fetch challenges and spawn swarms for all unsolved."
     )
 
+    patrol_task: asyncio.Task | None = None
     try:
         await turn_fn(initial_msg)
 
         # Auto-spawn swarms for unsolved challenges if coordinator LLM didn't
         await _auto_spawn_unsolved(deps, poller)
+
+        # Start the proactive patrol (stuck-solver detection + fast nudges)
+        patrol_interval = int(getattr(deps.settings, "patrol_interval_s", 120) or 120)
+        if patrol_interval > 0:
+            patrol_task = asyncio.create_task(
+                _patrol_loop(
+                    deps,
+                    interval_s=patrol_interval,
+                    stuck_quiet_s=int(getattr(deps.settings, "patrol_stuck_quiet_s", 240) or 240),
+                ),
+                name="coordinator-patrol",
+            )
 
         last_status = asyncio.get_event_loop().time()
 
@@ -185,6 +200,8 @@ async def run_event_loop(
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
     finally:
+        if patrol_task:
+            patrol_task.cancel()
         if msg_server:
             msg_server.close()
             await msg_server.wait_closed()
@@ -228,6 +245,73 @@ async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     unsolved = poller.known_challenges - poller.known_solved
     for name in sorted(unsolved):
         await _auto_spawn_one(deps, name)
+
+
+# ---------------------------------------------------------------------------
+# Proactive patrol — detect stuck solvers, nudge them via the fast mailbox.
+# ---------------------------------------------------------------------------
+
+async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: int) -> None:
+    """Periodically scan active solvers; alert + advise the stuck ones.
+
+    A solver counts as stuck when its trace shows no new event for
+    stuck_quiet_s seconds, or it is repeating the same tool call over and over.
+    Detection writes a template nudge to the solver's fast mailbox (picked up
+    mid-run) AND alerts the coordinator inbox so the coordinator LLM can
+    follow up with real guidance via advise_agent / bump_agent.
+    """
+    reported: set[str] = set()  # solver keys currently in a reported-stuck episode
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            now = time.time()
+            for ch_name, swarm in list(deps.swarms.items()):
+                if swarm.cancel_event.is_set():
+                    continue
+                for spec, solver in list(swarm.solvers.items()):
+                    key = f"{ch_name}|{spec}"
+                    try:
+                        trace_path = getattr(getattr(solver, "tracer", None), "path", None)
+                        if not trace_path or not Path(trace_path).exists():
+                            continue
+                        last_ts, sigs = trace_activity(trace_path)
+                        quiet_s = now - last_ts if last_ts else 0
+                        looping = len(sigs) >= 6 and len(set(sigs[-6:])) <= 2
+
+                        if quiet_s >= stuck_quiet_s or looping:
+                            if key not in reported:
+                                reported.add(key)
+                                reason = (
+                                    f"no activity for {int(quiet_s)}s" if quiet_s >= stuck_quiet_s
+                                    else "repeating the same command"
+                                )
+                                logger.warning(f"[patrol] {key} stuck ({reason})")
+                                # Fast nudge into the running solver's mailbox
+                                nudge = (
+                                    f"You seem stuck ({reason}). STOP and reset: "
+                                    "write down what you've confirmed so far, then pick a "
+                                    "DIFFERENT technique. If a task-specific handbook exists "
+                                    "under /skills/, read it. If you're spinning on one command, "
+                                    "switch tools entirely."
+                                )
+                                try:
+                                    await swarm.message_bus.post_advice(spec, nudge)
+                                except Exception:
+                                    pass
+                                # Alert the coordinator so it can craft real guidance
+                                deps.coordinator_inbox.put_nowait(
+                                    f"PATROL ALERT: solver '{spec}' on '{ch_name}' looks stuck "
+                                    f"({reason}). Use read_solver_trace to see what it's doing, "
+                                    f"then advise_agent with specific next steps."
+                                )
+                        else:
+                            reported.discard(key)  # recovered → allow future alerts
+                    except Exception:
+                        continue
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(f"patrol loop error: {e}")
 
 
 async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:

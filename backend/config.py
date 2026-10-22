@@ -68,5 +68,13 @@ class Settings(BaseSettings):
     solver_time_budget_s: int = 1500
     # Start injecting skill-library hints after this many failed attempts (bumps).
     skill_after_bumps: int = 1
+    # Coordinator model — use your STRONGEST model here (it coaches weaker
+    # solvers). Empty = CLI --coordinator-model, else built-in default.
+    coordinator_model: str = ""
+    # Proactive coordinator patrol: scan active solvers every N seconds for
+    # stuck patterns (quiet too long / looping), alert + advise them.
+    patrol_interval_s: int = 120
+    # A solver with no new trace activity for this many seconds counts as stuck.
+    patrol_stuck_quiet_s: int = 240
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

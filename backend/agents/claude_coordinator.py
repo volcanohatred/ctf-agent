@@ -15,6 +15,7 @@ from claude_agent_sdk import (
 )
 
 from backend.agents.coordinator_core import (
+    do_advise_agent,
     do_broadcast,
     do_bump_agent,
     do_check_swarm_status,
@@ -40,6 +41,16 @@ Strategy:
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
 - Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
+
+COACHING TOOLS (use these to steer solvers — many solvers here are weaker models
+that need active guidance):
+- bump_agent: restart-level nudge with new insights (takes effect on the solver's next attempt)
+- advise_agent: FAST channel — drops a message into a RUNNING solver's mailbox,
+  picked up at its next tool call. Use this to redirect a solver mid-turn without
+  waiting for its current attempt to finish.
+- You will receive "PATROL ALERT: solver X on challenge Y looks stuck" events.
+  When you see one: read that solver's trace, diagnose the exact problem, and
+  send a specific advise_agent message telling it precisely what to try next.
 
 KNOWLEDGE BASE:
 - Every solver sandbox has a curated CTF technique library mounted read-only at /skills/
@@ -99,6 +110,10 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def bump_agent(args: dict) -> dict:
         return _text(await do_bump_agent(deps, args["challenge_name"], args["model_spec"], args["insights"]))
 
+    @tool("advise_agent", "Drop guidance into a RUNNING solver's mailbox — picked up at its next tool call, no restart needed. Use for timely coaching when a solver is mid-turn.", {"challenge_name": str, "model_spec": str, "advice": str})
+    async def advise_agent(args: dict) -> dict:
+        return _text(await do_advise_agent(deps, args["challenge_name"], args["model_spec"], args["advice"]))
+
     @tool("broadcast", "Broadcast a strategic hint to ALL solvers on a challenge.", {"challenge_name": str, "message": str})
     async def broadcast(args: dict) -> dict:
         return _text(await do_broadcast(deps, args["challenge_name"], args["message"]))
@@ -110,7 +125,7 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     return create_sdk_mcp_server(
         name="coordinator", version="1.0.0",
         tools=[fetch_challenges, get_solve_status, spawn_swarm, check_swarm_status,
-               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace],
+               submit_flag, kill_swarm, bump_agent, advise_agent, broadcast, read_solver_trace],
     )
 
 
@@ -129,14 +144,20 @@ async def run_claude_coordinator(
     deps.msg_port = msg_port
 
     mcp_server = _build_coordinator_mcp(deps)
-    resolved_model = coordinator_model or "kimi-k3"
+    # Coordinator = the "coach": default to the strongest configured gateway
+    # model. CLI --coordinator-model overrides; COORDINATOR_MODEL env next.
+    resolved_model = (
+        coordinator_model
+        or getattr(settings, "coordinator_model", "")
+        or "qwen3.8-max"
+    )
 
     allowed = {
         "mcp__coordinator__fetch_challenges", "mcp__coordinator__get_solve_status",
         "mcp__coordinator__spawn_swarm", "mcp__coordinator__check_swarm_status",
         "mcp__coordinator__submit_flag", "mcp__coordinator__kill_swarm",
-        "mcp__coordinator__bump_agent", "mcp__coordinator__broadcast",
-        "mcp__coordinator__read_solver_trace",
+        "mcp__coordinator__bump_agent", "mcp__coordinator__advise_agent",
+        "mcp__coordinator__broadcast", "mcp__coordinator__read_solver_trace",
         "ToolSearch",
         "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
     }

@@ -239,6 +239,22 @@ class ClaudeSolver:
             response_str = str(input_data.get("tool_response", ""))[:2000]
             self.tracer.tool_result(input_data.get("tool_name", "?"), response_str[:500], self._step_count)
 
+            # Fast mailbox: coordinator advice picked up mid-run (every 3 steps)
+            if self._step_count % 3 == 0 and self.message_bus:
+                advice = await self.message_bus.check_advice(self.model_spec)
+                if advice:
+                    self.tracer.event("advice_picked", count=len(advice))
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": (
+                                "📨 **Guidance from your coordinator (read now, it overrides "
+                                "your current plan if relevant):**\n\n"
+                                + "\n\n".join(advice)
+                            ),
+                        }
+                    }
+
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
                 findings = await do_check_findings(self.message_bus, self.model_spec)

@@ -85,6 +85,17 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         if name == "submit_flag" and "INCORRECT" not in result_str and any(m in result_str for m in CORRECT_MARKERS):
             self.tracer.event("flag_confirmed", tool=name, step=step)
 
+        # Fast mailbox: coordinator advice picked up mid-run (every 3 steps)
+        if step % 3 == 0 and ctx.deps.message_bus and isinstance(result, str):
+            advice = await ctx.deps.message_bus.check_advice(ctx.deps.model_spec)
+            if advice:
+                self.tracer.event("advice_picked", count=len(advice))
+                result += (
+                    "\n\n---\n📨 **Guidance from your coordinator (read now, it "
+                    "overrides your current plan if relevant):**\n\n"
+                    + "\n\n".join(advice)
+                )
+
         if step % 5 == 0 and ctx.deps.message_bus and isinstance(result, str):
             from backend.tools.core import do_check_findings
             findings_text = await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)

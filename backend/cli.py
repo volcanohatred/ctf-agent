@@ -49,7 +49,7 @@ def _print_settings(settings: Settings, model_specs: list[str], max_challenges: 
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: kimi-k3)")
+@click.option("--coordinator-model", default=None, help="Model for coordinator (default: qwen3.8-max; use your strongest)")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")

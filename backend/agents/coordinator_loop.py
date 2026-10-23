@@ -106,11 +106,26 @@ async def run_event_loop(
     )
 
     patrol_task: asyncio.Task | None = None
+    dashboard = None
     try:
         await turn_fn(initial_msg)
 
         # Auto-spawn swarms for unsolved challenges if coordinator LLM didn't
         await _auto_spawn_unsolved(deps, poller)
+
+        # Operator dashboard (live swarm view + guidance mailbox UI)
+        dash_port = int(getattr(deps.settings, "dashboard_port", 8080) or 0)
+        if dash_port > 0:
+            try:
+                from backend.web_dashboard import DashboardServer
+                dashboard = DashboardServer(
+                    deps,
+                    host=getattr(deps.settings, "dashboard_host", "0.0.0.0"),
+                    port=dash_port,
+                )
+                await dashboard.start()
+            except Exception as e:
+                logger.warning(f"Dashboard failed to start: {e}")
 
         # Start the proactive patrol (stuck-solver detection + fast nudges)
         patrol_interval = int(getattr(deps.settings, "patrol_interval_s", 120) or 120)
@@ -202,6 +217,8 @@ async def run_event_loop(
     finally:
         if patrol_task:
             patrol_task.cancel()
+        if dashboard:
+            await dashboard.stop()
         if msg_server:
             msg_server.close()
             await msg_server.wait_closed()

@@ -21,6 +21,7 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
 )
 
 from backend.cost_tracker import CostTracker
@@ -331,6 +332,13 @@ class ClaudeSolver:
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             self._findings = block.text[:2000]
+                            self.tracer.model_response(block.text[:800], self._step_count)
+                        elif isinstance(block, ThinkingBlock):
+                            # Reasoning models surface their plan as a ThinkingBlock
+                            # — capture it so the dashboard can show the live "思路".
+                            self.tracer.model_response(
+                                f"[思考] {block.thinking[:800]}", self._step_count
+                            )
 
                 elif isinstance(message, ResultMessage):
                     self._session_id = message.session_id

@@ -15,6 +15,7 @@ dependencies = [
     "rich",
     "click",
     "markdownify",
+    "aiohttp",
 ]
 
 [project.scripts]

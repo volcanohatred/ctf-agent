@@ -40,3 +40,27 @@ def trace_activity(trace_path: str, tail_bytes: int = 8192) -> tuple[float, list
         return last_ts, sigs
     except Exception:
         return 0.0, []
+
+
+def last_model_text(trace_path: str, tail_bytes: int = 65536) -> str:
+    """The most recent reasoning text the model produced (model_response event).
+
+    Used by the dashboard to show "what is the solver currently thinking".
+    Returns "" when absent.
+    """
+    try:
+        with open(trace_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.strip().splitlines()):
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") == "model_response" and ev.get("text"):
+                return str(ev["text"])[:600]
+        return ""
+    except Exception:
+        return ""

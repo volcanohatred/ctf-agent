@@ -43,6 +43,7 @@ services:
       - ${SKILLS_HOST_DIR:-./skills}:/skills:ro
     ports:
       - "9400:9400"  # operator message endpoint (ctf-msg)
+      - "8080:8080"  # web dashboard (live swarm view + guidance)
     tty: true
     stdin_open: true
     restart: "no"

@@ -93,23 +93,42 @@ class DashboardServer:
     def _swarm_summary(self, name: str, swarm: Any) -> dict:
         meta = swarm.meta
         agents = {}
+        cost_tracker = getattr(self.deps, "cost_tracker", None)
         for spec in swarm.model_specs:
             solver = swarm.solvers.get(spec)
-            agents[spec] = {"status": "not started", "last": "", "last_ts": 0.0}
+            agent: dict[str, Any] = {
+                "status": "not started", "last": "", "last_ts": 0.0,
+                "thinking": "", "quiet_s": None, "steps": 0, "cost_usd": 0.0,
+                "approach": "",
+            }
+            # per-solver cost from the shared tracker (agent_name = "<ch>/<model>")
+            if cost_tracker is not None:
+                from backend.models import model_id_from_spec
+                ag = cost_tracker.by_agent.get(f"{name}/{model_id_from_spec(spec)}")
+                if ag:
+                    agent["cost_usd"] = round(ag.cost_usd, 4)
+                    agent["steps"] = 0  # filled below if available
             if solver is None:
+                agents[spec] = agent
                 continue
-            agents[spec]["status"] = "running"
+            agent["status"] = "running"
+            agent["steps"] = getattr(solver, "_step_count", 0)
+            # rotation assignment (which technique it's been told to try)
+            assigned = getattr(swarm, "_assigned_approach", {}).get(spec, "")
+            if assigned:
+                agent["approach"] = assigned
             tracer = getattr(solver, "tracer", None)
             path = getattr(tracer, "path", None)
             if path and Path(path).exists():
                 last_ts, sigs = trace_activity(path)
-                agents[spec]["last_ts"] = last_ts
+                agent["last_ts"] = last_ts
+                agent["quiet_s"] = round(time.time() - last_ts) if last_ts else None
                 if sigs:
-                    agents[spec]["last"] = sigs[-1][:200]
-                # The solver's latest reasoning text — "what is it thinking".
+                    agent["last"] = sigs[-1][:200]
                 thinking = last_model_text(path)
                 if thinking:
-                    agents[spec]["thinking"] = thinking
+                    agent["thinking"] = thinking
+            agents[spec] = agent
         return {
             "challenge": name,
             "category": getattr(meta, "category", ""),

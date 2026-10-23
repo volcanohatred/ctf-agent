@@ -145,6 +145,30 @@ class DashboardServer:
     async def _state(self, _req: web.Request) -> web.Response:
         deps = self.deps
         swarms = {name: self._swarm_summary(name, s) for name, s in deps.swarms.items()}
+        # Archived (finished) swarms — keep them visible as completed.
+        history = getattr(deps, "swarms_history", {})
+        for name, hist in history.items():
+            if name not in swarms:
+                hist = dict(hist)
+                hist.setdefault("cancelled", True)
+                hist.setdefault("archived", True)
+                swarms[name] = hist
+        # Challenges known to CTFd but not yet spawned → shown as "待解题".
+        for name, meta in getattr(deps, "challenge_metas", {}).items():
+            if name not in swarms:
+                swarms[name] = {
+                    "challenge": name,
+                    "category": getattr(meta, "category", ""),
+                    "value": getattr(meta, "value", 0),
+                    "cancelled": False,
+                    "winner": None,
+                    "winner_spec": "",
+                    "bumps": 0,
+                    "failed_approaches": [],
+                    "agents": {},
+                    "findings": {},
+                    "pending": True,
+                }
         data = {
             "ts": time.time(),
             "solved": list(getattr(deps, "results", {}).keys()),

@@ -112,27 +112,35 @@ async function refresh() {
 
 function renderList() {
   const el = document.getElementById('challenges');
-  const names = Object.keys(STATE.swarms).sort();
+  const names = Object.keys(STATE.swarms).sort((a, b) => {
+    const sa = STATE.swarms[a], sb = STATE.swarms[b];
+    const ra = sa.pending ? 2 : (sa.winner ? 1 : 0);
+    const rb = sb.pending ? 2 : (sb.winner ? 1 : 0);
+    return ra - rb;  // running first, then solved, then pending
+  });
   const solvedSet = new Set(STATE.solved);
   let html = '';
   for (const name of names) {
     const s = STATE.swarms[name];
     const solved = solvedSet.has(name) || s.winner;
-    const stuck = !solved && Object.values(s.agents).some(a => a.quiet_s && a.quiet_s > 240);
-    const badge = solved ? '<span class="badge b-solved">✔ 已解</span>'
+    const pending = !!s.pending;
+    const stuck = !solved && !pending && Object.values(s.agents).some(a => a.quiet_s && a.quiet_s > 240);
+    const badge = pending ? '<span class="badge" style="background:#e2e8f0;color:var(--dim)">待解题</span>'
+      : solved ? '<span class="badge b-solved">✔ 已解</span>'
       : stuck ? '<span class="badge b-stuck">⚠ 疑似卡死</span>'
       : '<span class="badge b-run">● 进行中</span>';
-    const cost = Object.values(s.agents).reduce((x, a) => x + (a.cost_usd || 0), 0);
-    const dots = Object.entries(s.agents).map(([sp, a]) =>
+    const cost = Object.values(s.agents || {}).reduce((x, a) => x + (a.cost_usd || 0), 0);
+    const dots = Object.entries(s.agents || {}).map(([sp, a]) =>
       `<span class="${s.winner ? (s.winner_spec === sp ? 'd-win' : 'd-dead') : 'd-run'}" title="${esc(sp)}"></span>`).join('');
-    html += `<div class="card ${SEL === name ? 'sel' : ''}" onclick="sel('${esc(name)}')">
+    const dimStyle = pending ? 'opacity:.55' : (solved ? 'opacity:.8' : '');
+    html += `<div class="card ${SEL === name ? 'sel' : ''}" style="${dimStyle}" onclick="sel('${esc(name)}')">
       ${badge}
       <div class="name">${esc(name)}</div>
-      <div class="meta">${esc(s.category)} · ${s.value}分 · bump ${s.bumps} · $${cost.toFixed(3)}</div>
+      <div class="meta">${esc(s.category)} · ${s.value}分 · bump ${s.bumps || 0}${cost ? ' · $' + cost.toFixed(3) : ''}</div>
       <div class="dots">${dots}</div>
     </div>`;
   }
-  el.innerHTML = html || '<div class="muted" style="padding:20px">还没有 swarm</div>';
+  el.innerHTML = html || '<div class="muted" style="padding:20px">还没有题目</div>';
 }
 
 function sel(name) { SEL = name; SELSPEC = null; renderDetail(); }
@@ -141,20 +149,33 @@ async function renderDetail() {
   const s = STATE.swarms[SEL];
   if (!s) return;
   const el = document.getElementById('detail');
-  const cost = Object.values(s.agents).reduce((x, a) => x + (a.cost_usd || 0), 0);
+  const cost = Object.values(s.agents || {}).reduce((x, a) => x + (a.cost_usd || 0), 0);
+  const statusTxt = s.pending ? '⏸ 待解题（尚未 spawn）' : s.winner ? '✅ 已解出' : (s.cancelled ? '⏹ 已停止' : '▶ 进行中');
   let html = `<div class="panel">
     <h2 style="font-size:16px">${esc(SEL)}</h2>
     <div style="margin-top:6px">
       <span class="kv">类别 <b>${esc(s.category)}</b></span>
       <span class="kv">分值 <b>${s.value}</b></span>
-      <span class="kv">bump <b>${s.bumps}</b> 次</span>
+      <span class="kv">bump <b>${s.bumps || 0}</b> 次</span>
       <span class="kv">本题成本 <b>$${cost.toFixed(3)}</b></span>
-      <span class="kv">状态 <b>${s.winner ? '✅ 已解' : (s.cancelled ? '⏹ 已停' : '▶ 进行中')}</b></span>
+      <span class="kv">状态 <b>${statusTxt}</b></span>
     </div>`;
   if (s.winner) html += `<div class="flagbox">🚩 ${esc(s.winner)}<span class="muted" style="font-weight:400">　by ${esc(s.winner_spec || '')}</span></div>`;
   if (s.failed_approaches && s.failed_approaches.length)
     html += `<div class="ledger" style="margin-top:8px">🚫 已排除方向：${esc(s.failed_approaches.join('、'))}</div>`;
   html += `</div>`;
+
+  if (s.pending) {
+    html += `<div class="panel muted">这道题还没 spawn swarm。等协调器排上它，或点下方手动 spawn。</div>`;
+    el.innerHTML = html;
+    return;
+  }
+  const agentEntries = Object.entries(s.agents || {});
+  if (agentEntries.length === 0) {
+    html += `<div class="panel muted">此题已完成/归档，活跃 solver 数据已回收（历史 trace 在 logs/ 目录）。</div>`;
+    el.innerHTML = html;
+    return;
+  }
 
   // per-solver table
   html += `<div class="panel"><table class="solvers"><thead><tr>
@@ -174,8 +195,8 @@ async function renderDetail() {
       <td>${a.steps || 0}</td>
       <td>$${(a.cost_usd || 0).toFixed(3)}</td>
       <td class="muted">${a.quiet_s != null ? fmtAgo(a.last_ts) : '—'}</td>
-      <td><button class="ghost" onclick="event.stopPropagation();showTrace('${esc(spec)}')">轨迹</button>
-          <button class="purp" onclick="event.stopPropagation();prepAdvise('${esc(spec)}')">提示</button></td>
+      <td><button class="ghost" onclick="event.stopPropagation();showTrace(this.dataset.spec)" data-spec="${esc(spec)}">轨迹</button>
+          <button class="purp" onclick="event.stopPropagation();prepAdvise(this.dataset.spec)" data-spec="${esc(spec)}">提示</button></td>
     </tr><tr style="display:none" id="tracerow-${esc(spec)}"><td colspan="9"><div class="trace" id="trace-${esc(spec)}"></div></td></tr>`;
   }
   html += `</tbody></table></div>`;
@@ -196,8 +217,9 @@ function prepAdvise(spec) { SELSPEC = spec; const t = document.getElementById('g
 
 async function showTrace(spec) {
   SELSPEC = spec;
-  const row = document.getElementById('tracerow-' + CSS.escape(spec));
-  const box = document.getElementById('trace-' + CSS.escape(spec));
+  // element ids contain '/' (e.g. claude-sdk/kimi-k3) — use getElementById, never CSS.escape
+  const row = document.getElementById('tracerow-' + spec);
+  const box = document.getElementById('trace-' + spec);
   if (!row || !box) return;
   if (row.style.display === 'none') {
     row.style.display = '';

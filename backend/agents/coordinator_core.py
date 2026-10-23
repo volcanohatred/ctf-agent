@@ -38,13 +38,29 @@ async def do_get_solve_status(deps: CoordinatorDeps) -> str:
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    # Retire ALL finished swarms before checking capacity
+    # Retire ALL finished swarms before checking capacity — but ARCHIVE their
+    # summaries first so the dashboard keeps showing them as completed.
     finished = [
         name for name, swarm in deps.swarms.items()
         if swarm.cancel_event.is_set()
         or (name in deps.swarm_tasks and deps.swarm_tasks[name].done())
     ]
     for name in finished:
+        swarm = deps.swarms[name]
+        try:
+            deps.swarms_history[name] = {
+                "challenge": name,
+                "category": getattr(swarm.meta, "category", ""),
+                "value": getattr(swarm.meta, "value", 0),
+                "winner": swarm.winner.flag if swarm.winner else None,
+                "winner_spec": swarm.winner_spec,
+                "bumps": getattr(swarm, "_total_bumps", 0),
+                "failed_approaches": getattr(swarm, "_failed_approaches", []),
+                "finished_at": __import__("time").time(),
+                "agents": {},  # traces archived separately on disk
+            }
+        except Exception:
+            deps.swarms_history[name] = {"challenge": name, "winner": None}
         del deps.swarms[name]
         deps.swarm_tasks.pop(name, None)
 

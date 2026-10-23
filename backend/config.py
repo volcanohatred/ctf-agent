@@ -76,5 +76,8 @@ class Settings(BaseSettings):
     patrol_interval_s: int = 120
     # A solver with no new trace activity for this many seconds counts as stuck.
     patrol_stuck_quiet_s: int = 240
+    # After this many failed bump attempts across a swarm with no winner,
+    # spawn a stronger-model solver (escalation ladder). 0 disables.
+    escalate_after_bumps: int = 8
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

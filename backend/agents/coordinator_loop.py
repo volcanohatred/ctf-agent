@@ -286,14 +286,34 @@ async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: in
                                     else "repeating the same command"
                                 )
                                 logger.warning(f"[patrol] {key} stuck ({reason})")
-                                # Fast nudge into the running solver's mailbox
-                                nudge = (
-                                    f"You seem stuck ({reason}). STOP and reset: "
+                                # Specific nudge: cite the exact repeated evidence + next direction
+                                evidence = ""
+                                if looping and sigs:
+                                    from collections import Counter
+                                    top = Counter(sigs[-6:]).most_common(1)[0][0]
+                                    evidence = f" You ran this {Counter(sigs[-6:])[top]}x in a row: `{top[:120]}`."
+                                nudge_parts = [
+                                    f"You seem stuck ({reason}).{evidence} STOP and reset: "
                                     "write down what you've confirmed so far, then pick a "
-                                    "DIFFERENT technique. If a task-specific handbook exists "
-                                    "under /skills/, read it. If you're spinning on one command, "
-                                    "switch tools entirely."
+                                    "DIFFERENT technique.",
+                                ]
+                                # Point at the next untried technique if the swarm has a queue
+                                try:
+                                    queue = getattr(swarm, "_approach_queue", [])
+                                    failed = set(getattr(swarm, "_failed_approaches", []))
+                                    nxt = next((a for a in queue if a.title not in failed), None)
+                                    if nxt:
+                                        nudge_parts.append(
+                                            f"Suggested untried direction: **{nxt.title}** — "
+                                            f"read `{nxt.path}` first, then apply it."
+                                        )
+                                except Exception:
+                                    pass
+                                nudge_parts.append(
+                                    "If a task-specific handbook exists under /skills/, read it "
+                                    "before retrying."
                                 )
+                                nudge = "\n".join(nudge_parts)
                                 try:
                                     await swarm.message_bus.post_advice(spec, nudge)
                                 except Exception:
@@ -301,7 +321,7 @@ async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: in
                                 # Alert the coordinator so it can craft real guidance
                                 deps.coordinator_inbox.put_nowait(
                                     f"PATROL ALERT: solver '{spec}' on '{ch_name}' looks stuck "
-                                    f"({reason}). Use read_solver_trace to see what it's doing, "
+                                    f"({reason}).{evidence} Use read_solver_trace to see what it's doing, "
                                     f"then advise_agent with specific next steps."
                                 )
                         else:

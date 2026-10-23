@@ -154,6 +154,28 @@ def test_patrol_trace_activity() -> None:
         assert trace_activity(str(Path(td) / "nope.jsonl")) == (0.0, [])
 
 
+def test_approach_queue() -> None:
+    """build_approach_queue turns skill packs into a deterministic technique queue."""
+    import tempfile
+
+    from backend.approaches import build_approach_queue
+
+    with tempfile.TemporaryDirectory() as td:
+        pack = Path(td) / "ctf-pwn"
+        pack.mkdir(parents=True)
+        (pack / "INDEX.md").write_text("# index", encoding="utf-8")
+        (pack / "heap-techniques.md").write_text("# Heap Techniques\n...", encoding="utf-8")
+        (pack / "format-string.md").write_text("# Format String\n...", encoding="utf-8")
+        (pack / "rop.md").write_text("# ROP\n...", encoding="utf-8")
+
+        q = build_approach_queue(["ctf-pwn"], td)
+        assert len(q) == 3
+        assert q[0].path == "/skills/ctf-pwn/format-string.md"  # sorted
+        assert q[0].title == "Format String"
+        paths = [a.path for a in q]
+        assert len(set(paths)) == 3  # unique
+
+
 def test_advice_mailbox() -> None:
     """Coordinator→solver advice is queued per-solver and drained once."""
     async def _run() -> None:

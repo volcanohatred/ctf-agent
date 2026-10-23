@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.agents.solver import Solver
+from backend.approaches import build_approach_queue
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.message_bus import ChallengeMessageBus
@@ -78,6 +79,14 @@ class ChallengeSwarm:
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
     skill_router: SkillRouter = field(init=False)
     _skill_pack_ids: list[str] = field(init=False, default_factory=list)
+    # Direction-rotation state (anti-loop): per-challenge queue of candidate
+    # techniques + per-solver assignment/failure tracking.
+    _approach_queue: list = field(init=False, default_factory=list)
+    _failed_approaches: list[str] = field(init=False, default_factory=list)
+    _assigned_approach: dict[str, str] = field(init=False, default_factory=dict)
+    _total_bumps: int = field(init=False, default=0)
+    _escalated: bool = field(init=False, default=False)
+    _pending_extra: list[str] = field(init=False, default_factory=list)  # escalation specs to spawn
 
     def __post_init__(self) -> None:
         self.skill_router = SkillRouter(skills_dir=getattr(self.settings, "skills_dir", "") or "")
@@ -93,6 +102,13 @@ class ChallengeSwarm:
                 if self._skill_pack_ids:
                     logger.info(
                         f"[{self.meta.name}] Skill triage → {self._skill_pack_ids}"
+                    )
+                    self._approach_queue = build_approach_queue(
+                        self._skill_pack_ids,
+                        getattr(self.settings, "skills_dir", "") or "",
+                    )
+                    logger.info(
+                        f"[{self.meta.name}] Approach queue: {len(self._approach_queue)} techniques"
                     )
             except Exception as e:
                 logger.warning(f"[{self.meta.name}] Skill triage failed: {e}")
@@ -175,12 +191,102 @@ class ChallengeSwarm:
             logger.warning(f"[{self.meta.name}] Skill hint render failed: {e}")
             return ""
 
+    def _next_approach(self, model_spec: str):
+        """Assign the next untried technique to this solver.
+
+        The previously assigned approach is marked as failed (the solver is
+        back for a bump), so retries systematically walk the technique space
+        instead of repeating a dead end.
+        """
+        prev_path = self._assigned_approach.get(model_spec)
+        if prev_path:
+            prev = next((a for a in self._approach_queue if a.path == prev_path), None)
+            if prev and prev.title not in self._failed_approaches:
+                self._failed_approaches.append(prev.title)
+        for a in self._approach_queue:
+            if a.title not in self._failed_approaches and a.path != prev_path:
+                self._assigned_approach[model_spec] = a.path
+                return a
+        return None
+
     def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
-        parts = [reason, "", self._gather_sibling_insights(model_spec)]
+        """Rotation-based bump: dead-end ledger + assign the next untried technique."""
+        parts = [reason]
+
+        if self._failed_approaches:
+            parts.append(
+                "\n🚫 Directions already tried and FAILED — do NOT repeat these:\n"
+                + "\n".join(f"  ✗ {t}" for t in self._failed_approaches)
+            )
+
+        nxt = self._next_approach(model_spec)
+        if nxt:
+            parts.append(
+                f"\n🎯 This attempt, focus on ONE new direction nobody has tried yet: "
+                f"**{nxt.title}**\n"
+                f"Full handbook: `{nxt.path}` — read it first (`sed -n '1,160p' {nxt.path}`), "
+                "then apply its concrete technique."
+            )
+
+        insights = self._gather_sibling_insights(model_spec)
+        if "No sibling insights" not in insights:
+            parts += ["", insights]
+
         hint = self._skill_hint(bump_count)
         if hint:
             parts += ["", hint]
         return "\n".join(p for p in parts if p.strip())
+
+    # Escalation: after this many total failed bumps across the swarm with no
+    # winner, add a stronger solver instead of spinning in place forever.
+    # Overridable via settings.escalate_after_bumps.
+    ESCALATE_AFTER_BUMPS = 8
+
+    def _maybe_escalate(self) -> None:
+        """Queue a stronger-model solver when the swarm keeps failing."""
+        if self._escalated or self.cancel_event.is_set():
+            return
+        threshold = int(getattr(self.settings, "escalate_after_bumps", 0) or self.ESCALATE_AFTER_BUMPS)
+        if self._total_bumps < threshold:
+            return
+        strong = getattr(self.settings, "coordinator_model", "") or "qwen3.8-max"
+        spec = f"claude-sdk/{strong}"
+        if spec in self.solvers or spec in self._pending_extra:
+            return
+        self._escalated = True
+        logger.warning(
+            f"[{self.meta.name}] {self._total_bumps} bumps without a flag — escalating to {spec}"
+        )
+        self._pending_extra.append(spec)
+
+    async def _run_escalated_solver(self, model_spec: str) -> None:
+        """Run an escalation solver seeded with the full dead-end ledger."""
+        solver = self._create_solver(model_spec)
+        self.solvers[model_spec] = solver
+        try:
+            await solver.start()
+            solver.bump(self._escalation_briefing())  # seed it with everything we learned
+            result, solver = await self._run_solver_loop(solver, model_spec)
+            if result and result.status == FLAG_FOUND:
+                self.winner = result
+                self.winner_spec = model_spec
+                self.cancel_event.set()
+        except Exception as e:
+            logger.error(f"[{self.meta.name}/{model_spec}] escalation solver error: {e}")
+        finally:
+            await solver.stop()
+
+    def _escalation_briefing(self) -> str:
+        failed = "\n".join(f"  ✗ {t}" for t in self._failed_approaches) or "  (none recorded)"
+        tried_files = "\n".join(f"  - {a.path}" for a in self._approach_queue
+                                if a.title in self._failed_approaches) or "  (none)"
+        return (
+            "You are a STRONGER solver brought in after others failed this challenge.\n\n"
+            "Directions already tried and FAILED (do not repeat):\n" + failed + "\n\n"
+            "Skill handbooks consulted so far:\n" + tried_files + "\n\n"
+            "Bring a genuinely different, more sophisticated technique. "
+            "If the library has an advanced file, use it."
+        )
 
     # Escalating cooldowns after incorrect submissions (per model)
     SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]  # 0s, 30s, 2min, 5min, 10min
@@ -390,6 +496,8 @@ class ChallengeSwarm:
 
             # ---- bump path: GAVE_UP, recoverable ERROR, or time budget hit ----
             bump_count += 1
+            self._total_bumps += 1
+            self._maybe_escalate()
             # Cooldown between bumps — check cancellation during wait
             try:
                 await asyncio.wait_for(
@@ -417,14 +525,24 @@ class ChallengeSwarm:
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
-        tasks = [
+        tasks: set[asyncio.Task] = {
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in self.model_specs
-        ]
+        }
 
         try:
             while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                # Timeout so escalations queued mid-run get picked up.
+                done, pending = await asyncio.wait(
+                    tasks, timeout=10, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Spawn any escalation solvers queued since last wake
+                while self._pending_extra:
+                    spec = self._pending_extra.pop(0)
+                    pending.add(asyncio.create_task(
+                        self._run_escalated_solver(spec), name=f"solver-escalate-{spec}"
+                    ))
 
                 for task in done:
                     try:
@@ -438,7 +556,7 @@ class ChallengeSwarm:
                         await asyncio.gather(*pending, return_exceptions=True)
                         return result
 
-                tasks = list(pending)
+                tasks = set(pending)
 
             self.cancel_event.set()
             return self.winner

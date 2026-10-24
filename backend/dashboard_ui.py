@@ -201,6 +201,19 @@ async function renderDetail() {
   }
   html += `</tbody></table></div>`;
 
+  // shared-experience feed (blackboard): facts + dead-ends + broadcasts
+  if (s.shared_feed && s.shared_feed.length) {
+    html += `<div class="panel"><div style="color:var(--blue);font-weight:600;margin-bottom:6px">📋 共享经验与踩坑记录（模型间的黑板）</div><div style="max-height:240px;overflow-y:auto">`;
+    for (const f of [...s.shared_feed].reverse()) {
+      const ts = new Date(f.ts * 1000).toLocaleTimeString();
+      const mdl = (f.model || '').replace('claude-sdk/', '');
+      if (f.kind === 'excluded') html += `<div style="color:var(--red);font-size:12px;margin:3px 0">✗ [${ts}] <b>${esc(mdl)}</b> 排除: ${esc(f.content)}</div>`;
+      else if (f.kind === 'broadcast') html += `<div style="color:var(--amber);font-size:12px;margin:3px 0">📢 [${ts}] <b>${esc(mdl)}</b>: ${esc(f.content)}</div>`;
+      else html += `<div style="color:var(--green);font-size:12px;margin:3px 0">✓ [${ts}] <b>${esc(mdl)}</b>: ${esc(f.content)}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
   // guidance panel
   html += `<div class="panel guide">
       <div style="color:var(--blue);font-weight:600;margin-bottom:6px">📨 喂提示 / 指导（指导信箱——模型执行中就能收到）</div>

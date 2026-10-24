@@ -176,6 +176,40 @@ def test_approach_queue() -> None:
         assert len(set(paths)) == 3  # unique
 
 
+def test_swarm_summary_shared_feed() -> None:
+    """_swarm_summary exposes the message_bus findings as shared_feed entries."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from backend.message_bus import ChallengeMessageBus
+    from backend.web_dashboard import DashboardServer
+
+    bus = ChallengeMessageBus()
+    asyncio.run(bus.post("m1", "found weak CRC32", kind="fact"))
+    asyncio.run(bus.post("m2", "format string ruled out", kind="excluded"))
+    asyncio.run(bus.broadcast("coordinator hint"))
+
+    swarm = SimpleNamespace(
+        meta=SimpleNamespace(category="crypto", value=100),
+        model_specs=["m1"],
+        solvers={},
+        cancel_event=asyncio.Event(),
+        winner=None, winner_spec="",
+        _total_bumps=0, _failed_approaches=[],
+        findings={},
+        message_bus=bus,
+    )
+    deps = SimpleNamespace(cost_tracker=None)
+    srv = DashboardServer(deps)
+    out = srv._swarm_summary("chal", swarm)
+    feed = out["shared_feed"]
+    assert len(feed) == 3, feed
+    assert feed[0]["kind"] == "fact" and "CRC32" in feed[0]["content"]
+    assert feed[1]["kind"] == "excluded"
+    assert feed[2]["kind"] == "broadcast"
+    assert feed[0]["model"] == "m1"
+
+
 def test_advice_mailbox() -> None:
     """Coordinator→solver advice is queued per-solver and drained once."""
     async def _run() -> None:

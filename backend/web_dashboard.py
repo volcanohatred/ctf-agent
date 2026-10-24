@@ -129,6 +129,22 @@ class DashboardServer:
                 if thinking:
                     agent["thinking"] = thinking
             agents[spec] = agent
+        # Shared blackboard feed — what solvers posted for siblings (facts,
+        # excluded dead-ends, coordinator broadcasts). This is the
+        # "shared experience" across models on this challenge.
+        feed: list[dict] = []
+        try:
+            bus = getattr(swarm, "message_bus", None)
+            if bus is not None:
+                for f in bus.findings[-30:]:
+                    feed.append({
+                        "model": f.model,
+                        "kind": f.kind,
+                        "content": f.content[:400],
+                        "ts": f.timestamp,
+                    })
+        except Exception:
+            pass
         return {
             "challenge": name,
             "category": getattr(meta, "category", ""),
@@ -140,6 +156,7 @@ class DashboardServer:
             "failed_approaches": getattr(swarm, "_failed_approaches", []),
             "agents": agents,
             "findings": dict(swarm.findings),
+            "shared_feed": feed,
         }
 
     async def _state(self, _req: web.Request) -> web.Response:

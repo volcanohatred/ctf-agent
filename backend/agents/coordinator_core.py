@@ -48,16 +48,33 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
     for name in finished:
         swarm = deps.swarms[name]
         try:
+            # Preserve the blackboard feed + per-agent findings so the export
+            # and the dashboard still show the full picture after archival.
+            feed = []
+            bus = getattr(swarm, "message_bus", None)
+            if bus is not None:
+                for f in bus.findings:
+                    feed.append({"model": f.model, "kind": f.kind,
+                                 "content": f.content, "ts": f.timestamp})
+            agents_hist = {}
+            for spec in swarm.model_specs:
+                agents_hist[spec] = {
+                    "status": "finished",
+                    "findings": swarm.findings.get(spec, ""),
+                }
             deps.swarms_history[name] = {
                 "challenge": name,
                 "category": getattr(swarm.meta, "category", ""),
                 "value": getattr(swarm.meta, "value", 0),
+                "description": getattr(swarm.meta, "description", ""),
+                "tags": getattr(swarm.meta, "tags", []),
                 "winner": swarm.winner.flag if swarm.winner else None,
                 "winner_spec": swarm.winner_spec,
                 "bumps": getattr(swarm, "_total_bumps", 0),
                 "failed_approaches": getattr(swarm, "_failed_approaches", []),
+                "agents": agents_hist,
+                "shared_feed": feed,
                 "finished_at": __import__("time").time(),
-                "agents": {},  # traces archived separately on disk
             }
         except Exception:
             deps.swarms_history[name] = {"challenge": name, "winner": None}

@@ -234,6 +234,41 @@ def test_swarm_summary_shared_feed() -> None:
     assert feed[0]["model"] == "m1"
 
 
+def test_export_report() -> None:
+    """Export aggregates meta + agents + shared feed + failed approaches."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from backend.export import build_report, render_json, render_markdown
+    from backend.message_bus import ChallengeMessageBus
+
+    bus = ChallengeMessageBus()
+    asyncio.run(bus.post("m1", "found weak CRC32", kind="fact"))
+    asyncio.run(bus.post("m2", "format string ruled out", kind="excluded"))
+
+    solver = SimpleNamespace(_step_count=42, tracer=None)
+    swarm = SimpleNamespace(
+        meta=SimpleNamespace(category="pwn", value=200, description="heap pwn", tags=["heap"]),
+        model_specs=["m1"],
+        solvers={"m1": solver},
+        cancel_event=asyncio.Event(),
+        winner=None, winner_spec="",
+        _total_bumps=3,
+        _failed_approaches=["format string", "ret2win"],
+        findings={"m1": "found weak CRC32"},
+        message_bus=bus,
+    )
+    deps = SimpleNamespace(cost_tracker=None)
+    report = build_report("test-chal", swarm, None, deps)
+    assert report["name"] == "test-chal"
+    assert report["failed_approaches"] == ["format string", "ret2win"]
+    assert len(report["shared_feed"]) == 2
+    md = render_markdown(report)
+    assert "死路账本" in md and "共享黑板" in md and "m1" in md
+    js = render_json(report)
+    assert '"name": "test-chal"' in js
+
+
 def test_advice_mailbox() -> None:
     """Coordinator→solver advice is queued per-solver and drained once."""
     async def _run() -> None:

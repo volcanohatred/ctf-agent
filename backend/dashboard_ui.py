@@ -160,6 +160,11 @@ async function renderDetail() {
       <span class="kv">bump <b>${s.bumps || 0}</b> 次</span>
       <span class="kv">本题成本 <b>$${cost.toFixed(3)}</b></span>
       <span class="kv">状态 <b>${statusTxt}</b></span>
+    </div>
+    <div style="margin-top:8px">
+      <a href="/api/export?name=${encodeURIComponent(SEL)}&fmt=md" download><button>📥 导出 Markdown 报告</button></a>
+      <a href="/api/export?name=${encodeURIComponent(SEL)}&fmt=json" download><button class="ghost">JSON</button></a>
+      <span class="muted">（含各模型的踩坑点 / 尝试过程 / 共享黑板 / 死路账本，可写 writeup）</span>
     </div>`;
   if (s.winner) html += `<div class="flagbox">🚩 ${esc(s.winner)}<span class="muted" style="font-weight:400">　by ${esc(s.winner_spec || '')}</span></div>`;
   if (s.failed_approaches && s.failed_approaches.length)

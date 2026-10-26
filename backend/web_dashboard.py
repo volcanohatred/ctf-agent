@@ -69,6 +69,7 @@ class DashboardServer:
             web.get("/", self._index),
             web.get("/api/state", self._state),
             web.get("/api/trace", self._trace),
+            web.get("/api/export", self._export),
             web.post("/api/advise", self._advise),
             web.post("/api/bump", self._bump),
             web.post("/api/broadcast", self._broadcast),
@@ -244,3 +245,28 @@ class DashboardServer:
         from backend.agents.coordinator_core import do_spawn_swarm
         result = await do_spawn_swarm(self.deps, name)
         return web.json_response({"ok": True, "result": result})
+
+    async def _export(self, req: web.Request) -> web.Response:
+        """Download a full challenge report (JSON or Markdown)."""
+        from backend.export import build_report, render_json, render_markdown
+
+        name = req.query.get("name", "")
+        fmt = req.query.get("fmt", "md")
+        swarm = self.deps.swarms.get(name)
+        archived = getattr(self.deps, "swarms_history", {}).get(name)
+        if swarm is None and archived is None:
+            return web.json_response({"error": "no such challenge"}, status=404)
+        report = build_report(name, swarm, archived, self.deps)
+        if fmt == "json":
+            body = render_json(report)
+            ctype = "application/json"
+            ext = "json"
+        else:
+            body = render_markdown(report)
+            ctype = "text/markdown"
+            ext = "md"
+        fname = f"ctf-report-{name}.{ext}"
+        return web.Response(
+            text=body, content_type=ctype,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )

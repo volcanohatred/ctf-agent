@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # After this many failed bump attempts across a swarm with no winner,
     # spawn a stronger-model solver (escalation ladder). 0 disables.
     escalate_after_bumps: int = 8
+    # Long findings posted to the blackboard get an LLM key-info summary for
+    # sibling injection (full text is always kept; nothing is truncated).
+    summarize_threshold_chars: int = 900
+    # Model used for blackboard summarization (fast/cheap gateway model).
+    summarizer_model: str = "deepseek-v4-flash"
     # Operator web dashboard (live swarm view + guidance mailbox UI).
     # 0 disables. Default 8080.
     dashboard_port: int = 8080

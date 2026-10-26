@@ -341,6 +341,22 @@ class ChallengeSwarm:
                 self._last_submit_time[model_spec] = time.monotonic()
             return display, is_confirmed
 
+    async def _post_finding(self, model_spec: str, content: str, kind: str) -> None:
+        """Post a finding to the blackboard; LLM-summarize long ones so siblings
+        get the key info (never truncated) without the verbose process log."""
+        content = (content or "").strip()
+        if not content:
+            return
+        summary = ""
+        threshold = int(getattr(self.settings, "summarize_threshold_chars", 900) or 900)
+        if len(content) > threshold:
+            try:
+                from backend.summarize import summarize_for_siblings
+                summary = await summarize_for_siblings(content, self.settings)
+            except Exception:
+                summary = ""
+        await self.message_bus.post(model_spec, content, kind=kind, summary=summary)
+
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
         solver = self._create_solver(model_spec)
         self.solvers[model_spec] = solver
@@ -367,9 +383,7 @@ class ChallengeSwarm:
         findings = getattr(solver, "_findings", "") or ""
         if findings:
             self.findings[model_spec] = findings
-            await self.message_bus.post(
-                model_spec, f"[excluded] (time budget hit) {findings}", kind="excluded"
-            )
+            await self._post_finding(model_spec, f"[excluded] (time budget hit) {findings}", "excluded")
 
     async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → (timeout harvest) → bump → run → ..."""
@@ -427,10 +441,8 @@ class ChallengeSwarm:
                     self.findings[model_spec] = result.findings_summary
                     kind = "excluded" if result.status == GAVE_UP else "fact"
                     # Store the FULL finding on the blackboard (dashboard shows it);
-                    # compaction for sibling injection happens in format_unread().
-                    await self.message_bus.post(
-                        model_spec, result.findings_summary, kind=kind
-                    )
+                    # long ones get an LLM key-info summary for sibling injection.
+                    await self._post_finding(model_spec, result.findings_summary, kind)
 
                 if result.status == FLAG_FOUND:
                     self.cancel_event.set()

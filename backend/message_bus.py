@@ -25,6 +25,9 @@ class Finding:
     content: str
     kind: str = KIND_FACT
     timestamp: float = field(default_factory=time.time)
+    # LLM-generated key-info summary (for long findings) — used when injecting
+    # into sibling prompts. The full `content` is NEVER truncated.
+    summary: str = ""
 
 
 MAX_FINDINGS = 200
@@ -45,10 +48,11 @@ class ChallengeMessageBus:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _advice: dict[str, list[str]] = field(default_factory=dict)
 
-    async def post(self, model: str, content: str, kind: str = KIND_FACT) -> None:
-        """Post a finding from a solver."""
+    async def post(self, model: str, content: str, kind: str = KIND_FACT, summary: str = "") -> None:
+        """Post a finding from a solver. `summary` (optional) is the LLM
+        key-info extraction used when injecting into siblings."""
         async with self._lock:
-            self.findings.append(Finding(model=model, content=content, kind=kind))
+            self.findings.append(Finding(model=model, content=content, kind=kind, summary=summary))
             if len(self.findings) > MAX_FINDINGS:
                 trim = len(self.findings) - MAX_FINDINGS
                 self.findings = self.findings[trim:]
@@ -82,26 +86,19 @@ class ChallengeMessageBus:
                 self._advice[model] = []
             return items
 
-    def format_unread(self, findings: list[Finding], max_per_finding: int = 500) -> str:
+    def format_unread(self, findings: list[Finding]) -> str:
         """Format findings for injection into a solver prompt, grouped by kind.
 
-        The blackboard STORES full findings (the dashboard shows them whole);
-        THIS function trims per-finding so sibling injections stay cheap on
-        solver context. Trimming is head+tail: the opening usually carries the
-        conclusion and the tail often carries the final flag/key/hash — the
-        verbose middle is what gets dropped, so critical info survives.
+        No truncation anywhere: short findings go in full; long findings use
+        their LLM-generated key-info `summary` (extracted at post time) so
+        siblings get the load-bearing facts without the verbose process logs.
         """
         if not findings:
             return ""
 
-        def clip(text: str) -> str:
-            text = text.strip()
-            if len(text) <= max_per_finding:
-                return text
-            head = max_per_finding * 2 // 3
-            tail = max_per_finding - head
-            omitted = len(text) - head - tail
-            return f"{text[:head]}\n…[{omitted} chars omitted]…\n{text[-tail:]}"
+        def render(f: Finding) -> str:
+            body = (f.summary or f.content).strip()
+            return f"- [{f.model}] {body}"
 
         excluded = [f for f in findings if f.kind == KIND_EXCLUDED]
         facts = [f for f in findings if f.kind == KIND_FACT]
@@ -110,11 +107,11 @@ class ChallengeMessageBus:
         parts: list[str] = ["**Findings from other agents:**"]
         if broadcasts:
             parts.append("\nCoordinator messages:")
-            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in broadcasts)
+            parts.extend(render(f) for f in broadcasts)
         if excluded:
             parts.append("\nDead ends already ruled out — do NOT retry these:")
-            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in excluded)
+            parts.extend(render(f) for f in excluded)
         if facts:
             parts.append("\nConfirmed facts:")
-            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in facts)
+            parts.extend(render(f) for f in facts)
         return "\n".join(parts)

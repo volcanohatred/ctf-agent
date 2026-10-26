@@ -91,6 +91,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 let STATE = null, SEL = null, SELSPEC = null;
+const openTraces = new Set();   // trace panels to keep open across refreshes
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 2200); }
@@ -107,7 +108,7 @@ async function refresh() {
   document.getElementById('nActive').textContent = Object.values(STATE.swarms).filter(s => !s.cancelled).length;
   document.getElementById('clock').textContent = new Date().toLocaleTimeString();
   renderList();
-  if (SEL) renderDetail();
+  if (SEL) { renderDetail().then(restoreTraces); } else { restoreTraces(); }
 }
 
 function renderList() {
@@ -230,14 +231,29 @@ function prepAdvise(spec) { SELSPEC = spec; const t = document.getElementById('g
 
 async function showTrace(spec) {
   SELSPEC = spec;
-  // element ids contain '/' (e.g. claude-sdk/kimi-k3) — use getElementById, never CSS.escape
   const row = document.getElementById('tracerow-' + spec);
   const box = document.getElementById('trace-' + spec);
   if (!row || !box) return;
-  if (row.style.display === 'none') {
+  if (row.style.display === 'none' || row.style.display === '') {
+    openTraces.add(spec);
     row.style.display = '';
     await loadTrace(spec, box);
-  } else { row.style.display = 'none'; }
+  } else {
+    openTraces.delete(spec);
+    row.style.display = 'none';
+  }
+}
+
+// After each refresh re-render, restore any open trace panels (and reload content)
+async function restoreTraces() {
+  for (const spec of openTraces) {
+    const row = document.getElementById('tracerow-' + spec);
+    const box = document.getElementById('trace-' + spec);
+    if (row && box) {
+      row.style.display = '';
+      await loadTrace(spec, box);
+    }
+  }
 }
 
 async function loadTrace(spec, box) {

@@ -128,22 +128,26 @@ def test_bus_grouping() -> None:
     asyncio.run(_run())
 
 
-def test_bus_head_tail_truncation() -> None:
-    """Long findings keep BOTH conclusion (head) and result (tail) when trimmed."""
+def test_bus_summary_injection() -> None:
+    """Long findings use their LLM summary for siblings; full text never lost."""
     async def _run() -> None:
         bus = ChallengeMessageBus()
-        # 1500-char finding: conclusion at head, key result at tail
-        long_finding = "结论：这是堆溢出" + "过程" * 600 + "KEY=0xDEADBEEF"
-        await bus.post("m1", long_finding, kind="fact")
+        long_finding = "结论：这是堆溢出\n" + "过程日志\n" * 400 + "\nKEY=0xDEADBEEF"
+        # simulate the post-time summarization result
+        bus_summary = "结论：堆溢出。KEY=0xDEADBEEF"
+        await bus.post("m1", long_finding, kind="fact", summary=bus_summary)
         unread = await bus.check("m2")
-        out = bus.format_unread(unread, max_per_finding=500)
-        assert "结论：这是堆溢出" in out          # head preserved
-        assert "KEY=0xDEADBEEF" in out           # tail preserved
-        assert "omitted" in out                   # middle dropped with a marker
-        # short findings pass through whole
-        await bus.post("m1", "short ok", kind="fact")
-        out2 = bus.format_unread(await bus.check("m2"), max_per_finding=500)
-        assert "short ok" in out2 and "omitted" not in out2
+        out = bus.format_unread(unread)
+        # siblings get the summary (short), NOT a truncated dump
+        assert "结论：堆溢出" in out and "KEY=0xDEADBEEF" in out
+        assert "过程日志" not in out  # verbose middle replaced by summary
+        # ...but the STORED content is the full text (dashboard shows it whole)
+        stored = unread[0]
+        assert "过程日志" in stored.content and len(stored.content) > 1000
+        # and a finding WITHOUT summary renders its full content
+        await bus.post("m2", "short fact", kind="fact")
+        out2 = bus.format_unread(await bus.check("m1"))
+        assert "short fact" in out2
 
     asyncio.run(_run())
 

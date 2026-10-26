@@ -172,10 +172,16 @@ class ChallengeSwarm:
         return solver
 
     def _gather_sibling_insights(self, exclude_model: str) -> str:
+        """Sibling findings for bump payloads — bounded per finding so the
+        bump context stays light (the blackboard stores them in full)."""
+        def _clip(text: str, limit: int = 400) -> str:
+            text = text.strip()
+            return text if len(text) <= limit else text[:limit] + " …"
+
         parts: list[str] = []
         for model, finding in self.findings.items():
             if model != exclude_model and finding:
-                parts.append(f"[{model}]: {finding}")
+                parts.append(f"[{model}]: {_clip(finding)}")
         return "\n\n".join(parts) if parts else "No sibling insights available yet."
 
     def _skill_hint(self, bump_count: int) -> str:

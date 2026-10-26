@@ -1,4 +1,4 @@
-"""Per-model solver agent — one model, one container, one challenge."""
+"""Per-model solver agent  — one model, one container, one challenge."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         if loop_status == "warn":
             result = f"{result}\n\n{LOOP_WARNING_MESSAGE}" if isinstance(result, str) else result
 
-        # Check for confirmed flag (avoid matching "INCORRECT" → CORRECT substring)
+        # Check for confirmed flag (avoid matching "INCORRECT"  — CORRECT substring)
         if name == "submit_flag" and "INCORRECT" not in result_str and any(m in result_str for m in CORRECT_MARKERS):
             self.tracer.event("flag_confirmed", tool=name, step=step)
 
@@ -247,7 +247,7 @@ class Solver:
                     if msg_usage and msg_usage.input_tokens:
                         self._last_input_tokens = msg_usage.input_tokens
                     if text.strip():
-                        self._findings = text[:2000]
+                        self._findings = text  # store full; summarizer handles sibling injection
                     self.tracer.model_response(
                         text[:500], self._step_count[0],
                         input_tokens=msg_usage.input_tokens if msg_usage else 0,
@@ -312,7 +312,7 @@ class Solver:
         summary_text = (
             "[Context compacted] Older tool outputs were dropped to free context space. "
             f"Your progress so far: {self._findings[:1500] or '(no summary available)'}\n"
-            "Files you created persist under /challenge/workspace/ — "
+            "Files you created persist under /challenge/workspace/  — "
             "re-run cheap read commands if you need their contents again."
         )
         summary_msg = ModelRequest(parts=[UserPromptPart(content=summary_text)])
@@ -359,7 +359,7 @@ class Solver:
         return SolverResult(
             flag=self._flag,
             status=status,
-            findings_summary=self._findings[:2000],
+            findings_summary=self._findings,
             step_count=run_steps if run_steps is not None else self._step_count[0],
             cost_usd=run_cost if run_cost is not None else cost,
             log_path=self.tracer.path,

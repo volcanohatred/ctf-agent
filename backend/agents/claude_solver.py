@@ -1,8 +1,8 @@
-"""Claude Agent SDK solver — native tools with execution hooks.
+"""Claude Agent SDK solver  — native tools with execution hooks.
 
 Uses Claude's native Bash tool, but intercepts every command via a PreToolUse
 hook and rewrites it to run inside the Docker sandbox via `docker exec`. Read,
-Write, and Edit are blocked — the model uses bash for all file operations.
+Write, and Edit are blocked  — the model uses bash for all file operations.
 Flag submission is intercepted from bash commands matching `submit_flag <flag>`.
 """
 
@@ -84,7 +84,7 @@ class ClaudeSolver:
 
     async def start(self) -> None:
         if self._client:
-            return  # idempotent — reset_session() clears _client to force rebuild
+            return  # idempotent  — reset_session() clears _client to force rebuild
         if not self.sandbox._container:
             await self.sandbox.start()
 
@@ -96,7 +96,7 @@ class ClaudeSolver:
         distfile_names = list_distfiles(self.challenge_dir)
         sandbox_preamble = (
             "IMPORTANT: You are running inside a Docker sandbox. "
-            "All files are under /challenge/ — distfiles at /challenge/distfiles/, "
+            "All files are under /challenge/  — distfiles at /challenge/distfiles/, "
             "workspace at /challenge/workspace/. Do NOT use any paths outside /challenge/. "
             "All bash commands run inside the container via docker exec. "
             "Use bash for everything: cat/head to read files, tee/echo> to write, find/grep to search. "
@@ -109,7 +109,7 @@ class ClaudeSolver:
         )
 
         # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
-        # Block Read/Write/Edit — model should use bash for file access.
+        # Block Read/Write/Edit  — model should use bash for file access.
         async def sandbox_redirect(input_data, tool_use_id, context):
             try:
                 return await _sandbox_redirect_inner(input_data, tool_use_id, context)
@@ -134,7 +134,7 @@ class ClaudeSolver:
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "Loop detected — try a different approach.",
+                        "permissionDecisionReason": "Loop detected  — try a different approach.",
                     }
                 }
             warn_msg = ""
@@ -145,16 +145,16 @@ class ClaudeSolver:
             if tool_name == "Bash":
                 command = tool_input.get("command", "")
 
-                # Intercept submit_flag commands — handle submission directly
+                # Intercept submit_flag commands  — handle submission directly
                 flag_match = re.match(r"submit_flag\s+['\"]?(.+?)['\"]?\s*$", command.strip())
                 if flag_match:
                     flag_val = flag_match.group(1).strip()
-                    # Route through the swarm when available — it dedups,
+                    # Route through the swarm when available  — it dedups,
                     # rate-limits, and (offline) verifies the answer key.
                     if self.submit_fn:
                         display, confirmed = await self.submit_fn(flag_val)
                     elif self.no_submit:
-                        display, confirmed = f'DRY RUN — would submit "{flag_val}"', False
+                        display, confirmed = f'DRY RUN  — would submit "{flag_val}"', False
                     else:
                         from backend.tools.core import do_submit_flag
                         display, confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag_val)
@@ -209,21 +209,21 @@ class ClaudeSolver:
             if tool_name in ("WebFetch", "WebSearch"):
                 return {"systemMessage": warn_msg} if warn_msg else {}
 
-            # Everything else is denied — Glob/Grep/Read/Write/Edit/Agent/etc.
+            # Everything else is denied  — Glob/Grep/Read/Write/Edit/Agent/etc.
             # would run on the host filesystem, breaking sandbox isolation.
             # The model should use find/grep/cat/tee via bash instead.
             redirect_hint = ""
             if tool_name in ("Glob", "Grep"):
-                redirect_hint = " Use `find` or `grep` via bash instead — those run in the container."
+                redirect_hint = " Use `find` or `grep` via bash instead  — those run in the container."
             elif tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
                 redirect_hint = " Use cat/head/tail to read, and tee/cat>file to write via bash."
 
             return {
-                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",
+                "systemMessage": f"{tool_name} is not available  — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": f"{tool_name} blocked — use bash for all operations inside the sandbox.",
+                    "permissionDecisionReason": f"{tool_name} blocked  — use bash for all operations inside the sandbox.",
                 },
             }
 
@@ -269,7 +269,7 @@ class ClaudeSolver:
             return {}
 
         from backend.models import claude_cli_env, effort_from_spec
-        # Effort levels are a Claude-native feature — gateway models (kimi,
+        # Effort levels are a Claude-native feature  — gateway models (kimi,
         # deepseek, qwen, ...) may reject the parameter, so only pass it for
         # genuine Claude models.
         effort = effort_from_spec(self.model_spec) if self.model_id.startswith("claude") else None
@@ -331,11 +331,11 @@ class ClaudeSolver:
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
-                            self._findings = block.text[:2000]
+                            self._findings = block.text  # store full
                             self.tracer.model_response(block.text[:800], self._step_count)
                         elif isinstance(block, ThinkingBlock):
                             # Reasoning models surface their plan as a ThinkingBlock
-                            # — capture it so the dashboard can show the live "思路".
+                            #  — capture it so the dashboard can show the live "思路".
                             self.tracer.model_response(
                                 f"[思考] {block.thinking[:800]}", self._step_count
                             )
@@ -413,7 +413,7 @@ class ClaudeSolver:
         # Use per-run metrics if provided, so broken-solver detection works across bumps
         return SolverResult(
             flag=self._flag, status=status,
-            findings_summary=self._findings[:2000],
+            findings_summary=self._findings,
             step_count=run_steps if run_steps is not None else self._step_count,
             cost_usd=run_cost if run_cost is not None else self._cost_usd,
             log_path=self.tracer.path,

@@ -128,6 +128,26 @@ def test_bus_grouping() -> None:
     asyncio.run(_run())
 
 
+def test_bus_head_tail_truncation() -> None:
+    """Long findings keep BOTH conclusion (head) and result (tail) when trimmed."""
+    async def _run() -> None:
+        bus = ChallengeMessageBus()
+        # 1500-char finding: conclusion at head, key result at tail
+        long_finding = "结论：这是堆溢出" + "过程" * 600 + "KEY=0xDEADBEEF"
+        await bus.post("m1", long_finding, kind="fact")
+        unread = await bus.check("m2")
+        out = bus.format_unread(unread, max_per_finding=500)
+        assert "结论：这是堆溢出" in out          # head preserved
+        assert "KEY=0xDEADBEEF" in out           # tail preserved
+        assert "omitted" in out                   # middle dropped with a marker
+        # short findings pass through whole
+        await bus.post("m1", "short ok", kind="fact")
+        out2 = bus.format_unread(await bus.check("m2"), max_per_finding=500)
+        assert "short ok" in out2 and "omitted" not in out2
+
+    asyncio.run(_run())
+
+
 def test_patrol_trace_activity() -> None:
     """trace_activity parses a solver trace for last-ts + repeated signatures."""
     import json

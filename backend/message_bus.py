@@ -82,10 +82,27 @@ class ChallengeMessageBus:
                 self._advice[model] = []
             return items
 
-    def format_unread(self, findings: list[Finding]) -> str:
-        """Format findings for injection into a solver prompt, grouped by kind."""
+    def format_unread(self, findings: list[Finding], max_per_finding: int = 500) -> str:
+        """Format findings for injection into a solver prompt, grouped by kind.
+
+        The blackboard STORES full findings (the dashboard shows them whole);
+        THIS function trims per-finding so sibling injections stay cheap on
+        solver context. Trimming is head+tail: the opening usually carries the
+        conclusion and the tail often carries the final flag/key/hash — the
+        verbose middle is what gets dropped, so critical info survives.
+        """
         if not findings:
             return ""
+
+        def clip(text: str) -> str:
+            text = text.strip()
+            if len(text) <= max_per_finding:
+                return text
+            head = max_per_finding * 2 // 3
+            tail = max_per_finding - head
+            omitted = len(text) - head - tail
+            return f"{text[:head]}\n…[{omitted} chars omitted]…\n{text[-tail:]}"
+
         excluded = [f for f in findings if f.kind == KIND_EXCLUDED]
         facts = [f for f in findings if f.kind == KIND_FACT]
         broadcasts = [f for f in findings if f.kind == KIND_BROADCAST]
@@ -93,11 +110,11 @@ class ChallengeMessageBus:
         parts: list[str] = ["**Findings from other agents:**"]
         if broadcasts:
             parts.append("\nCoordinator messages:")
-            parts.extend(f"- [{f.model}] {f.content}" for f in broadcasts)
+            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in broadcasts)
         if excluded:
             parts.append("\nDead ends already ruled out — do NOT retry these:")
-            parts.extend(f"- [{f.model}] {f.content}" for f in excluded)
+            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in excluded)
         if facts:
             parts.append("\nConfirmed facts:")
-            parts.extend(f"- [{f.model}] {f.content}" for f in facts)
+            parts.extend(f"- [{f.model}] {clip(f.content)}" for f in facts)
         return "\n".join(parts)

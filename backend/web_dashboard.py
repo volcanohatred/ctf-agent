@@ -140,7 +140,7 @@ class DashboardServer:
                     feed.append({
                         "model": f.model,
                         "kind": f.kind,
-                        "content": f.content[:400],
+                        "content": f.content,  # full text — the dashboard shows it whole
                         "ts": f.timestamp,
                     })
         except Exception:

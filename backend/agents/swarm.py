@@ -368,7 +368,7 @@ class ChallengeSwarm:
         if findings:
             self.findings[model_spec] = findings
             await self.message_bus.post(
-                model_spec, f"[excluded] (time budget hit) {findings[:450]}", kind="excluded"
+                model_spec, f"[excluded] (time budget hit) {findings}", kind="excluded"
             )
 
     async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
@@ -426,8 +426,10 @@ class ChallengeSwarm:
                         and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
                     self.findings[model_spec] = result.findings_summary
                     kind = "excluded" if result.status == GAVE_UP else "fact"
+                    # Store the FULL finding on the blackboard (dashboard shows it);
+                    # compaction for sibling injection happens in format_unread().
                     await self.message_bus.post(
-                        model_spec, result.findings_summary[:500], kind=kind
+                        model_spec, result.findings_summary, kind=kind
                     )
 
                 if result.status == FLAG_FOUND:

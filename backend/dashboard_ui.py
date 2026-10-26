@@ -209,10 +209,14 @@ async function renderDetail() {
   html += `</tbody></table></div>`;
 
   // 🆘 Help requests — knowledge gaps the solvers flagged for the operator
-  if (s.help_requests && s.help_requests.length) {
-    html += `<div class="panel" style="border-left:4px solid var(--red)">
-      <div style="color:var(--red);font-weight:600;margin-bottom:6px">🆘 求助项（模型主动举手——它们不懂的知识点）</div>`;
-    for (const h of [...s.help_requests].reverse()) {
+  // (always visible; empty state tells you nobody has raised a gap yet)
+  html += `<div class="panel" style="border-left:4px solid var(--red)">
+      <div style="color:var(--red);font-weight:600;margin-bottom:6px">🆘 求助/卡点（模型不懂的知识点 + 卡住的位置）</div>`;
+  const helpItems = (s.help_requests && s.help_requests.length) ? s.help_requests : [];
+  if (!helpItems.length) {
+    html += `<div class="muted" style="font-size:12px">暂无求助项。模型卡住或遇到不懂的东西时会在这里出现（含它的原话思路），你点"回复它"就能喂答案。</div>`;
+  } else {
+    for (const h of [...helpItems].reverse()) {
       const ts = new Date(h.ts * 1000).toLocaleTimeString();
       const mdl = (h.model || '').replace('claude-sdk/', '');
       html += `<div style="margin:8px 0;padding:8px 10px;background:#fef2f2;border-radius:6px;font-size:12.5px">
@@ -221,8 +225,8 @@ async function renderDetail() {
         <button class="purp" style="margin-top:6px;font-size:11px" onclick="replyHelp('${esc(mdl)}', this)">回复它 →</button>
       </div>`;
     }
-    html += `<div class="muted" style="margin-top:4px">回复内容会进它的指导信箱（执行中就能读到）。</div></div>`;
   }
+  html += `<div class="muted" style="margin-top:4px">回复内容会进它的指导信箱（执行中就能读到）。</div></div>`;
 
   // shared-experience feed (blackboard): facts + dead-ends + broadcasts
   if (s.shared_feed && s.shared_feed.length) {

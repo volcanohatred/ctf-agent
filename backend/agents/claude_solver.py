@@ -226,6 +226,11 @@ class ClaudeSolver:
             if tool_name in ("WebFetch", "WebSearch"):
                 return {"systemMessage": warn_msg} if warn_msg else {}
 
+            # StructuredOutput is the SDK's answer-submission channel — safe and
+            # required for flag reporting; allow it (no filesystem side effects).
+            if tool_name == "StructuredOutput":
+                return {}
+
             # Everything else is denied  — Glob/Grep/Read/Write/Edit/Agent/etc.
             # would run on the host filesystem, breaking sandbox isolation.
             # The model should use find/grep/cat/tee via bash instead.
@@ -234,6 +239,9 @@ class ClaudeSolver:
                 redirect_hint = " Use `find` or `grep` via bash instead  — those run in the container."
             elif tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
                 redirect_hint = " Use cat/head/tail to read, and tee/cat>file to write via bash."
+            elif tool_name in ("Agent", "Task", "TaskCreate", "TaskStop"):
+                redirect_hint = (" Sub-agents are not available here — do the work directly "
+                                 "with your own bash commands instead of spawning a sub-agent.")
 
             return {
                 "systemMessage": f"{tool_name} is not available  — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",

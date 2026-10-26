@@ -17,7 +17,7 @@ from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
-from backend.trace_read import trace_activity
+from backend.trace_read import last_model_text, trace_activity
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,22 @@ async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
 # Proactive patrol — detect stuck solvers, nudge them via the fast mailbox.
 # ---------------------------------------------------------------------------
 
+# Signals that a solver is stuck on something it doesn't understand — used by
+# the patrol to auto-surface a help point (so the operator sees the gap even
+# if the model never calls request_help itself).
+_CONFUSION_SIGNALS = (
+    "不知道", "不懂", "不理解", "不明白", "不认识", "看不懂", "不了解", "不熟悉", "没见过",
+    "unknown", "unfamiliar", "don't know", "not sure", "no idea",
+    "confusing", "unclear", "unrecogniz", "what is this", "custom protocol",
+    "proprietary", "never seen", "makes no sense",
+)
+
+
+def _looks_confused(text: str) -> bool:
+    t = (text or "").lower()
+    return any(s in t for s in _CONFUSION_SIGNALS)
+
+
 async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: int) -> None:
     """Periodically scan active solvers; alert + advise the stuck ones.
 
@@ -303,6 +319,19 @@ async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: in
                                     else "repeating the same command"
                                 )
                                 logger.warning(f"[patrol] {key} stuck ({reason})")
+                                # Auto-surface a help point if the solver's recent
+                                # thinking shows it hit something it doesn't understand.
+                                try:
+                                    thinking = last_model_text(trace_path)
+                                    if thinking and _looks_confused(thinking):
+                                        gap = (
+                                            f"模型 {spec} 卡在了它不懂的东西上。它的原话思路："
+                                            f"「{thinking[:280]}」"
+                                        )
+                                        await swarm.message_bus.post_help(spec, gap)
+                                        logger.info(f"[patrol] {key} auto-help-point posted")
+                                except Exception:
+                                    pass
                                 # Specific nudge: cite the exact repeated evidence + next direction
                                 evidence = ""
                                 if looping and sigs:

@@ -186,8 +186,9 @@ def build_prompt(
         (
             '8. **Knowledge gaps**: if you hit something you genuinely don\'t understand '
             "(an unknown protocol, an unfamiliar scheme, a technique you don't know), "
-            "call `request_help` with a SPECIFIC question (what you observed, what you "
-            "tried, exactly what's unclear). A human operator will research it and reply."
+            "raise it IMMEDIATELY with `request_help '具体描述你不懂的点'`. "
+            "A human operator watches and will reply with the answer. "
+            "Don't waste many turns guessing at unfamiliar tech — ask."
         ),
     ]
 

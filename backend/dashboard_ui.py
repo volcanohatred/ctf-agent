@@ -93,6 +93,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 let STATE = null, SEL = null, SELSPEC = null;
 const openTraces = new Set();   // trace panels to keep open across refreshes
 let gTextContent = '';          // guidance textarea content — survives refreshes
+let gTextFocused = false;       // whether the operator is actively typing
+let gTextCaret = 0;             // caret position to restore after re-render
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 2200); }
@@ -245,15 +247,23 @@ async function renderDetail() {
   html += `<div class="panel guide">
       <div style="color:var(--blue);font-weight:600;margin-bottom:6px">📨 喂提示 / 指导（指导信箱——模型执行中就能收到）</div>
       <div class="muted">目标 solver：<b id="gTarget">${SELSPEC ? esc(SELSPEC) : '(点上表"提示"选择)'}</b></div>
-      <textarea id="gText" oninput="gTextContent=this.value" placeholder="例如：这个协议是 XX，格式是…，去读 /skills/ctf-web/xx.md 的 Y 手法；或者：你已经拿到 A，下一步用 B 解"></textarea>
+      <textarea id="gText" oninput="gTextContent=this.value;gTextCaret=this.selectionStart"
+        onfocus="gTextFocused=true" onblur="gTextFocused=false"
+        placeholder="例如：这个协议是 XX，格式是…，去读 /skills/ctf-web/xx.md 的 Y 手法；或者：你已经拿到 A，下一步用 B 解"></textarea>
       <button onclick="sendAdvice()">📨 发给该 solver</button>
       <button class="warn" onclick="sendBroadcast()">📢 广播给本题全部</button>
       <div class="muted" style="margin-top:6px">提示会插进模型的工具结果里（每 3 步拉取一次）；写入即达，不用等重开</div>
     </div>`;
   el.innerHTML = html;
-  // Restore the in-progress guidance text after every re-render
+  // Restore the in-progress guidance text + focus + caret after every re-render
   const gt = document.getElementById('gText');
-  if (gt && gTextContent) { gt.value = gTextContent; }
+  if (gt && gTextContent) {
+    gt.value = gTextContent;
+    if (gTextFocused) {
+      gt.focus();
+      try { gt.setSelectionRange(gTextCaret, gTextCaret); } catch (e) {}
+    }
+  }
 }
 
 function prepAdvise(spec) { SELSPEC = spec; const t = document.getElementById('gTarget'); if (t) t.textContent = spec; toast('已选定 ' + spec + '，写内容后点发送'); }

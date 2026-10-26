@@ -67,7 +67,8 @@ class Settings(BaseSettings):
     # is bumped with fresh direction. 0 = no budget.
     solver_time_budget_s: int = 1500
     # Start injecting skill-library hints after this many failed attempts (bumps).
-    skill_after_bumps: int = 1
+    # Default 2 = first retry is lean (rotation only); skills join from the 2nd failure.
+    skill_after_bumps: int = 2
     # Coordinator model — use your STRONGEST model here (it coaches weaker
     # solvers). Empty = CLI --coordinator-model, else built-in default.
     coordinator_model: str = ""

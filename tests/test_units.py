@@ -85,9 +85,9 @@ def test_render_hint_levels() -> None:
     with tempfile.TemporaryDirectory() as td:
         router = SkillRouter(skills_dir=str(_make_fake_skills(Path(td))))
         h1 = router.render_hint(["ctf-pwn"], level=1)
-        assert "/skills/ctf-pwn/INDEX.md" in h1
-        assert "heap-techniques.md" in h1  # from the index excerpt
-        assert "level 1" in h1
+        # L1 is a SHORT pointer (no full content) — progressive disclosure
+        assert "/skills/ctf-pwn" in h1
+        assert "heap-techniques.md" not in h1  # content is withheld until L2+
 
         h2 = router.render_hint(["ctf-pwn"], level=2)
         assert "Full file list" in h2

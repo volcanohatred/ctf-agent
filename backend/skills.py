@@ -201,7 +201,20 @@ class SkillRouter:
         if not self._enabled or not pack_ids:
             return ""
 
-        parts: list[str] = [
+        parts: list[str] = []
+
+        if level <= 1:
+            # Level 1: SHORT pointer only — don't spend tokens on content yet.
+            # Just tell the solver the pack exists and where its index is.
+            pack_list = ", ".join(f"{SANDBOX_SKILLS_ROOT}/{p}/" for p in pack_ids)
+            return (
+                "KNOWLEDGE BASE: this challenge matches a technique pack in the "
+                f"library mounted read-only at {SANDBOX_SKILLS_ROOT}/. "
+                f"If you're stuck, skim `{pack_list}INDEX.md` and read ONE relevant file. "
+                "(Only escalate to reading full docs if a quick retry fails.)"
+            )
+
+        parts += [
             f"KNOWLEDGE BASE (escalation level {level}):",
             f"A CTF technique library is mounted read-only at `{SANDBOX_SKILLS_ROOT}/` "
             "inside your container. Your current direction has not worked — "

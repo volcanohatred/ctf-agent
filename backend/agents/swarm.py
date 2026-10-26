@@ -210,22 +210,18 @@ class ChallengeSwarm:
         return None
 
     def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
-        """Rotation-based bump: dead-end ledger + assign the next untried technique."""
+        """Lean rotation bump: short reason + next untried technique + skill hint
+        only from the configured failure threshold onward."""
         parts = [reason]
 
         if self._failed_approaches:
-            parts.append(
-                "\n🚫 Directions already tried and FAILED — do NOT repeat these:\n"
-                + "\n".join(f"  ✗ {t}" for t in self._failed_approaches)
-            )
+            failed = "、".join(self._failed_approaches)
+            parts.append(f"\n🚫 已试且失败（勿重复）：{failed}")
 
         nxt = self._next_approach(model_spec)
         if nxt:
             parts.append(
-                f"\n🎯 This attempt, focus on ONE new direction nobody has tried yet: "
-                f"**{nxt.title}**\n"
-                f"Full handbook: `{nxt.path}` — read it first (`sed -n '1,160p' {nxt.path}`), "
-                "then apply its concrete technique."
+                f"\n🎯 本轮专攻新方向：【{nxt.title}】（手册 {nxt.path}，先读再做）"
             )
 
         insights = self._gather_sibling_insights(model_spec)

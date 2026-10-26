@@ -37,6 +37,7 @@ from backend.tools.sandbox import (
     list_files,
     notify_coordinator,
     read_file,
+    request_help,
     web_fetch,
     webhook_create,
     webhook_get_requests,
@@ -109,7 +110,8 @@ class TracingToolset(WrapperToolset[SolverDeps]):
 def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
     """Build the raw toolset for a solver agent."""
     tools = [bash, read_file, write_file, list_files, submit_flag, web_fetch,
-             webhook_create, webhook_get_requests, check_findings, notify_coordinator]
+             webhook_create, webhook_get_requests, check_findings, notify_coordinator,
+             request_help]
     if deps.use_vision:
         tools.append(view_image)
     return FunctionToolset(tools=tools, max_retries=4)
@@ -351,6 +353,18 @@ class Solver:
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")
+
+    def reset_history(self) -> None:
+        """Hard-reset the conversation for a FRESH attempt (fresh-restart mode).
+
+        The sandbox (files in /challenge/workspace) persists — only the LLM
+        message history is cleared. Used with the distilled journal so each
+        round starts with a clean context instead of an ever-growing history.
+        """
+        self._messages = []
+        self._last_input_tokens = 0
+        self.loop_detector.reset()
+        self.tracer.event("session_reset")
 
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
         agent_usage = self.cost_tracker.by_agent.get(self.agent_name)

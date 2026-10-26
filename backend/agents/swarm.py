@@ -87,6 +87,7 @@ class ChallengeSwarm:
     _total_bumps: int = field(init=False, default=0)
     _escalated: bool = field(init=False, default=False)
     _pending_extra: list[str] = field(init=False, default_factory=list)  # escalation specs to spawn
+    _journals: dict[str, list[str]] = field(init=False, default_factory=dict)  # per-solver distilled rounds
 
     def __post_init__(self) -> None:
         self.skill_router = SkillRouter(skills_dir=getattr(self.settings, "skills_dir", "") or "")
@@ -363,19 +364,68 @@ class ChallengeSwarm:
                 summary = ""
         await self.message_bus.post(model_spec, content, kind=kind, summary=summary)
 
-    async def _run_solver(self, model_spec: str) -> SolverResult | None:
-        solver = self._create_solver(model_spec)
-        self.solvers[model_spec] = solver
+    async def _fresh_restart(self, solver, model_spec: str, result: SolverResult,
+                              reason: str, bump_count: int, timed_out: bool) -> None:
+        """Fresh-restart retry: distill this round into the journal, optionally
+        meta-summarize it (dedup) every N rounds, reset the session, and seed a
+        clean new attempt carrying ONLY the distilled state — never an
+        ever-growing conversation history."""
+        from backend.round_summary import meta_summarize, summarize_round
 
-        try:
-            result, final_solver = await self._run_solver_loop(solver, model_spec)
-            solver = final_solver
-            return result
-        except Exception as e:
-            logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
-            return None
-        finally:
-            await solver.stop()
+        fresh_rounds = int(getattr(self.settings, "fresh_restart_rounds", 5) or 0)
+        # 1. distill this round — prefer the solver's real findings over the
+        # synthetic "time budget exhausted" placeholder
+        raw = (getattr(solver, "_findings", "") or result.findings_summary or reason)
+        note = await summarize_round(raw, self.settings)
+        journal = self._journals.setdefault(model_spec, [])
+        journal.append(note)
+
+        # 2. meta-summarize (dedup) every N rounds so the state never bloats
+        if fresh_rounds > 0 and len(journal) >= fresh_rounds:
+            state = await meta_summarize(journal, self.settings)
+            self._journals[model_spec] = [state]
+            journal = self._journals[model_spec]
+
+        # 3. hard-reset the session (workspace files persist; history clears)
+        reset = getattr(solver, "reset_session", None) or getattr(solver, "reset_history", None)
+        if reset:
+            try:
+                out = reset()
+                if asyncio.iscoroutine(out):
+                    await out
+            except Exception as e:
+                logger.warning(f"[{self.meta.name}/{model_spec}] reset failed: {e}")
+
+        # 4. build the restart seed and bump it into the fresh session
+        payload = self._build_restart_payload(model_spec, reason, bump_count)
+        solver.bump(payload)
+
+    def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
+        """The seed message for a freshly restarted session."""
+        journal = self._journals.get(model_spec, [])
+        state_txt = "\n".join(f"{i+1}. {j}" for i, j in enumerate(journal)) or "(暂无)"
+
+        parts = [
+            f"这是一次全新的尝试（第 {bump_count + 1} 轮）。你之前的探索状态已被蒸馏如下，"
+            "不要重复已失败的方向，直接基于它继续：",
+            "",
+            "【探索状态】",
+            state_txt,
+        ]
+        # Rotation: assign the next untried technique
+        nxt = self._next_approach(model_spec)
+        if nxt:
+            parts.append(
+                f"\n🎯 本轮主攻方向（未试过）：【{nxt.title}】（手册 {nxt.path}，先读再做）"
+            )
+        hint = self._skill_hint(bump_count)
+        if hint:
+            parts += ["", hint]
+        sib = self._gather_sibling_insights(model_spec)
+        if "No sibling insights" not in sib:
+            parts += ["", "【兄弟模型动态】", sib]
+        parts.append("\n开始吧。工作区里你之前创建的文件还在（/challenge/workspace/）。")
+        return "\n".join(p for p in parts if p.strip())
 
     async def _harvest_timeout(self, solver, model_spec: str) -> None:
         """Cairn-style conclude on wall-clock timeout: harvest, reset, move on."""
@@ -390,6 +440,20 @@ class ChallengeSwarm:
         if findings:
             self.findings[model_spec] = findings
             await self._post_finding(model_spec, f"[excluded] (time budget hit) {findings}", "excluded")
+
+    async def _run_solver(self, model_spec: str) -> SolverResult | None:
+        solver = self._create_solver(model_spec)
+        self.solvers[model_spec] = solver
+
+        try:
+            result, final_solver = await self._run_solver_loop(solver, model_spec)
+            solver = final_solver
+            return result
+        except Exception as e:
+            logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
+            return None
+        finally:
+            await solver.stop()
 
     async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → (timeout harvest) → bump → run → ..."""
@@ -532,7 +596,13 @@ class ChallengeSwarm:
                 )
             else:
                 reason = "Your previous attempt did not find the flag."
-            solver.bump(self._build_bump_payload(model_spec, reason, bump_count))
+
+            # Fresh-restart mode: distill this round, reset the session, and
+            # restart clean carrying only the distilled state (no history bloat).
+            if int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
+                await self._fresh_restart(solver, model_spec, result, reason, bump_count, timed_out)
+            else:
+                solver.bump(self._build_bump_payload(model_spec, reason, bump_count))
             logger.info(
                 f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
             )

@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # After this many failed bump attempts across a swarm with no winner,
     # spawn a stronger-model solver (escalation ladder). 0 disables.
     escalate_after_bumps: int = 8
+    # Fresh-restart retry: after a GAVE_UP, distill the round into a journal
+    # entry, reset the session, and restart with a clean context carrying only
+    # the distilled state. Every N rounds the journal is meta-summarized (and
+    # de-duplicated) so the carried state never grows unboundedly.
+    # 0/1 disables (falls back to the continue-session bump).
+    fresh_restart_rounds: int = 5
     # Long findings posted to the blackboard get an LLM key-info summary for
     # sibling injection (full text is always kept; nothing is truncated).
     summarize_threshold_chars: int = 900

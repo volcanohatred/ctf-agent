@@ -188,6 +188,23 @@ class ClaudeSolver:
                         }
                     }
 
+                # Intercept request_help commands — post to the blackboard for the human
+                help_match = re.match(r"request_help\s+['\"]?(.+?)['\"]?\s*$", command.strip())
+                if help_match:
+                    question = help_match.group(1).strip()
+                    from backend.tools.core import do_request_help
+                    result_msg = await do_request_help(
+                        self.message_bus, self.model_spec, question,
+                        notify_coordinator=self.notify_coordinator,
+                    )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "updatedInput": {**tool_input, "command": f"echo {shlex.quote(result_msg)}"},
+                        }
+                    }
+
                 # Rewrite command to run in the Docker container
                 escaped = shlex.quote(command)
                 rewritten = f"docker exec -i {self._container_id} bash -c {escaped}"

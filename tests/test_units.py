@@ -269,6 +269,47 @@ def test_export_report() -> None:
     assert '"name": "test-chal"' in js
 
 
+def test_help_request() -> None:
+    """request_help posts a 'help' finding to the bus and notifies coordinator."""
+    import asyncio
+
+    from backend.message_bus import ChallengeMessageBus
+    from backend.tools.core import do_request_help
+
+    async def _run() -> None:
+        bus = ChallengeMessageBus()
+        notified = []
+        async def notify(msg): notified.append(msg)
+        out = await do_request_help(bus, "m1", "unknown protocol XYZ — how to decode?", notify)
+        assert "Help request recorded" in out
+        assert notified and "HELP REQUEST" in notified[0]
+        findings = await bus.check("m2")
+        assert len(findings) == 1 and findings[0].kind == "help"
+        assert "XYZ" in findings[0].content
+
+    asyncio.run(_run())
+
+
+def test_round_summary_fallback() -> None:
+    """round_summary returns text unchanged when short / gateway absent (never loses info)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from backend.round_summary import meta_summarize, summarize_round
+
+    async def _run() -> None:
+        settings = SimpleNamespace(gateway_base_url="", gateway_api_key="", summarizer_model="")
+        # short text passes through
+        assert await summarize_round("short note", settings) == "short note"
+        # no gateway → meta_summarize falls back to a clean join (deduped join of entries)
+        out = await meta_summarize(["tried A, failed", "tried B, failed"], settings)
+        assert "tried A" in out and "tried B" in out
+        # empty journal → empty
+        assert await meta_summarize([], settings) == ""
+
+    asyncio.run(_run())
+
+
 def test_advice_mailbox() -> None:
     """Coordinator→solver advice is queued per-solver and drained once."""
     async def _run() -> None:

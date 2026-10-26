@@ -92,6 +92,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 let STATE = null, SEL = null, SELSPEC = null;
 const openTraces = new Set();   // trace panels to keep open across refreshes
+let gTextContent = '';          // guidance textarea content — survives refreshes
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 2200); }
@@ -207,6 +208,22 @@ async function renderDetail() {
   }
   html += `</tbody></table></div>`;
 
+  // 🆘 Help requests — knowledge gaps the solvers flagged for the operator
+  if (s.help_requests && s.help_requests.length) {
+    html += `<div class="panel" style="border-left:4px solid var(--red)">
+      <div style="color:var(--red);font-weight:600;margin-bottom:6px">🆘 求助项（模型主动举手——它们不懂的知识点）</div>`;
+    for (const h of [...s.help_requests].reverse()) {
+      const ts = new Date(h.ts * 1000).toLocaleTimeString();
+      const mdl = (h.model || '').replace('claude-sdk/', '');
+      html += `<div style="margin:8px 0;padding:8px 10px;background:#fef2f2;border-radius:6px;font-size:12.5px">
+        <div class="muted" style="font-size:11px">${ts} · <b>${esc(mdl)}</b> 求助：</div>
+        <div style="margin-top:3px;white-space:pre-wrap">${esc(h.question)}</div>
+        <button class="purp" style="margin-top:6px;font-size:11px" onclick="replyHelp('${esc(mdl)}', this)">回复它 →</button>
+      </div>`;
+    }
+    html += `<div class="muted" style="margin-top:4px">回复内容会进它的指导信箱（执行中就能读到）。</div></div>`;
+  }
+
   // shared-experience feed (blackboard): facts + dead-ends + broadcasts
   if (s.shared_feed && s.shared_feed.length) {
     html += `<div class="panel"><div style="color:var(--blue);font-weight:600;margin-bottom:6px">📋 共享经验与踩坑记录（模型间的黑板）</div><div style="max-height:240px;overflow-y:auto">`;
@@ -224,15 +241,24 @@ async function renderDetail() {
   html += `<div class="panel guide">
       <div style="color:var(--blue);font-weight:600;margin-bottom:6px">📨 喂提示 / 指导（指导信箱——模型执行中就能收到）</div>
       <div class="muted">目标 solver：<b id="gTarget">${SELSPEC ? esc(SELSPEC) : '(点上表"提示"选择)'}</b></div>
-      <textarea id="gText" placeholder="例如：这个协议是 XX，格式是…，去读 /skills/ctf-web/xx.md 的 Y 手法；或者：你已经拿到 A，下一步用 B 解"></textarea>
+      <textarea id="gText" oninput="gTextContent=this.value" placeholder="例如：这个协议是 XX，格式是…，去读 /skills/ctf-web/xx.md 的 Y 手法；或者：你已经拿到 A，下一步用 B 解"></textarea>
       <button onclick="sendAdvice()">📨 发给该 solver</button>
       <button class="warn" onclick="sendBroadcast()">📢 广播给本题全部</button>
       <div class="muted" style="margin-top:6px">提示会插进模型的工具结果里（每 3 步拉取一次）；写入即达，不用等重开</div>
     </div>`;
   el.innerHTML = html;
+  // Restore the in-progress guidance text after every re-render
+  const gt = document.getElementById('gText');
+  if (gt && gTextContent) { gt.value = gTextContent; }
 }
 
 function prepAdvise(spec) { SELSPEC = spec; const t = document.getElementById('gTarget'); if (t) t.textContent = spec; toast('已选定 ' + spec + '，写内容后点发送'); }
+
+function replyHelp(model) {
+  prepAdvise('claude-sdk/' + model.replace(/^claude-sdk\//, ''));
+  const gt = document.getElementById('gText');
+  if (gt) { gt.focus(); gt.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+}
 
 async function showTrace(spec) {
   SELSPEC = spec;
@@ -285,6 +311,7 @@ async function sendAdvice() {
   await api('/api/advise', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ challenge: SEL, model_spec: SELSPEC, advice: text }) });
   document.getElementById('gText').value = '';
+  gTextContent = '';
   toast('📨 已投进信箱，模型下个动作就能读到');
 }
 
@@ -294,6 +321,7 @@ async function sendBroadcast() {
   await api('/api/broadcast', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ challenge: SEL, message: text }) });
   document.getElementById('gText').value = '';
+  gTextContent = '';
   toast('📢 已广播给本题所有 solver');
 }
 

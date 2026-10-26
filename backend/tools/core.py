@@ -162,6 +162,20 @@ async def do_check_findings(message_bus, model_spec: str) -> str:
     return message_bus.format_unread(findings)
 
 
+async def do_request_help(message_bus, model_spec: str, question: str,
+                          notify_coordinator=None) -> str:
+    """A solver raises a knowledge-gap help request for the human operator."""
+    if not message_bus:
+        return "No help channel available."
+    await message_bus.post_help(model_spec, question)
+    if notify_coordinator:
+        try:
+            await notify_coordinator(f"🆘 HELP REQUEST: {question[:300]}")
+        except Exception:
+            pass
+    return "Help request recorded — a human operator will see it and may reply via the mailbox. Keep working other angles meanwhile."
+
+
 # Image constants (shared with vision wrapper)
 IMAGE_EXTS_FOR_VISION: dict[str, str] = {
     ".png": "image/png",

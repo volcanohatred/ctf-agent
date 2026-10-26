@@ -8,6 +8,7 @@ from backend.tools.core import (
     do_check_findings,
     do_list_files,
     do_read_file,
+    do_request_help,
     do_web_fetch,
     do_webhook_create,
     do_webhook_get_requests,
@@ -47,6 +48,21 @@ async def check_findings(ctx: RunContext[SolverDeps]) -> str:
     Call this periodically to see if siblings have discovered useful information.
     """
     return await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
+
+
+async def request_help(ctx: RunContext[SolverDeps], question: str) -> str:
+    """Ask the human operator for help when you hit a knowledge gap.
+
+    Use this when you're stuck on something you genuinely don't understand —
+    an unknown protocol, an unfamiliar crypto/encoding scheme, a technique you
+    don't know. Be SPECIFIC: describe what you observed, what you tried, and
+    exactly what you don't understand. A human will research it and reply via
+    the guidance mailbox (you'll see the answer as an injected message).
+    """
+    return await do_request_help(
+        ctx.deps.message_bus, ctx.deps.model_spec, question,
+        notify_coordinator=ctx.deps.notify_coordinator,
+    )
 
 
 async def notify_coordinator(ctx: RunContext[SolverDeps], message: str) -> str:

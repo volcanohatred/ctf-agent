@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 KIND_FACT = "fact"
 KIND_EXCLUDED = "excluded"
 KIND_BROADCAST = "broadcast"
+KIND_HELP = "help"  # a solver's explicit request for human help (knowledge gap)
 
 
 @dataclass
@@ -69,6 +70,10 @@ class ChallengeMessageBus:
     async def broadcast(self, content: str, source: str = "coordinator") -> None:
         """Coordinator broadcasts a message to all solvers."""
         await self.post(source, content, kind=KIND_BROADCAST)
+
+    async def post_help(self, model: str, question: str) -> None:
+        """A solver raises a knowledge-gap help request for the human operator."""
+        await self.post(model, question, kind=KIND_HELP)
 
     async def post_advice(self, model: str, content: str) -> None:
         """Drop guidance addressed to ONE running solver (mid-run pickup)."""

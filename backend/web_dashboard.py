@@ -134,6 +134,7 @@ class DashboardServer:
         # excluded dead-ends, coordinator broadcasts). This is the
         # "shared experience" across models on this challenge.
         feed: list[dict] = []
+        help_requests: list[dict] = []
         try:
             bus = getattr(swarm, "message_bus", None)
             if bus is not None:
@@ -144,6 +145,10 @@ class DashboardServer:
                         "content": f.content,  # full text — the dashboard shows it whole
                         "ts": f.timestamp,
                     })
+                    if f.kind == "help":
+                        help_requests.append({
+                            "model": f.model, "question": f.content, "ts": f.timestamp,
+                        })
         except Exception:
             pass
         return {
@@ -158,6 +163,7 @@ class DashboardServer:
             "agents": agents,
             "findings": dict(swarm.findings),
             "shared_feed": feed,
+            "help_requests": help_requests,
         }
 
     async def _state(self, _req: web.Request) -> web.Response:

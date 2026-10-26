@@ -183,6 +183,12 @@ def build_prompt(
         f"5. {submit_hint}",
         "6. Once CORRECT: output `FLAG: <value>` on its own line.",
         "7. Do not guess. Do not ask. Cover maximum surface area.",
+        (
+            '8. **Knowledge gaps**: if you hit something you genuinely don\'t understand '
+            "(an unknown protocol, an unfamiliar scheme, a technique you don't know), "
+            "call `request_help` with a SPECIFIC question (what you observed, what you "
+            "tried, exactly what's unclear). A human operator will research it and reply."
+        ),
     ]
 
     if skills_enabled:

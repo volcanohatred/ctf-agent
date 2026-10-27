@@ -27,7 +27,7 @@ from backend.round_summary import SummaryResult
 # ---------------------------------------------------------------------------
 
 class RecordingSummarizer:
-    """Stands in for the two gateway-backed summarizers."""
+    """Stands in for the gateway-backed summarizers."""
 
     def __init__(self, meta_condensed: bool = True):
         self.round_calls: list[str] = []
@@ -36,7 +36,11 @@ class RecordingSummarizer:
 
     async def summarize_round(self, text, settings, cost_tracker=None, agent_name=""):
         self.round_calls.append(text)
-        return f"<distilled:{len(text)}chars>"
+        # Numbered so successive rounds produce DISTINCT entries. An earlier
+        # version keyed the output only on len(text), which made every round
+        # identical — the structural de-dup then (correctly) collapsed all five
+        # into one and the merge test measured nothing.
+        return f"<distilled#{len(self.round_calls)}:{len(text)}chars>"
 
     async def meta_summarize(self, journal, settings, cost_tracker=None, agent_name=""):
         self.meta_calls.append(list(journal))
@@ -74,7 +78,7 @@ async def test_each_gave_up_round_produces_one_journal_entry(monkeypatch) -> Non
     assert len(rec.round_calls) == 3, rec.round_calls
     journal = swarm._journals["m1"]
     assert len(journal) == 3
-    assert all(j.startswith("<distilled:") for j in journal)
+    assert all(j.startswith("<distilled#") for j in journal)
 
 
 @pytest.mark.asyncio
@@ -226,7 +230,7 @@ async def test_restart_payload_carries_state_direction_and_skills(monkeypatch) -
 
     payload = solver.bumps[0]
     assert "【探索状态】" in payload
-    assert "<distilled:" in payload, "the distilled state is missing"
+    assert "<distilled#" in payload, "the distilled state is missing"
     assert "本轮主攻方向" in payload and "Encoding Tricks" in payload
     assert "/challenge/workspace/" in payload, "must tell the solver its files persist"
 
@@ -265,7 +269,7 @@ async def test_no_placeholder_when_siblings_have_nothing(monkeypatch) -> None:
 
     for payload in solver.bumps:
         assert "No sibling insights" not in payload, payload[:300]
-        assert "【兄弟模型动态】" not in payload, "empty sibling section was injected"
+        assert "全队进展" not in payload, "empty team section was injected"
 
 
 @pytest.mark.asyncio
@@ -277,7 +281,7 @@ async def test_sibling_findings_do_reach_the_restart_payload(monkeypatch) -> Non
     await swarm.run()
 
     assert any("hunter2" in b for b in solver.bumps), solver.bumps
-    assert any("【兄弟模型动态】" in b for b in solver.bumps)
+    assert any("全队进展" in b for b in solver.bumps)
 
 
 @pytest.mark.asyncio
@@ -365,6 +369,126 @@ async def test_summarizer_calls_are_attributed_to_the_challenge(monkeypatch) -> 
     await swarm.run()
 
     assert seen and all(a == "chal/summarizer" for a in seen), seen
+
+
+# ---------------------------------------------------------------------------
+# Team digest — siblings get the same distilled treatment as the own journal
+# ---------------------------------------------------------------------------
+
+class RecordingSiblingSummarizer(RecordingSummarizer):
+    """Also records calls to summarize_siblings."""
+
+    def __init__(self, meta_condensed: bool = True, sibling_condensed: bool = True):
+        super().__init__(meta_condensed=meta_condensed)
+        self.sibling_calls: list[list[str]] = []
+        self.sibling_condensed = sibling_condensed
+
+    async def summarize_siblings(self, reports, settings, cost_tracker=None, agent_name=""):
+        self.sibling_calls.append(list(reports))
+        if self.sibling_condensed:
+            return SummaryResult(text="<TEAM-STATE>", condensed=True)
+        return SummaryResult(text="\n".join(reports), condensed=False)
+
+    def install(self, monkeypatch):
+        super().install(monkeypatch)
+        monkeypatch.setattr(rs, "summarize_siblings", self.summarize_siblings)
+        return self
+
+
+@pytest.mark.asyncio
+async def test_restart_payload_carries_the_distilled_team_state(monkeypatch) -> None:
+    """Siblings used to reach a restarting solver as "latest raw finding per
+    model, clipped to 400 chars" — early discoveries dropped out and nothing was
+    merged. They now get the same distillation the own journal gets."""
+    rec = RecordingSiblingSummarizer().install(monkeypatch)
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, fresh_restart_rounds=5, max_attempts_per_challenge=DEFAULT_CAP)
+    await swarm.message_bus.post("m2", "[fact] archive password is hunter2", kind="fact")
+    await swarm.message_bus.post("m3", "[excluded] brute force is rate limited", kind="excluded")
+
+    await swarm.run()
+
+    assert rec.sibling_calls, "the team digest was never computed"
+    joined = "\n".join(rec.sibling_calls[0])
+    assert "hunter2" in joined, "an early sibling finding was dropped"
+    assert "brute force" in joined
+    assert any("全队进展" in b for b in solver.bumps), solver.bumps
+
+
+@pytest.mark.asyncio
+async def test_team_digest_reads_the_whole_blackboard_not_just_the_latest(monkeypatch) -> None:
+    """`self.findings` only ever holds each model's LATEST finding; the digest
+    must be built from the bus, which retains the history."""
+    rec = RecordingSiblingSummarizer().install(monkeypatch)
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, fresh_restart_rounds=5, max_attempts_per_challenge=DEFAULT_CAP)
+    await swarm.message_bus.post("m2", "[fact] EARLY discovery: the CRC is faked", kind="fact")
+    await swarm.message_bus.post("m2", "[fact] LATE discovery: offset 72 overflows", kind="fact")
+    # only the latest is in the per-model map
+    swarm.findings["m2"] = "[fact] LATE discovery: offset 72 overflows"
+
+    await swarm.run()
+
+    joined = "\n".join(rec.sibling_calls[0])
+    assert "EARLY discovery" in joined, "the early finding was lost"
+    assert "LATE discovery" in joined
+
+
+@pytest.mark.asyncio
+async def test_team_digest_is_computed_once_per_bump_generation(monkeypatch) -> None:
+    """Four solvers restarting in the same round must cost ONE call, not four."""
+    rec = RecordingSiblingSummarizer().install(monkeypatch)
+    solvers = {f"m{i}": ScriptedSolver(f"m{i}", [_gave_up(), _flag()]) for i in range(1, 5)}
+    swarm = _swarm(solvers, fresh_restart_rounds=5, max_attempts_per_challenge=DEFAULT_CAP)
+    await swarm.message_bus.post("m1", "[fact] something confirmed", kind="fact")
+    await swarm.message_bus.post("m2", "[excluded] something ruled out", kind="excluded")
+
+    await swarm.run()
+
+    # one call per bump generation, not one per solver
+    assert len(rec.sibling_calls) <= 2, f"digest recomputed {len(rec.sibling_calls)}x"
+
+
+@pytest.mark.asyncio
+async def test_team_digest_falls_back_to_raw_when_the_model_is_unavailable(monkeypatch) -> None:
+    RecordingSiblingSummarizer(sibling_condensed=False).install(monkeypatch)
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, fresh_restart_rounds=5, max_attempts_per_challenge=DEFAULT_CAP)
+    swarm.findings["m2"] = "[fact] raw fallback content"
+
+    await swarm.run()
+
+    assert any("raw fallback content" in b for b in solver.bumps), solver.bumps
+    assert not any("<TEAM-STATE>" in b for b in solver.bumps)
+
+
+@pytest.mark.asyncio
+async def test_team_digest_needs_a_minimum_number_of_reports(monkeypatch) -> None:
+    """One solver's own findings do not need merging with anything — do not spend
+    a model call on it."""
+    rec = RecordingSiblingSummarizer().install(monkeypatch)
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, fresh_restart_rounds=5,
+                   max_attempts_per_challenge=DEFAULT_CAP, sibling_digest_min_reports=2)
+    await swarm.message_bus.post("m1", "[fact] only my own finding", kind="fact")
+
+    await swarm.run()
+
+    assert rec.sibling_calls == [], "spent a digest call on a single report"
+
+
+@pytest.mark.asyncio
+async def test_team_digest_excludes_infra_noise(monkeypatch) -> None:
+    rec = RecordingSiblingSummarizer().install(monkeypatch)
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, fresh_restart_rounds=5, max_attempts_per_challenge=DEFAULT_CAP)
+    await swarm.message_bus.post("m2", "API Error: Connection refused (ECONNREFUSED)", kind="fact")
+    await swarm.message_bus.post("m3", "[fact] real finding", kind="fact")
+
+    await swarm.run()
+
+    joined = "\n".join(rec.sibling_calls[0]) if rec.sibling_calls else ""
+    assert "Connection refused" not in joined
 
 
 # ---------------------------------------------------------------------------

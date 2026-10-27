@@ -85,7 +85,13 @@ class Settings(BaseSettings):
     # Hard cap on bump/retry rounds per solver. A solver that keeps coming back
     # GAVE_UP is retired after this many rounds instead of spinning forever.
     # 0 = unlimited (only sane in coordinator mode against a live CTFd).
-    max_attempts_per_challenge: int = 6
+    #
+    # This interacts with fresh_restart_rounds: the distil->merge cycle needs
+    # fresh_restart_rounds bumps to complete ONE merge, so the cap must be at
+    # least 2*fresh_restart_rounds + 1 for the merged state to drive more than a
+    # single round. The default 12 allows two full merge cycles at the default
+    # fresh_restart_rounds of 5. A warning is logged when they are misaligned.
+    max_attempts_per_challenge: int = 12
     container_memory_limit: str = "16g"
     # CPU quota per sandbox container (NanoCpus = limit * 1e9).
     container_cpu_limit: float = 2.0
@@ -174,6 +180,14 @@ class Settings(BaseSettings):
     # Long findings posted to the blackboard get an LLM key-info summary for
     # sibling injection (full text is always kept; nothing is truncated).
     summarize_threshold_chars: int = 900
+    # Minimum distinct solver reports on the blackboard before spending an LLM
+    # call to distil them into the shared team state. Below this the raw (bounded
+    # and de-duplicated) form is used instead — one solver's own findings do not
+    # need merging with anything.
+    sibling_digest_min_reports: int = 2
+    # The team digest is recomputed at most once per bump generation and shared
+    # by every solver restarting in it, so N solvers cost one call, not N.
+    sibling_digest_refresh_bumps: int = 1
     # Model used for blackboard summarization (fast/cheap gateway model).
     summarizer_model: str = "deepseek-v4-flash"
     # Operator web dashboard (live swarm view + guidance mailbox UI).
@@ -211,3 +225,57 @@ class Settings(BaseSettings):
             k: _strip_inline_comment(v) if isinstance(v, str) else v
             for k, v in data.items()
         }
+
+
+def validate_tuning(settings: Settings) -> list[str]:
+    """Return human-readable warnings about tuning combinations that defeat a
+    mechanism silently.
+
+    These are warnings, not errors: every combination is runnable, but each one
+    quietly disables something the operator probably intended to use. Surfacing
+    them at startup is far cheaper than debugging why a feature "did nothing".
+    """
+    warnings: list[str] = []
+
+    # getattr with defaults so this stays usable against a partial settings
+    # object (tests, and callers that build Settings-like namespaces).
+    cap = int(getattr(settings, "max_attempts_per_challenge", 0) or 0)
+    fresh = int(getattr(settings, "fresh_restart_rounds", 0) or 0)
+    budget = int(getattr(settings, "solver_time_budget_s", 0) or 0)
+    if cap > 0 and fresh > 0:
+        # One distil->merge cycle costs `fresh` bumps; the merged state then
+        # needs at least one further round to be worth computing.
+        needed = 2 * fresh + 1
+        if cap < fresh + 1:
+            warnings.append(
+                f"MAX_ATTEMPTS_PER_CHALLENGE={cap} is below FRESH_RESTART_ROUNDS={fresh}, "
+                "so the journal is never merged — the distilled state grows as a plain "
+                f"list of up to {cap} entries. Raise the cap to at least {fresh + 1}."
+            )
+        elif cap < needed:
+            cycles = (cap - 1) // fresh
+            warnings.append(
+                f"MAX_ATTEMPTS_PER_CHALLENGE={cap} with FRESH_RESTART_ROUNDS={fresh} allows "
+                f"only {cycles} merge cycle(s), and the merged state drives just "
+                f"{cap - cycles * fresh} round(s) before the solver retires. "
+                f"For {cycles + 1} cycles set the cap to at least {needed}."
+            )
+
+    if budget > 0 and cap == 0:
+        warnings.append(
+            "MAX_ATTEMPTS_PER_CHALLENGE=0 means unlimited rounds; the only bound is an "
+            "external time limit. Fine for coordinator mode against a live CTFd, "
+            "dangerous for ctf-solve --challenge."
+        )
+
+    if (fresh > 0
+            and not (getattr(settings, "gateway_base_url", "")
+                     and getattr(settings, "gateway_api_key", ""))):
+        warnings.append(
+            "GATEWAY_BASE_URL/GATEWAY_API_KEY are unset, so round distillation and the "
+            "team digest cannot call a summarizer. The journal falls back to raw "
+            "(bounded) entries and sibling context to clipped raw findings — the "
+            "mechanism still works, just without merging or de-duplication by model."
+        )
+
+    return warnings

@@ -157,6 +157,7 @@ async def run_benchmark(
     output_path: str = "",
 ) -> dict:
     """Run all discovered challenges with bounded concurrency; write a JSON report."""
+    from backend.config import validate_tuning
     from backend.models import DEFAULT_MODELS
     from backend.sandbox import (
         cleanup_orphan_containers,
@@ -167,6 +168,8 @@ async def run_benchmark(
     from backend.tracing import prune_old_traces
 
     specs = model_specs or list(DEFAULT_MODELS)
+    for w in validate_tuning(settings):
+        logger.warning("[bench] config: %s", w)
 
     # Health check FIRST. A dead gateway is a far more useful thing to report
     # than "no challenges found", and probing before any container work means

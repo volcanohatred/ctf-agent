@@ -43,6 +43,17 @@ _META_PROMPT = (
     "直接输出这三段，不要解释。\n\n【各轮摘要】\n{text}"
 )
 
+_SIBLING_PROMPT = (
+    "你是 CTF 团队协作助手。下面是同一道题上**其他模型**已经报告的发现。"
+    "把它们合并成一份给队友看的集体状态，必须去重、必须保留所有硬信息"
+    "（文件路径、地址、偏移、密钥、凭据、payload、已排除的方向）。"
+    "不超过 12 行，格式固定为：\n"
+    "【队友已确认】…\n"
+    "【队友已排除】…（不要再试这些）\n"
+    "【值得接力】…（队友做到一半、最有希望接着做的点）\n"
+    "直接输出这三段，不要解释。\n\n【其他模型的报告】\n{text}"
+)
+
 
 @dataclass(frozen=True)
 class SummaryResult:
@@ -107,6 +118,39 @@ def _record(cost_tracker, agent_name: str, model: str, data: dict, seconds: floa
         )
     except Exception as e:  # noqa: BLE001 — accounting must never break solving
         logger.debug("cost accounting for summarizer failed: %s", e)
+
+
+async def summarize_siblings(
+    reports: list[str],
+    settings: object,
+    cost_tracker: object | None = None,
+    agent_name: str = "",
+) -> SummaryResult:
+    """Condense what the OTHER solvers on this challenge have established.
+
+    Sibling findings previously reached a restarting solver as "the latest raw
+    finding per model, clipped to 400 chars" — so early discoveries dropped out,
+    and nothing was merged or de-duplicated. This gives them the same treatment
+    the solver's own journal gets.
+
+    Returns `condensed=False` when the model was unavailable, so the caller can
+    fall back to the raw (bounded) form instead of presenting a join as a summary.
+    """
+    from backend.dedup import dedup_entries
+
+    entries = dedup_entries([r for r in reports if r and r.strip()])
+    if not entries:
+        return SummaryResult(text="", condensed=False)
+    if len(entries) == 1 and len(entries[0]) < 700:
+        return SummaryResult(text=entries[0], condensed=True)
+    joined = "\n---\n".join(f"[{i+1}]\n{e}" for i, e in enumerate(entries))
+    out = await _call_gateway(
+        _SIBLING_PROMPT.format(text=joined[:20000]), settings, _model(settings),
+        cost_tracker=cost_tracker, agent_name=agent_name,
+    )
+    if out:
+        return SummaryResult(text=out, condensed=True, model=_model(settings))
+    return SummaryResult(text=joined, condensed=False)
 
 
 def _model(settings: object) -> str:

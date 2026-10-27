@@ -173,6 +173,14 @@ class ChallengeSwarm:
     # retire the swarm, not grind through the whole time limit.
     _infra_failures: int = field(init=False, default=0)
     _retire_reason: str = field(init=False, default="")
+    # Dead-end ledger of *published* excluded lines, normalized, so a restated
+    # dead end cannot accumulate independently of what the LLM merge catches.
+    _seen_dead_ends: list[str] = field(init=False, default_factory=list)
+    # Swarm-wide distilled state, recomputed at most once per bump generation and
+    # shared by every solver restarting in that generation.
+    _team_digest: str = field(init=False, default="")
+    _team_digest_gen: int = field(init=False, default=-1)
+    _digest_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
         self._all_specs = list(self.model_specs)
@@ -258,24 +266,86 @@ class ChallengeSwarm:
         solver.deps.notify_coordinator = self._make_notify_fn(model_spec)
         return solver
 
-    def _gather_sibling_insights(self, exclude_model: str) -> str:
-        """Sibling findings for bump payloads — bounded per finding so the
-        bump context stays light (the blackboard stores them in full).
+    def _collect_team_reports(self) -> list[str]:
+        """Raw material for the team digest: the whole blackboard, grouped.
 
-        Returns "" when there is nothing to say. Callers test truthiness; this
-        used to return an English sentinel string, which made that test always
-        pass and injected a meaningless "No sibling insights available yet."
-        section into every restart payload.
+        Read from the message bus rather than `self.findings` — the bus keeps up
+        to max_findings entries with their kind, while `self.findings` only ever
+        holds each model's LATEST finding, so early discoveries silently dropped
+        out of every restart payload.
         """
+        grouped: dict[str, list[str]] = {}
+        for f in self.message_bus.findings:
+            if not publishable(f.content):
+                continue
+            tag = {"excluded": "✗", "help": "?"}.get(f.kind, "✓")
+            grouped.setdefault(f.model, []).append(f"{tag} {f.content.strip()}")
+        return [
+            f"[{model}]\n" + "\n".join(items)
+            for model, items in grouped.items()
+        ]
+
+    def _raw_sibling_fallback(self, exclude_model: str) -> str:
+        """Bounded raw form, used when no digest is available."""
         def _clip(text: str, limit: int = 400) -> str:
             text = text.strip()
             return text if len(text) <= limit else text[:limit] + " …"
 
-        parts: list[str] = []
-        for model, finding in self.findings.items():
-            if model != exclude_model and finding and publishable(finding):
-                parts.append(f"[{model}]: {_clip(finding)}")
+        parts = [
+            f"[{model}]: {_clip(finding)}"
+            for model, finding in self.findings.items()
+            if model != exclude_model and finding and publishable(finding)
+        ]
         return "\n".join(parts)
+
+    async def _team_state(self, generation: int, exclude_model: str) -> str:
+        """Distilled, de-duplicated picture of what the swarm has established.
+
+        Recomputed at most once per bump generation and shared by every solver
+        restarting in that generation, so four solvers cost one summarizer call
+        instead of four. A restarting solver has had its session wiped, so its
+        own earlier findings are included deliberately — it no longer remembers
+        them, and re-reading them is the point.
+        """
+        async with self._digest_lock:
+            refresh_every = max(1, int(getattr(self.settings, "sibling_digest_refresh_bumps", 1) or 1))
+            age = generation - self._team_digest_gen
+            if self._team_digest and 0 <= age < refresh_every:
+                return self._team_digest
+
+            reports = self._collect_team_reports()
+            digest = ""
+            if reports:
+                try:
+                    from backend.round_summary import summarize_siblings
+
+                    every = int(getattr(self.settings, "sibling_digest_min_reports", 2) or 2)
+                    if len(reports) >= every:
+                        res = await summarize_siblings(
+                            reports, self.settings,
+                            cost_tracker=self.cost_tracker,
+                            agent_name=f"{self.meta.name}/summarizer",
+                        )
+                        if res.condensed:
+                            digest = res.text
+                except Exception as e:  # noqa: BLE001 — the digest is an enhancement
+                    logger.debug(f"[{self.meta.name}] team digest failed: {e}")
+
+            if not digest:
+                digest = self._raw_sibling_fallback(exclude_model)
+            self._team_digest = digest
+            self._team_digest_gen = generation
+            return digest
+
+    def _gather_sibling_insights(self, exclude_model: str) -> str:
+        """Synchronous, undigested sibling findings.
+
+        Kept for the escalation briefing and any caller that must not await.
+        Returns "" when there is nothing to say — callers test truthiness, and an
+        earlier sentinel string made that test always pass, injecting a
+        meaningless placeholder section into every payload.
+        """
+        return self._raw_sibling_fallback(exclude_model)
 
     def _skill_hint(self, bump_count: int) -> str:
         """Escalating knowledge-base hint, activated after repeated failures."""
@@ -310,7 +380,7 @@ class ChallengeSwarm:
                 return a
         return None
 
-    def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
+    async def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
         """Lean rotation bump: short reason + next untried technique + skill hint
         only from the configured failure threshold onward."""
         parts = [reason]
@@ -325,9 +395,9 @@ class ChallengeSwarm:
                 f"\n🎯 本轮专攻新方向：【{nxt.title}】（手册 {nxt.path}，先读再做）"
             )
 
-        insights = self._gather_sibling_insights(model_spec)
-        if insights:
-            parts += ["", insights]
+        team = await self._team_state(bump_count, model_spec)
+        if team:
+            parts += ["", "【全队进展（已去重蒸馏）】", team]
 
         hint = self._skill_hint(bump_count)
         if hint:
@@ -493,17 +563,34 @@ class ChallengeSwarm:
         round as an excluded dead end — as an earlier revision did — tells
         siblings "do NOT retry this" about content that is mostly confirmed
         observations.
+
+        Dead ends are additionally de-duplicated structurally, before the LLM
+        ever sees them: a restated dead end must not grow the "do not retry"
+        list, and the ledger is what steers every subsequent round.
         """
         if not publishable(text):
             return
         excluded, facts = split_tagged(text)
         posted = False
         if excluded:
-            body = "\n".join(f"- {e}" for e in excluded)
-            await self._post_finding(model_spec, body, KIND_EXCLUDED)
-            posted = True
+            from backend.dedup import new_lines
+
+            fresh = new_lines(excluded, self._seen_dead_ends)
+            if fresh:
+                self._seen_dead_ends.extend(fresh)
+                body = "\n".join(f"- {e}" for e in fresh)
+                await self._post_finding(model_spec, body, KIND_EXCLUDED)
+                posted = True
+            elif excluded:
+                logger.debug(
+                    f"[{self.meta.name}/{model_spec}] {len(excluded)} dead end(s) "
+                    "already recorded — not republishing"
+                )
         if facts:
-            await self._post_finding(model_spec, "\n".join(f"- {f}" for f in facts), KIND_FACT)
+            from backend.dedup import dedup_lines
+
+            body = "\n".join(f"- {f}" for f in dedup_lines(facts))
+            await self._post_finding(model_spec, body, KIND_FACT)
             posted = True
         if not posted:
             await self._post_finding(model_spec, text, KIND_FACT)
@@ -529,25 +616,31 @@ class ChallengeSwarm:
             journal.append(note)
 
             # 2. meta-summarize (dedup) every N rounds so the state never bloats.
-            #    On failure the LIST is kept as-is: collapsing it into one giant
+            #    Entries are de-duplicated STRUCTURALLY first, so the model is
+            #    handed an already-unique set and a restated round cannot consume
+            #    one of the N slots.
+            #    On failure the bounded LIST is kept: collapsing it into one giant
             #    joined string would make the carried state grow without bound,
             #    which is the exact problem this mechanism exists to prevent.
             if fresh_rounds > 0 and len(journal) >= fresh_rounds:
-                state = await meta_summarize(journal, self.settings,
+                from backend.dedup import dedup_entries
+
+                unique = dedup_entries(journal)
+                state = await meta_summarize(unique, self.settings,
                                              cost_tracker=self.cost_tracker,
                                              agent_name=f"{self.meta.name}/summarizer")
                 if state.condensed:
-                    self._journals[model_spec] = [state.text]
+                    self._journals[model_spec] = dedup_entries([state.text])
                 else:
                     # Keep the newest entries only, so the payload stays bounded
                     # even when the summarizer is unavailable.
-                    self._journals[model_spec] = journal[-fresh_rounds:]
+                    self._journals[model_spec] = unique[-fresh_rounds:]
 
         # 3. hard-reset the session (workspace files persist; history clears)
         await self._reset_solver_session(solver)
 
         # 4. build the restart seed and queue it into the fresh session
-        solver.bump(self._build_restart_payload(model_spec, reason, bump_count))
+        solver.bump(await self._build_restart_payload(model_spec, reason, bump_count))
 
     @staticmethod
     async def _reset_solver_session(solver) -> None:
@@ -564,7 +657,7 @@ class ChallengeSwarm:
             except Exception as e:  # noqa: BLE001 — a failed reset must not kill the round
                 logger.warning("session reset via %s failed: %s", name, e)
 
-    def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
+    async def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
         """The seed message for a freshly restarted session."""
         journal = self._journals.get(model_spec, [])
         state_txt = "\n".join(f"{i+1}. {j}" for i, j in enumerate(journal)) or "(暂无)"
@@ -585,9 +678,11 @@ class ChallengeSwarm:
         hint = self._skill_hint(bump_count)
         if hint:
             parts += ["", hint]
-        sib = self._gather_sibling_insights(model_spec)
-        if sib:
-            parts += ["", "【兄弟模型动态】", sib]
+        # The session was just wiped, so this solver no longer remembers its own
+        # earlier work either — the team digest intentionally includes it.
+        team = await self._team_state(bump_count, model_spec)
+        if team:
+            parts += ["", "【全队进展（含你自己之前的发现，已去重蒸馏）】", team]
         parts.append("\n开始吧。工作区里你之前创建的文件还在（/challenge/workspace/）。")
         return "\n".join(p for p in parts if p.strip())
 
@@ -820,7 +915,7 @@ class ChallengeSwarm:
             if int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
                 await self._fresh_restart(solver, model_spec, result, reason, bump_count)
             else:
-                solver.bump(self._build_bump_payload(model_spec, reason, bump_count))
+                solver.bump(await self._build_bump_payload(model_spec, reason, bump_count))
             logger.info(
                 f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
             )

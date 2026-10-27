@@ -67,6 +67,44 @@ what gets harvested to the blackboard. If the conclude phase fails, **nothing is
 written** — a partial or invented harvest is worse than none, because siblings
 treat it as ground truth. The solver then resumes with a fresh direction.
 
+**Fresh restart with a distilled journal**: after a GAVE_UP the round is distilled
+into one journal entry, the session is *forgotten* (not merely reconnected — the
+Claude backend's `reset_session` keeps the session id and would resume the old
+history, defeating the point), and a clean attempt starts carrying only that
+state plus the team digest, the next untried technique, and the skill hint. Every
+`FRESH_RESTART_ROUNDS` (default 5) the journal is merged by a second model call
+that de-duplicates it, so the carried state stays bounded instead of growing.
+
+Two guards make that bound hold when the summarizer is unavailable, which against
+a flaky gateway is the normal case rather than the exception:
+
+- **Structural de-duplication** (`backend/dedup.py`) runs *before* the model
+  merge, on the journal, on the dead-end ledger, and on the team digest. It
+  normalizes case, punctuation and CJK-preserving word content, and collapses
+  volatile literals (`0x7f8a1c000000` and `0x7f9b2d000000` are the same finding
+  under a different ASLR slide). A terse restatement of a recorded finding is
+  dropped; a longer one *replaces* it, so detail is never lost to an earlier
+  summary. Identical or reordered entries cannot accumulate no matter what the
+  model does.
+- **A failed merge keeps the bounded list** rather than collapsing it into one
+  joined string. The previous behaviour did the opposite of the mechanism's
+  purpose: with the gateway down, every round appended to a single ever-growing
+  entry.
+
+**Team digest**: what all solvers on a challenge have established is merged into
+one de-duplicated state and injected into every restart. It is read from the
+blackboard (which retains history) rather than the per-model latest finding, so
+early discoveries no longer drop out. It is recomputed at most once per bump
+generation and shared, so four restarting solvers cost one summarizer call
+instead of four. A restarting solver has had its session wiped, so its own
+earlier findings are included deliberately — it no longer remembers them.
+
+**Coupling worth knowing**: one distil→merge cycle costs `FRESH_RESTART_ROUNDS`
+bumps, so `MAX_ATTEMPTS_PER_CHALLENGE` must be at least
+`2 × FRESH_RESTART_ROUNDS + 1` for the merged state to drive more than a single
+round. The defaults (12 and 5) allow two full cycles. A misalignment is reported
+at startup by `validate_tuning` instead of silently wasting the merge.
+
 **Fail fast on a dead gateway**: `STARTUP_HEALTH_CHECK` probes both endpoints
 before anything launches. This matters more than it sounds — the Claude CLI
 reports `API Error: Connection refused` as an *ordinary assistant text block*,
@@ -251,11 +289,14 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `STARTUP_HEALTH_CHECK` | `true` | Probe both gateway endpoints before launching; fail in seconds instead of grinding |
 | `SOLVER_TIME_BUDGET_S` | `1500` | Per-attempt wall clock; on expiry the turn is interrupted and phase 2 harvests it. 0 disables |
 | `CONCLUDE_TIMEOUT_S` | `90` | Independent budget for the phase-2 conclude harvest |
-| `MAX_ATTEMPTS_PER_CHALLENGE` | `6` | Hard cap on retry rounds per solver. 0 = unlimited |
+| `MAX_ATTEMPTS_PER_CHALLENGE` | `12` | Hard cap on retry rounds per solver. 0 = unlimited. Must be ≥ `2×FRESH_RESTART_ROUNDS+1` for two merge cycles |
 | `MAX_INFRA_FAILURES` | `3` | Consecutive infra failures before a swarm retires itself |
 | `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts |
 | `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
 | `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |
+| `SIBLING_DIGEST_MIN_REPORTS` | `2` | Distinct reports needed before spending a model call on the team digest |
+| `SIBLING_DIGEST_REFRESH_BUMPS` | `1` | Recompute the team digest at most once every N bumps (shared by all solvers) |
+| `SUMMARIZER_MODEL` | `deepseek-v4-flash` | Model for journal distillation, merges and the team digest — all cost-tracked |
 | `SANDBOX_COMMAND_TIMEOUT_S` | `900` | Per-command `timeout -k 5` inside the sandbox — no orphaned processes |
 | `COORDINATOR_TURN_TIMEOUT_S` | `300` | Cap on one coordinator turn; a stalling gateway would otherwise freeze the whole event loop |
 | `CONTAINER_MEMORY_LIMIT` | `16g` | Per-sandbox memory |

@@ -47,6 +47,7 @@ async def _preflight(settings: Settings, model_specs: list[str], *, prune_logs: 
     thousands of "gave up" rounds spread over hours; with it, the run stops in a
     couple of seconds and says exactly what is wrong.
     """
+    from backend.config import validate_tuning
     from backend.health import HealthCheckError, ensure_healthy
     from backend.sandbox import (
         cleanup_orphan_containers,
@@ -55,6 +56,9 @@ async def _preflight(settings: Settings, model_specs: list[str], *, prune_logs: 
         default_workspace_root,
     )
     from backend.tracing import prune_old_traces
+
+    for w in validate_tuning(settings):
+        console.print(f"[yellow]Config warning:[/yellow] {w}")
 
     configure_semaphore(max(1, settings.max_concurrent_challenges * max(1, len(model_specs))))
 

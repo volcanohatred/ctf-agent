@@ -352,10 +352,17 @@ class DashboardServer:
         # would flag the entire board as local-only on a fresh start.
         ctfd_names = set(getattr(deps, "ctfd_challenges", None) or ())
         ctfd_known = bool(ctfd_names)
+        solved_names = set(getattr(deps, "results", {}).keys())
+        solved_names |= set(getattr(deps, "ctfd_solved", None) or ())
         for name, meta in list(getattr(deps, "challenge_metas", {}).items()):
             if name in swarms:
                 continue
             on_ctfd = (name in ctfd_names) if ctfd_known else True
+            # A solved challenge with no live swarm is NOT pending. Marking it so
+            # left the badge correct (the UI tests `solved` first) but made the
+            # detail panel read "待解题（尚未 spawn）" and sorted it below the
+            # running ones.
+            is_solved = name in solved_names
             swarms[name] = {
                 "challenge": name,
                 "category": getattr(meta, "category", ""),
@@ -367,19 +374,19 @@ class DashboardServer:
                 "failed_approaches": [],
                 "agents": {},
                 "findings": {},
-                "pending": on_ctfd,
+                "pending": on_ctfd and not is_solved,
                 "local_only": not on_ctfd,
+                "solved": is_solved,
             }
 
         # CTFd is the authority on what is solved. `results` only accumulates
         # during the current session, so relying on it alone showed 0 solved
         # after every restart even though the coordinator's own STATUS line —
-        # which reads the poller — reported the true count.
-        solved = set(getattr(deps, "results", {}).keys())
-        solved |= set(getattr(deps, "ctfd_solved", None) or ())
+        # which reads the poller — reported the true count. (`solved_names`
+        # above is this same union, computed before the placeholder loop.)
         data = {
             "ts": time.time(),
-            "solved": sorted(solved),
+            "solved": sorted(solved_names),
             "swarms": swarms,
             "cost_usd": round(getattr(deps.cost_tracker, "total_cost_usd", 0.0), 4),
             "results": getattr(deps, "results", {}),

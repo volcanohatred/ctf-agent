@@ -161,9 +161,8 @@ function renderList() {
   const el = document.getElementById('challenges');
   const names = Object.keys(STATE.swarms).sort((a, b) => {
     const sa = STATE.swarms[a], sb = STATE.swarms[b];
-    const ra = sa.local_only ? 3 : (sa.pending ? 2 : (sa.winner ? 1 : 0));
-    const rb = sb.local_only ? 3 : (sb.pending ? 2 : (sb.winner ? 1 : 0));
-    return ra - rb;  // running first, then solved, then pending, then not-on-CTFd
+    const rank = x => x.local_only ? 3 : (x.winner || x.solved) ? 1 : (x.pending ? 2 : 0);
+    return rank(sa) - rank(sb);  // running, solved, pending, then not-on-CTFd
   });
   const solvedSet = new Set(STATE.solved);
   let html = '';
@@ -204,8 +203,8 @@ async function renderDetail() {
   const el = document.getElementById('detail');
   const cost = Object.values(s.agents || {}).reduce((x, a) => x + (a.cost_usd || 0), 0);
   const statusTxt = s.local_only ? '⊘ 本地题目，未上 CTFd（协调器不会自动接管）'
+    : (s.winner || s.solved) ? '✅ 已解出'
     : s.pending ? '⏸ 待解题（尚未 spawn）'
-    : s.winner ? '✅ 已解出'
     : (s.cancelled ? '⏹ 已停止' : '▶ 进行中');
   let html = `<div class="panel">
     <h2 style="font-size:16px">${esc(SEL)}</h2>

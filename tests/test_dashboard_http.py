@@ -436,6 +436,52 @@ async def test_unknown_ctfd_set_does_not_mark_everything_local_only() -> None:
     assert data["swarms"]["chal"]["local_only"] is False
 
 
+@pytest.mark.asyncio
+async def test_solved_challenges_are_not_also_marked_pending() -> None:
+    """A solved challenge with no live swarm is done, not waiting.
+
+    Marking it pending left the card badge correct (the UI tests `solved` first)
+    but made the detail panel read "待解题（尚未 spawn）" and sorted it below the
+    running ones — so after a restart every already-solved challenge looked like
+    work the coordinator had not got to yet.
+    """
+    deps = _deps({})
+    deps.results = {}
+    deps.ctfd_solved = {"solved-chal"}
+    deps.ctfd_challenges = {"solved-chal", "unsolved-chal"}
+    deps.challenge_metas = {
+        "solved-chal": SimpleNamespace(category="misc", value=10),
+        "unsolved-chal": SimpleNamespace(category="misc", value=10),
+    }
+
+    srv = DashboardServer(deps, host="127.0.0.1", port=0, token=TOKEN)
+    await srv.start()
+    try:
+        base = f"http://127.0.0.1:{_bound_port(srv)}"
+        async with ClientSession() as s:
+            data = await (await s.get(base + f"/api/state?token={TOKEN}")).json()
+    finally:
+        await srv.stop()
+
+    solved_entry = data["swarms"]["solved-chal"]
+    assert solved_entry["solved"] is True
+    assert solved_entry["pending"] is False, "a solved challenge was also marked pending"
+
+    unsolved_entry = data["swarms"]["unsolved-chal"]
+    assert unsolved_entry["solved"] is False
+    assert unsolved_entry["pending"] is True
+
+
+def test_ui_prefers_solved_over_pending_in_status_and_sort() -> None:
+    from backend.dashboard_ui import render_dashboard
+
+    html = render_dashboard(TOKEN)
+    # statusTxt must test solved before pending
+    assert html.index("x.solved") < html.index("'⏸ 待解题")
+    # and the sort rank must treat solved as ahead of pending
+    assert "x.winner || x.solved" in html
+
+
 def test_ui_distinguishes_local_only_from_pending() -> None:
     from backend.dashboard_ui import render_dashboard
 

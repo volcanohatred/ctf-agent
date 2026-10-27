@@ -260,7 +260,13 @@ class ChallengeSwarm:
 
     def _gather_sibling_insights(self, exclude_model: str) -> str:
         """Sibling findings for bump payloads — bounded per finding so the
-        bump context stays light (the blackboard stores them in full)."""
+        bump context stays light (the blackboard stores them in full).
+
+        Returns "" when there is nothing to say. Callers test truthiness; this
+        used to return an English sentinel string, which made that test always
+        pass and injected a meaningless "No sibling insights available yet."
+        section into every restart payload.
+        """
         def _clip(text: str, limit: int = 400) -> str:
             text = text.strip()
             return text if len(text) <= limit else text[:limit] + " …"
@@ -269,7 +275,7 @@ class ChallengeSwarm:
         for model, finding in self.findings.items():
             if model != exclude_model and finding and publishable(finding):
                 parts.append(f"[{model}]: {_clip(finding)}")
-        return "\n".join(parts) if parts else "No sibling insights available yet."
+        return "\n".join(parts)
 
     def _skill_hint(self, bump_count: int) -> str:
         """Escalating knowledge-base hint, activated after repeated failures."""

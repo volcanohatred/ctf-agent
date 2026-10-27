@@ -11,6 +11,7 @@ tests drive it with a fake client.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -453,3 +454,118 @@ def test_command_timeout_can_be_disabled() -> None:
     s.settings = SimpleNamespace(sandbox_command_timeout_s=0)
     s._container_id = "c1"
     assert "timeout" not in s._wrap_for_sandbox("ls")
+
+
+# ---------------------------------------------------------------------------
+# Restart payloads must be auditable from the trace
+# ---------------------------------------------------------------------------
+
+def _realistic_restart_payload(target_chars: int = 10_500) -> str:
+    """A payload sized like the ones measured live (7.8-10.5 KB).
+
+    Sections appear in the order `_build_restart_payload` emits them. The skill
+    hint is the bulky one: at escalation level 3 it embeds a whole pack index,
+    bounded by skills.MAX_INDEX_CHARS. Because the team digest comes AFTER it, an
+    undersized trace window loses the digest specifically — which is the section
+    you most need when a restart misbehaves.
+    """
+    from backend.skills import MAX_INDEX_CHARS
+
+    journal = "\n".join(
+        f"{i}. 【已排除的死路】direction {i} ruled out after probing it thoroughly "
+        f"and finding no write primitive; 【已确认的事实】offset {i * 7} leaks a libc pointer"
+        for i in range(1, 6)
+    )
+    # Pad the handbook index to the real cap rather than guessing a size.
+    index_body = "handbook entry line describing one technique\n"
+    repeats = (MAX_INDEX_CHARS // len(index_body)) + 1
+    skill_hint = (
+        "KNOWLEDGE BASE (escalation level 3):\n"
+        "A CTF technique library is mounted read-only at `/skills/`.\n"
+        f"=== Pack index: /skills/ctf-misc/INDEX.md ===\n{(index_body * repeats)[:MAX_INDEX_CHARS]}\n"
+        "Full file list for ctf-misc: " + ", ".join(f"/skills/ctf-misc/f{i}.md" for i in range(40))
+    )
+    # Size the digest from the ACTUAL entry length rather than an estimate, so
+    # the fixture reliably lands at the measured payload size.
+    sample_entry = "finding number 0 confirmed; "
+    n_findings = max(1, (target_chars - len(journal) - len(skill_hint)) // len(sample_entry))
+    team_digest = "【队友已确认】" + "; ".join(
+        f"finding number {i} confirmed" for i in range(n_findings)
+    )
+    payload = "\n".join([
+        "这是一次全新的尝试（第 4 轮）。",
+        "【上一轮为何结束】",
+        "Your previous attempt hit the 90s wall-clock time budget and was interrupted.",
+        "【探索状态】",
+        journal,
+        "🎯 本轮主攻方向（未试过）：【CTF Misc - DNS Exploitation Techniques】"
+        "（手册 /skills/ctf-misc/dns.md，先读再做）",
+        skill_hint,
+        "【全队进展（含你自己之前的发现，已去重蒸馏）】",
+        team_digest,
+        "开始吧。工作区里你之前创建的文件还在（/challenge/workspace/）。",
+    ])
+    return payload
+
+
+def test_fixture_matches_the_measured_payload_size() -> None:
+    """Guard the guard: if the fixture shrinks below what was observed live, the
+    window test stops testing anything."""
+    payload = _realistic_restart_payload()
+    assert len(payload) >= 10_000, f"fixture is only {len(payload)} chars; live payloads reached 10500"
+
+
+def test_trace_window_holds_a_realistic_restart_payload() -> None:
+    """The team digest sits AFTER the bulky L3 skill hint, so a window that is
+    even slightly too small loses precisely the section you need when a restart
+    misbehaves. Measured payloads reached 10.5 KB against a 4 KB window."""
+    payload = _realistic_restart_payload()
+    assert len(payload) <= cs.BUMP_TRACE_CHARS, (
+        f"BUMP_TRACE_CHARS={cs.BUMP_TRACE_CHARS} cannot hold a {len(payload)}-char "
+        "payload; the team digest would be truncated out of the trace"
+    )
+
+
+def test_bump_event_records_the_true_payload_length() -> None:
+    """So truncation is visible rather than silent, whatever the window is."""
+    import json
+    import tempfile
+
+    payload = _realistic_restart_payload()
+    with tempfile.TemporaryDirectory() as td:
+        s = ClaudeSolver.__new__(ClaudeSolver)
+        from collections import deque
+
+        s._bump_queue = deque(maxlen=8)
+        s.loop_detector = LoopDetector()
+        s.tracer = SolverTracer("window-check", "fake", log_dir=td)
+        s.agent_name = "window-check/fake"
+        s.bump(payload)
+        s.tracer.close()
+
+        events = [
+            json.loads(line)
+            for line in (Path(td) / Path(s.tracer.path).name).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    bump_events = [e for e in events if e.get("type") == "bump"]
+    assert len(bump_events) == 1
+    ev = bump_events[0]
+    assert ev["insights_chars"] == len(payload), "the true length was not recorded"
+    assert len(ev["insights"]) == min(len(payload), cs.BUMP_TRACE_CHARS)
+    # The strongest proof nothing was cut: the LAST emitted section is present.
+    # Asserting a specific digest entry is brittle — its index depends on how the
+    # fixture was sized — while the trailing line is always the final one.
+    assert "全队进展" in ev["insights"], "the team digest header was cut off"
+    assert payload.rstrip().splitlines()[-1] in ev["insights"], (
+        "the payload tail was truncated, so the team digest is not auditable"
+    )
+
+
+def test_pydantic_backend_uses_the_same_window() -> None:
+    """Both backends write the same event shape; a window fixed in only one would
+    leave the other blind."""
+    from backend.agents import solver as pyd_solver
+
+    assert pyd_solver.BUMP_TRACE_CHARS == cs.BUMP_TRACE_CHARS

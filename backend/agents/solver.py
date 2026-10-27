@@ -63,10 +63,11 @@ logger = logging.getLogger(__name__)
 
 MAX_FINDING_BLOCKS = 24
 MAX_FINDING_CHARS = 24_000
-# Restart payloads carry the distilled journal plus the team digest and skill
-# hint, so they run to several KB. Trace enough to audit what the model actually
-# received; the full length is recorded alongside so truncation is visible.
-BUMP_TRACE_CHARS = 4_000
+# Restart payloads carry the distilled journal, the team digest, an escalating
+# skill hint (whose L3 form embeds a whole pack index) and the next untried
+# technique. Measured live at 7.8-10.5 KB, so the window must hold a real payload
+# or the tail — where the team digest sits — is what gets lost.
+BUMP_TRACE_CHARS = 16_000
 
 
 @dataclass

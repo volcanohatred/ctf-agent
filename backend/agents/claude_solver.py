@@ -70,10 +70,13 @@ STREAM_POLL_S = 2.0
 # overwritten, but they must not grow without bound either.
 MAX_FINDING_BLOCKS = 24
 MAX_FINDING_CHARS = 24_000
-# Restart payloads carry the distilled journal plus the team digest and skill
-# hint, so they run to several KB. Trace enough to audit what the model actually
-# received; the full length is recorded alongside so truncation is visible.
-BUMP_TRACE_CHARS = 4_000
+# Restart payloads carry the distilled journal, the team digest, an escalating
+# skill hint (whose L3 form embeds a whole pack index, up to MAX_INDEX_CHARS) and
+# the next untried technique. Measured live at 7.8-10.5 KB, so a 4 KB window cut
+# the tail — and because the team digest sits after the bulky skill hint, the
+# digest was exactly what got lost. Size the window to hold a real payload;
+# traces are pruned to the newest 500 files anyway, so this is bounded.
+BUMP_TRACE_CHARS = 16_000
 
 _STREAM_END = object()
 

@@ -58,6 +58,9 @@ class CoordinatorDeps:
     results: dict[str, dict] = field(default_factory=dict)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)
+    # How many times each challenge has been auto-spawned. Bounds the periodic
+    # re-spawn so a genuinely hopeless challenge is not re-queued forever.
+    spawn_attempts: dict[str, int] = field(default_factory=dict)
     # Archived (finished) swarm summaries — kept so the dashboard still shows
     # solved/completed challenges after their live swarm is retired.
     swarms_history: dict[str, dict] = field(default_factory=dict)

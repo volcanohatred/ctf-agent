@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     # Infra
     sandbox_image: str = "ctf-sandbox"
     max_concurrent_challenges: int = 10
+    # How many times a challenge may be auto-spawned. The coordinator re-checks
+    # for unsolved challenges with no active swarm every status interval, which
+    # is what makes it self-heal after a swarm retires (round cap / quota /
+    # infrastructure) and what lets it notice a CTFd solve-history reset — CTFd
+    # emits no event for a challenge becoming unsolved. The cap stops a genuinely
+    # hopeless challenge from being re-queued forever.
+    max_spawns_per_challenge: int = 3
     # Hard cap on bump/retry rounds per solver. A solver that keeps coming back
     # GAVE_UP is retired after this many rounds instead of spinning forever.
     # 0 = unlimited (only sane in coordinator mode against a live CTFd).

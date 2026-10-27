@@ -247,6 +247,25 @@ async def run_event_loop(
             now = asyncio.get_event_loop().time()
             if now - last_status >= status_interval:
                 last_status = now
+                # Re-check for unsolved challenges with no swarm. This is what
+                # makes the coordinator self-heal: a swarm that retired (round
+                # cap, quota, infrastructure) leaves its challenge unsolved and
+                # nothing else would ever retry it, and a CTFd solve-history reset
+                # emits no event at all.
+                try:
+                    n = await _auto_spawn_unsolved(
+                        deps, poller,
+                        max_spawns=int(getattr(deps.settings, "max_spawns_per_challenge", 3) or 3),
+                    )
+                    if n:
+                        logger.info("Re-spawned %d unsolved challenge(s)", n)
+                        parts.append(
+                            f"AUTO-SPAWN: {n} unsolved challenge(s) had no active swarm "
+                            "(retired or newly reset) and were re-queued."
+                        )
+                except Exception as e:  # noqa: BLE001 — never let this kill the loop
+                    logger.warning("Periodic re-spawn check failed: %s", e)
+
                 active = [n for n, t in deps.swarm_tasks.items() if not t.done()]
                 solved_set = poller.known_solved
                 unsolved_set = poller.known_challenges - solved_set
@@ -322,11 +341,29 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
         logger.warning("Auto-spawn failed for %s: %s", challenge_name, e)
 
 
-async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
-    """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
+async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller, max_spawns: int = 3) -> int:
+    """Spawn swarms for unsolved challenges that have no active swarm.
+
+    Called at startup AND periodically thereafter. The periodic call matters for
+    two cases that otherwise leave a challenge permanently unattended:
+      * its solve history was reset (CTFd emits no "became unsolved" event, so
+        nothing else notices), and
+      * its swarm retired — round cap, quota exhaustion or infrastructure
+        failures — without solving it.
+    Bounded by `max_spawns` per challenge so a genuinely hopeless challenge is
+    not re-queued forever.
+    """
     unsolved = poller.known_challenges - poller.known_solved
+    spawned = 0
     for name in sorted(unsolved):
+        if deps.spawn_attempts.get(name, 0) >= max_spawns:
+            continue
+        before = len(deps.swarm_tasks)
         await _auto_spawn_one(deps, name)
+        if len(deps.swarm_tasks) > before:
+            deps.spawn_attempts[name] = deps.spawn_attempts.get(name, 0) + 1
+            spawned += 1
+    return spawned
 
 
 # ---------------------------------------------------------------------------

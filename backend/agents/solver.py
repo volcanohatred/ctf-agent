@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 
 MAX_FINDING_BLOCKS = 24
 MAX_FINDING_CHARS = 24_000
+# Restart payloads carry the distilled journal plus the team digest and skill
+# hint, so they run to several KB. Trace enough to audit what the model actually
+# received; the full length is recorded alongside so truncation is visible.
+BUMP_TRACE_CHARS = 4_000
 
 
 @dataclass
@@ -581,7 +585,9 @@ class Solver:
             return
         self._bump_queue.append(insights)
         self.loop_detector.reset()
-        self.tracer.event("bump", insights=insights[:500], queued=len(self._bump_queue))
+        # See ClaudeSolver.bump: payloads outgrew the old 500-char window.
+        self.tracer.event("bump", insights=insights[:BUMP_TRACE_CHARS],
+                          insights_chars=len(insights), queued=len(self._bump_queue))
         logger.info(f"[{self.agent_name}] Bump queued ({len(self._bump_queue)} pending)")
 
     def reset_history(self) -> None:

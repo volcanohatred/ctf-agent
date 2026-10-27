@@ -36,6 +36,16 @@ services:
     env_file:
       - .env
     environment:
+      # Only what genuinely must DIFFER inside the container belongs here.
+      #
+      # Do NOT re-declare tuning defaults (SOLVER_TIME_BUDGET_S, MAX_ATTEMPTS_*,
+      # ...). `env_file: .env` already passes every value through, and
+      # backend/config.py is the single source of truth for defaults. Duplicating
+      # them here caused real drift: the code default for
+      # MAX_ATTEMPTS_PER_CHALLENGE was raised to 12 while this file still pinned
+      # 6, silently allowing only one distil->merge cycle. validate_tuning()
+      # caught it at startup, which is the only reason it was noticed.
+      #
       # DooD: sandbox binds must use HOST paths
       HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?Set HOST_PROJECT_DIR in .env (absolute project path on the docker host)}
       # Skills: BOTH are required. SKILLS_DIR is what the agent itself reads
@@ -43,27 +53,11 @@ services:
       # SKILLS_HOST_DIR is what gets bind-mounted into each sandbox.
       SKILLS_DIR: /skills
       SKILLS_HOST_DIR: ${SKILLS_HOST_DIR:-}
-      # Tuning pass-through (host env overrides .env for one-off runs)
-      SOLVER_TIME_BUDGET_S: ${SOLVER_TIME_BUDGET_S:-1500}
-      CONCLUDE_TIMEOUT_S: ${CONCLUDE_TIMEOUT_S:-90}
-      MAX_ATTEMPTS_PER_CHALLENGE: ${MAX_ATTEMPTS_PER_CHALLENGE:-6}
-      MAX_INFRA_FAILURES: ${MAX_INFRA_FAILURES:-3}
-      SKILL_AFTER_BUMPS: ${SKILL_AFTER_BUMPS:-1}
-      ESCALATE_AFTER_BUMPS: ${ESCALATE_AFTER_BUMPS:-8}
-      SANDBOX_COMMAND_TIMEOUT_S: ${SANDBOX_COMMAND_TIMEOUT_S:-900}
-      SANDBOX_PROXY_URL: ${SANDBOX_PROXY_URL:-}
-      COORDINATOR_MODEL: ${COORDINATOR_MODEL:-}
-      COORDINATOR_TURN_TIMEOUT_S: ${COORDINATOR_TURN_TIMEOUT_S:-300}
-      # 9400 must match `ctf-msg`'s default and the published port below.
-      MSG_PORT: ${MSG_PORT:-9400}
-      # Inside the container these MUST be 0.0.0.0 or Docker cannot forward the
-      # published port. Exposure is controlled host-side by the 127.0.0.1 bind
-      # in `ports:` below, plus the dashboard's bearer token.
+      # Inside the container these two MUST be 0.0.0.0 or Docker cannot forward
+      # the published port. Exposure is controlled host-side by the 127.0.0.1
+      # bind in `ports:` below, plus the dashboard's bearer token.
       MSG_HOST: ${MSG_HOST:-0.0.0.0}
-      DASHBOARD_PORT: ${DASHBOARD_PORT:-8080}
       DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
-      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
-      STARTUP_HEALTH_CHECK: ${STARTUP_HEALTH_CHECK:-true}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./challenges:/app/challenges

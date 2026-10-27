@@ -379,6 +379,124 @@ async def _instant_sleep(_seconds):
     """Keep retry-backoff tests fast without touching the real clock."""
 
 
+@pytest.mark.asyncio
+async def test_auxiliary_gateway_failure_does_not_block_a_runnable_session(patch_client, monkeypatch) -> None:
+    """The two endpoints are not equally important.
+
+    The Anthropic-protocol endpoint drives every default claude-sdk solver; the
+    OpenAI-compatible one is only the quota fallback and the summarizer backend.
+    Observed live: the primary probed `ok` while the auxiliary failed DNS inside
+    the container, and the whole run was vetoed even though it would have solved
+    challenges normally — losing only the fallback and the distilled journal.
+    """
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/v1/messages"):
+            return httpx.Response(200, json={"content": []})     # primary: healthy
+        raise httpx.ConnectError("No address associated with hostname")  # aux: DNS
+
+    patch_client(handler)
+    report = await check_health(_settings(health_check_retries=2))
+
+    primary, aux = report.probes
+    assert primary.ok and primary.critical
+    assert not aux.ok and aux.critical is False
+    assert report.ok, "an auxiliary endpoint vetoed a runnable session"
+    assert report.warnings and not report.fatal
+
+
+@pytest.mark.asyncio
+async def test_primary_failure_is_still_fatal_even_when_auxiliary_is_fine(patch_client, monkeypatch) -> None:
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/v1/messages"):
+            raise httpx.ConnectError("Connection refused")        # primary: dead
+        return httpx.Response(200, json={"choices": []})          # aux: healthy
+
+    patch_client(handler)
+    report = await check_health(_settings(health_check_retries=2))
+
+    assert not report.ok
+    assert [p.name for p in report.fatal] == ["anthropic"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_healthy_proceeds_when_only_the_auxiliary_endpoint_is_down(patch_client, monkeypatch) -> None:
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/v1/messages"):
+            return httpx.Response(200, json={"content": []})
+        raise httpx.ConnectError("No address associated with hostname")
+
+    patch_client(handler)
+    report = await ensure_healthy(_settings(health_check_retries=2))
+    assert report.ok
+    assert report.warnings, "the degraded fallback must still be surfaced loudly"
+
+
+# ---------------------------------------------------------------------------
+# The hint must match the actual failure
+# ---------------------------------------------------------------------------
+
+def _fatal_report(url: str, kind: str, detail: str, status: int | None = None) -> HealthReport:
+    return HealthReport(probes=[ProbeResult(
+        name="anthropic", url=url, ok=False, kind=kind, detail=detail, status=status,
+    )])
+
+
+def test_hint_for_loopback_addressing() -> None:
+    text = str(HealthCheckError(_fatal_report(
+        "http://127.0.0.1:8090/anthropic/v1/messages", "unreachable", "Connection refused")))
+    assert "host.docker.internal" in text
+    assert "DNS" not in text, "a loopback problem was diagnosed as DNS"
+
+
+def test_hint_for_container_dns_failure() -> None:
+    """A fixed hint told operators to fix loopback addressing when the real
+    problem was container DNS for an external hostname — sending them to edit the
+    wrong thing."""
+    text = str(HealthCheckError(_fatal_report(
+        "https://gw.example.com/v1/chat/completions", "unreachable",
+        "[Errno -5] No address associated with hostname")))
+    assert "DNS" in text
+    assert "host.docker.internal instead of 127.0.0.1" not in text
+
+
+def test_hint_for_bad_credentials() -> None:
+    text = str(HealthCheckError(_fatal_report(
+        "http://host.docker.internal:8090/anthropic/v1/messages", "auth",
+        "invalid api key", status=401)))
+    assert "credentials" in text.lower()
+    assert "ANTHROPIC_AUTH_TOKEN" in text
+    assert "host.docker.internal instead of 127.0.0.1" not in text
+
+
+def test_hint_for_nothing_listening() -> None:
+    text = str(HealthCheckError(_fatal_report(
+        "http://host.docker.internal:8090/anthropic/v1/messages", "unreachable",
+        "Connection refused")))
+    assert "nothing answered" in text
+
+
+def test_hint_always_mentions_the_bypass() -> None:
+    text = str(HealthCheckError(_fatal_report("http://x/v1/messages", "unreachable", "refused")))
+    assert "STARTUP_HEALTH_CHECK=false" in text
+
+
+def test_hint_covers_every_fatal_probe() -> None:
+    report = HealthReport(probes=[
+        ProbeResult(name="anthropic", url="http://127.0.0.1:8090/v1/messages",
+                    ok=False, kind="unreachable", detail="Connection refused"),
+        ProbeResult(name="anthropic2", url="https://gw.example.com/v1/messages",
+                    ok=False, kind="auth", detail="bad key", status=401),
+    ])
+    text = str(HealthCheckError(report))
+    assert "anthropic:" in text and "anthropic2:" in text
+
+
 def test_report_render_is_readable() -> None:
     report = HealthReport(probes=[
         ProbeResult(name="anthropic", url="http://gw/v1/messages", ok=False,

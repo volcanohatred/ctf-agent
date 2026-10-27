@@ -39,6 +39,15 @@ class ProbeResult:
     kind: str = "ok"
     status: int | None = None
     detail: str = ""
+    # Whether losing this endpoint makes solving impossible.
+    #
+    # The Anthropic-protocol endpoint drives every default (claude-sdk/*) solver,
+    # so it is critical. The OpenAI-compatible one is only the quota fallback and
+    # the summarizer backend: losing it degrades quality (no fallback on 429, no
+    # distilled journal or team digest) but does not stop a single challenge from
+    # being solved. Treating both as equally fatal blocked perfectly runnable
+    # sessions on a transient DNS blip for the auxiliary endpoint.
+    critical: bool = True
 
     def __str__(self) -> str:
         # ASCII only — see render(): this string reaches the startup console.
@@ -56,20 +65,22 @@ class HealthReport:
     def fatal(self) -> list[ProbeResult]:
         """Problems that must stop the run.
 
-        Only "nothing is there" (unreachable: refused / DNS failure / TLS) and
-        "your credentials are wrong" (auth) are fatal — both are deterministic
-        and will not improve on their own.
+        Two independent axes decide this, and both are needed:
 
-        A timeout is deliberately NOT fatal. Observed live: the local gateway
-        hangs for a few minutes at a time and then answers in ~1s, so treating a
-        slow probe as fatal blocked runs that would have worked. Proceeding is
-        safe because the swarm has its own guard — MAX_INFRA_FAILURES consecutive
-        infrastructure failures retire it within a few rounds with a recorded
-        reason, and ctfd-bench marks the report `usable_run: false`. That bounds
-        the damage without betting the whole run on one probe.
+        *Criticality* — only a CRITICAL endpoint can be fatal. The
+        Anthropic-protocol endpoint drives every default solver; the
+        OpenAI-compatible one is just the quota fallback and the summarizer
+        backend, so losing it degrades quality without preventing any solve.
+
+        *Recoverability* — of the critical probes, only "nothing is there"
+        (unreachable: refused / DNS failure / TLS) and "your credentials are
+        wrong" (auth) are fatal, since neither improves on its own. A timeout is
+        NOT fatal: observed live, the local gateway hangs for minutes and then
+        answers in ~1.2s, and the swarm's own MAX_INFRA_FAILURES guard bounds the
+        damage with a recorded reason if it stays broken.
         """
         return [p for p in self.probes
-                if not p.ok and p.kind in ("unreachable", "auth")]
+                if not p.ok and p.critical and p.kind in ("unreachable", "auth")]
 
     @property
     def warnings(self) -> list[ProbeResult]:
@@ -102,7 +113,54 @@ class HealthCheckError(RuntimeError):
 
     def __init__(self, report: HealthReport) -> None:
         self.report = report
-        super().__init__("Model gateway health check failed:\n" + report.render())
+        super().__init__(
+            "Model gateway health check failed:\n"
+            + report.render()
+            + "\n\n"
+            + _hint_for(report)
+        )
+
+
+def _hint_for(report: HealthReport) -> str:
+    """A hint that matches the actual failure.
+
+    A single fixed hint used to be printed for every fatal case, which made it
+    actively misleading: an external hostname failing DNS inside the container
+    was answered with "use host.docker.internal instead of 127.0.0.1", sending
+    the operator to edit the wrong thing.
+    """
+    hints: list[str] = []
+    for p in report.fatal:
+        url = p.url or ""
+        if p.kind == "auth":
+            hints.append(
+                f"{p.name}: credentials were rejected (HTTP {p.status}). Check "
+                "ANTHROPIC_AUTH_TOKEN / GATEWAY_API_KEY — this never fixes itself, "
+                "so retrying will not help."
+            )
+        elif "127.0.0.1" in url or "localhost" in url:
+            hints.append(
+                f"{p.name}: {url} is loopback. From inside the agent container that "
+                "is the container itself, not the host — use host.docker.internal "
+                "instead of 127.0.0.1 in .env."
+            )
+        elif "No address associated with hostname" in p.detail or "getaddrinfo" in p.detail \
+                or "ENOTFOUND" in p.detail or "Name or service not known" in p.detail:
+            hints.append(
+                f"{p.name}: DNS could not resolve the hostname in {url}. This is a "
+                "container DNS problem, not an addressing one — check Docker "
+                "Desktop's DNS settings, or the host's resolver/VPN, and confirm "
+                "`docker run --rm ctf-agent:latest getent hosts <hostname>` works."
+            )
+        else:
+            hints.append(
+                f"{p.name}: nothing answered at {url}. Confirm the gateway process "
+                "is running and that the port is reachable from inside a container "
+                "(host.docker.internal:<port> for a gateway on the Docker host)."
+            )
+    hints.append("Set STARTUP_HEALTH_CHECK=false (or pass --skip-health-check) to "
+                 "bypass this probe entirely.")
+    return "\n".join(hints)
 
 
 def _anthropic_headers(token: str) -> dict[str, str]:
@@ -267,16 +325,17 @@ async def check_health(settings: object, probe_model: str = "") -> HealthReport:
             attempts=attempts,
         )
     )
-    report.probes.append(
-        await _probe_with_retries(
-            probe_openai,
-            getattr(settings, "gateway_base_url", "") or "",
-            getattr(settings, "gateway_api_key", "") or "",
-            summarizer or primary,
-            timeout_s,
-            attempts=attempts,
-        )
+    # Auxiliary: quota fallback + summarizer only. Never fatal on its own.
+    aux = await _probe_with_retries(
+        probe_openai,
+        getattr(settings, "gateway_base_url", "") or "",
+        getattr(settings, "gateway_api_key", "") or "",
+        summarizer or primary,
+        timeout_s,
+        attempts=attempts,
     )
+    aux.critical = False
+    report.probes.append(aux)
     return report
 
 

@@ -90,12 +90,10 @@ async def _preflight(settings: Settings, model_specs: list[str], *, prune_logs: 
         await ensure_healthy(settings)
     except HealthCheckError as e:
         console.print("[bold red]Startup health check FAILED[/bold red]")
+        # The exception carries a hint tailored to the actual failure kind
+        # (loopback addressing vs container DNS vs bad credentials vs nothing
+        # listening). A fixed hint here used to contradict it.
         console.print(str(e))
-        console.print(
-            "\n[dim]Hint: from inside the agent container the gateway must be "
-            "reachable as host.docker.internal, not 127.0.0.1. "
-            "Set STARTUP_HEALTH_CHECK=false to skip this probe.[/dim]"
-        )
         raise SystemExit(2) from None
 
 

@@ -262,8 +262,7 @@ def test_export_report() -> None:
         findings={"m1": "found weak CRC32"},
         message_bus=bus,
     )
-    deps = SimpleNamespace(cost_tracker=None)
-    report = build_report("test-chal", swarm, None, deps)
+    report = build_report("test-chal", swarm, None)
     assert report["name"] == "test-chal"
     assert report["failed_approaches"] == ["format string", "ret2win"]
     assert len(report["shared_feed"]) == 2

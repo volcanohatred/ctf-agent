@@ -253,11 +253,14 @@ class ClaudeSolver:
 
     @staticmethod
     def _deny(tool_name: str, reason: str, system_message: str = "") -> dict:
+        # Name the blocked tool in the reason. It was accepted and then ignored,
+        # so a loop-break denial read as a generic "try a different approach"
+        # with no indication of which call had been rejected.
         out: dict = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
+                "permissionDecisionReason": f"[{tool_name}] {reason}" if tool_name else reason,
             }
         }
         if system_message:

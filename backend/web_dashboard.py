@@ -499,7 +499,7 @@ class DashboardServer:
         archived = getattr(self.deps, "swarms_history", {}).get(name)
         if swarm is None and archived is None:
             return web.json_response({"error": "no such challenge"}, status=404)
-        report = await asyncio.to_thread(build_report, name, swarm, archived, self.deps)
+        report = await asyncio.to_thread(build_report, name, swarm, archived)
         if fmt == "json":
             body, ctype, ext = render_json(report), "application/json", "json"
         else:

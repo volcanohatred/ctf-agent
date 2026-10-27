@@ -30,7 +30,6 @@ def collect_challenge_data(
     name: str,
     swarm: Any | None,
     archived: dict | None,
-    deps: Any,
 ) -> dict[str, Any]:
     """Normalize a challenge's data from a LIVE swarm or an archived summary."""
     if swarm is not None:
@@ -100,9 +99,9 @@ def collect_challenge_data(
     }
 
 
-def build_report(name: str, swarm: Any | None, archived: dict | None, deps: Any) -> dict[str, Any]:
+def build_report(name: str, swarm: Any | None, archived: dict | None) -> dict[str, Any]:
     """Build the complete exportable report for one challenge."""
-    data = collect_challenge_data(name, swarm, archived, deps)
+    data = collect_challenge_data(name, swarm, archived)
     data["exported_at"] = time.time()
     data["exported_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
     return data

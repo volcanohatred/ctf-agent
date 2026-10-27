@@ -361,9 +361,9 @@ class Solver:
             self.tracer.event("cancelled", step_count=self._step_count[0])
             raise
         except Exception as e:  # noqa: BLE001 — mapped onto solver statuses below
-            return self._handle_run_exception(e, t0, deltas)
+            return self._handle_run_exception(e, deltas)
 
-    def _handle_run_exception(self, e: Exception, t0: float, deltas: dict) -> SolverResult:
+    def _handle_run_exception(self, e: Exception, deltas: dict) -> SolverResult:
         """Map a pydantic-ai/model exception onto a solver status."""
         from pydantic_ai.exceptions import RunTimedOut
 

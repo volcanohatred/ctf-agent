@@ -162,7 +162,7 @@ def main(
         asyncio.run(_run_single(settings, challenge, model_specs, no_submit, time_limit))
     else:
         asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit,
-                                     coordinator_model, max_challenges))
+                                     coordinator_model))
 
 
 async def _run_single(
@@ -268,9 +268,13 @@ async def _run_coordinator(
     challenges_dir: str,
     no_submit: bool,
     coordinator_model: str | None,
-    max_challenges: int,
 ) -> None:
-    """Run the full coordinator (continuous until Ctrl+C)."""
+    """Run the full coordinator (continuous until Ctrl+C).
+
+    The concurrency cap is read from `settings.max_concurrent_challenges`, which
+    main() has already reconciled with --max-challenges; passing it again here was
+    a redundant parameter that nothing read.
+    """
     from backend.agents.claude_coordinator import run_claude_coordinator
 
     await _preflight(settings, model_specs)

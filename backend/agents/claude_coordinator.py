@@ -95,10 +95,14 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
 
     @tool("fetch_challenges", "List all challenges with category, points, solve count, and status.", {})
     async def fetch_challenges(args: dict) -> dict:
+        # The MCP @tool handler signature is framework-imposed: it is called with
+        # an args dict even when the tool declares no parameters.
+        del args
         return _text(await do_fetch_challenges(deps))
 
     @tool("get_solve_status", "Check which challenges are solved and which swarms are running.", {})
     async def get_solve_status(args: dict) -> dict:
+        del args  # framework-imposed signature; this tool takes no parameters
         return _text(await do_get_solve_status(deps))
 
     @tool("spawn_swarm", "Launch all solver models on a challenge.", {"challenge_name": str})

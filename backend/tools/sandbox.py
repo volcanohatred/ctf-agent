@@ -93,9 +93,16 @@ async def web_fetch(ctx: RunContext[SolverDeps], url: str, method: str = "GET", 
 
 async def webhook_create(ctx: RunContext[SolverDeps]) -> str:
     """Create a webhook.site token for out-of-band HTTP callbacks (XSS, SSRF, bot challenges)."""
+    # `ctx` is unused here but REQUIRED by the declared contract: FunctionToolset
+    # types every tool as (RunContext[Deps], /, *args, **kwargs) -> Any. Dropping
+    # it still registers at runtime (pydantic-ai injects by annotation, and finds
+    # none), but it violates the library's type contract — ty rejects it, and
+    # relying on undocumented leniency is not worth saving one parameter.
+    del ctx
     return await do_webhook_create()
 
 
 async def webhook_get_requests(ctx: RunContext[SolverDeps], uuid: str) -> str:
     """Retrieve HTTP requests received by a webhook.site token."""
+    del ctx  # required by the FunctionToolset signature; see webhook_create
     return await do_webhook_get_requests(uuid)

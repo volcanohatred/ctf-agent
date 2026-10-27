@@ -202,13 +202,10 @@ async def run_event_loop(
                 events.append(evt)
             events.extend(poller.drain_events())
 
-            # Auto-kill swarms for solved challenges
+            # Auto-kill swarms for solved challenges, and record the solve.
             for evt in events:
-                if evt.kind == "challenge_solved" and evt.challenge_name in deps.swarms:
-                    swarm = deps.swarms[evt.challenge_name]
-                    if not swarm.cancel_event.is_set():
-                        swarm.kill("challenge confirmed solved on CTFd")
-                        logger.info("Auto-killed swarm for: %s", evt.challenge_name)
+                if evt.kind == "challenge_solved":
+                    record_challenge_solved(deps, evt.challenge_name)
 
             parts: list[str] = []
             for evt in events:
@@ -324,6 +321,33 @@ async def run_event_loop(
         "total_tokens": cost_tracker.total_tokens,
         "archived": sorted(deps.swarms_history),
     }
+
+
+def record_challenge_solved(deps: CoordinatorDeps, name: str) -> None:
+    """Record a CTFd-confirmed solve and retire any swarm still working on it.
+
+    CTFd is the authority, and the poller can observe a solve BEFORE the winning
+    swarm has stored its own winner. Killing the swarm at that moment used to lose
+    the result entirely — observed live as the dashboard reporting 13 solved while
+    CTFd and the coordinator's own STATUS line both said 14, because
+    `_run_and_cleanup` only records a result when `swarm.run()` returns FLAG_FOUND.
+    """
+    swarm = deps.swarms.get(name)
+    if name not in deps.results:
+        flag = ""
+        if swarm is not None:
+            winner = getattr(swarm, "winner", None)
+            flag = getattr(winner, "flag", "") or ""
+            if not flag:
+                flag = getattr(swarm, "confirmed_flag", "") or ""
+        deps.results[name] = {
+            "flag": flag,
+            "submit": ("confirmed by solver" if flag
+                       else "confirmed on CTFd (observed by poller)"),
+        }
+    if swarm is not None and not swarm.cancel_event.is_set():
+        swarm.kill("challenge confirmed solved on CTFd")
+        logger.info("Auto-killed swarm for: %s", name)
 
 
 async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:

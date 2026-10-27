@@ -189,26 +189,66 @@ On quota/rate-limit, a solver automatically retries the SAME model via the
 OpenAI-compatible endpoint (`GATEWAY_BASE_URL`) reusing its sandbox
 (`QUOTA_FALLBACK` in `backend/agents/swarm.py`).
 
-Verified on the regression suite (10 easy + 4 hard + 4 harder + 3 boss-level,
-incl. glibc-2.39 safe-linking tcache poison, tcache double-free with key-clear
-bypass, DSA nonce-MSB hidden-number-problem, and an MBA-obfuscated reverse
-checker): 19/20 on a live local CTFd (one intentionally-unsolvable knapsack
-excepted — it's the control case that drives solvers into the skill library).
+The bundled suite has **22 keyed challenges**: `example-static` (1) +
+`regression` (10) + `hard` (4) + `hard2` (4) + `hard3` (3), covering glibc-2.39
+safe-linking tcache poison, tcache double-free with key-clear bypass, DSA
+nonce-MSB hidden-number-problem and an MBA-obfuscated reverse checker.
 
-## Verification results (local CTFd, gateway models)
+> An earlier revision of this file claimed "19/20" while its own table summed to
+> 21/21 and its prose described 21 challenges, and cited an "intentionally
+> unsolvable knapsack control case" that is not present anywhere in `challenges/`.
+> The numbers below are what was actually measured, with the distinction between
+> re-verified and inherited made explicit.
 
-| Suite | Result | Notes |
-|---|---|---|
-| challenges/example-static | ✅ | smoke |
-| challenges/regression (10) | 10/10 | 18s–10min each |
-| challenges/hard (4) | 4/4 | coppersmith / anti-debug / flask-cookie / heap-tcache |
-| challenges/hard2 (4) | 4/4 | franklin-reiter / custom-VM reverse / multi-layer forensics pcap / tcache double-free (key bypass) |
-| challenges/hard3 (3) | 3/3 | crypto-hnp (DSA nonce MSB leak) / reverse-mba / web-pickle-restricted |
-| Skill engagement | ✅ | when genuinely stuck, solvers grep & read `/skills/` docs on their own (knapsack → crypto lattice doc; mba → mba-simplification.md); bump-triggered hints escalate L1→L2→L3 with real file paths |
+## Verification results
+
+**Re-measured on this branch** (`feature/coach-mode`, gateway models, live local
+CTFd, `MAX_CONCURRENT_CHALLENGES=2`):
+
+| Run | Result | Cost | Notes |
+|---|---|---|---|
+| Full live CTFd run — `regression` (10) + `hard2` (4) | **14/14** | $8.72 | Coordinator mode end to end: auto-spawn, solve, submit, auto-kill, self-healing re-spawn. 0 leaked containers, 0 leaked workspaces |
+| `regression/misc-encoding` via `ctf-solve` | ✅ MATCH | $0.25–0.30 | 37s and 146s on separate runs |
+| `regression/forensics-magic` via `ctf-bench` | ✅ MATCH | $1.82 | 205s |
+| `regression/reverse-xor-binary` | ✅ MATCH | $0.40 | 30s |
+| `hard2/reverse-vm` | ✅ MATCH | $0.15 | 14s |
+| `hard3/reverse-mba` | ✅ MATCH | $0.22 | 55s |
+| `example-static` (smoke) | ✅ MATCH | $0.06–0.07 | 4/4 sandboxes torn down cleanly |
+| Two-phase harvest under a live LLM | ✅ | $1.54 | Forced with a 12s round budget on an unsolvable synthetic challenge: 8 `budget_interrupt`, **6/6 `conclude_ok`** (0 failures), 6 `session_forgotten`, 3 full restart cycles |
+
+That covers 16 of the 22 challenges by direct observation.
+
+**Inherited from earlier revisions, not re-measured here**: `hard` (4 —
+coppersmith / anti-debug / flask-cookie / heap-tcache) and `hard3`'s crypto-hnp
+and web-pickle-restricted (2). Treat those rows as unverified until re-run.
+
+| Suite | Status |
+|---|---|
+| `challenges/example-static` (1) | re-verified ✅ |
+| `challenges/regression` (10) | re-verified 10/10 ✅ |
+| `challenges/hard2` (4) | re-verified 4/4 ✅ |
+| `challenges/hard3` (3) | 1 of 3 re-verified; 2 inherited |
+| `challenges/hard` (4) | inherited, not re-verified |
+
+**Skill engagement**: bump-triggered hints escalate L1→L2→L3 with real file
+paths, and the approach queue rotates through triaged handbook files — observed
+live (`Skill triage → ['ctf-misc']`, `Approach queue: 12 techniques`, and
+`['ctf-forensics', 'ctf-reverse']` → 24 techniques). The previously documented
+"knapsack → crypto lattice doc" example cannot be reproduced: that challenge is
+not in the tree.
 
 Rebuild/regenerate: `python3 scripts/gen_regression.py` (inside the sandbox),
 `gen_hard.py`, `gen_hard2.py`, `gen_hard3.py`; seed a local CTFd with
 `scripts/seed_ctfd.py`.
+
+> **Scoring caveat**: 21 keyless flat duplicates of the canonical challenges also
+> sit directly under `challenges/` (e.g. `challenges/reg-misc-encoding/` beside
+> the keyed `challenges/regression/misc-encoding/`). A challenge with no `flag:`
+> cannot be scored offline at all — every submission answers DRY RUN, so
+> FLAG_FOUND is unreachable and the run always reports "No flag found" no matter
+> how well the models did. Both `ctf-bench` and `ctf-solve` now warn about this
+> instead of failing silently. Their `distfiles/` are byte-identical to the
+> canonical copies, so they are redundant rather than additional coverage.
 
 ## Skill Library
 

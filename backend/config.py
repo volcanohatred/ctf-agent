@@ -40,8 +40,19 @@ class Settings(BaseSettings):
     ctfd_token: str = ""
 
     # API Keys
+    #
+    # `anthropic_api_key` is not read by this codebase — it is read by the Claude
+    # Code CLI itself, out of the process environment, when ANTHROPIC_BASE_URL is
+    # left empty (i.e. talking to the official API rather than a gateway). It is
+    # declared here so it stays documented and validated alongside everything
+    # else. Do not "clean it up" as unused.
+    #
+    # There is deliberately no `openai_api_key`: this fork removed the Codex
+    # backend, and `resolve_model` has no bare `openai/` provider. OpenAI-shaped
+    # endpoints are reached through `gateway_*`, `azure_openai_*` or
+    # `opencode_zen_api_key`. A vestigial key here would imply a code path that
+    # does not exist.
     anthropic_api_key: str = ""
-    openai_api_key: str = ""
     gemini_api_key: str = ""
 
     # Claude Code CLI routing (claude-sdk backend).

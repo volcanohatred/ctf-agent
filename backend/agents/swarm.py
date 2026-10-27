@@ -658,13 +658,23 @@ class ChallengeSwarm:
                 logger.warning("session reset via %s failed: %s", name, e)
 
     async def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
-        """The seed message for a freshly restarted session."""
+        """The seed message for a freshly restarted session.
+
+        `reason` explains WHY the previous round ended — time budget exhausted,
+        context window exceeded, or simply no flag. It used to be accepted and
+        then ignored, so a restarted solver was never told it had timed out or
+        blown its context, and could not adjust its behaviour accordingly.
+        """
         journal = self._journals.get(model_spec, [])
         state_txt = "\n".join(f"{i+1}. {j}" for i, j in enumerate(journal)) or "(暂无)"
 
         parts = [
-            f"这是一次全新的尝试（第 {bump_count + 1} 轮）。你之前的探索状态已被蒸馏如下，"
-            "不要重复已失败的方向，直接基于它继续：",
+            f"这是一次全新的尝试（第 {bump_count + 1} 轮）。",
+        ]
+        if reason:
+            parts += ["【上一轮为何结束】", reason, ""]
+        parts += [
+            "你之前的探索状态已被蒸馏如下，不要重复已失败的方向，直接基于它继续：",
             "",
             "【探索状态】",
             state_txt,
@@ -873,7 +883,19 @@ class ChallengeSwarm:
                     break  # cancelled during backoff
                 continue
 
-            if result.status in (ERROR, INFRA_ERROR):
+            # Context overflow is recoverable and the solver has already dropped
+            # its history by the time we get here, so it must not be counted
+            # alongside genuine errors — otherwise five overflows would retire a
+            # solver that is perfectly healthy. The flag existed but nothing read
+            # it, so the distinction was invisible.
+            overflowed = bool(result.context_overflow)
+            if overflowed:
+                logger.warning(
+                    f"[{self.meta.name}/{model_spec}] context window exceeded — "
+                    "history was dropped, restarting clean"
+                )
+
+            if result.status in (ERROR, INFRA_ERROR) and not overflowed:
                 consecutive_errors += 1
                 if consecutive_errors >= 5:
                     self._retire_reason = f"{consecutive_errors} consecutive errors"
@@ -881,7 +903,7 @@ class ChallengeSwarm:
                         f"[{self.meta.name}/{model_spec}] {self._retire_reason} — giving up"
                     )
                     break
-            else:
+            elif not overflowed:
                 consecutive_errors = 0
 
             # ---- bump path: GAVE_UP, recoverable ERROR, or time budget hit ----
@@ -907,12 +929,27 @@ class ChallengeSwarm:
                     "interrupted. Your confirmed findings were harvested. Work in "
                     "smaller increments, and pick a FASTER, more direct strategy."
                 )
+            elif overflowed:
+                reason = (
+                    "Your previous attempt ran out of context window and your "
+                    "conversation history was dropped. Everything you confirmed is "
+                    "in the state below. Read large files in slices (sed -n, head), "
+                    "write intermediate results to /challenge/workspace/ instead of "
+                    "keeping them in context, and avoid re-printing big outputs."
+                )
             else:
                 reason = "Your previous attempt did not find the flag."
 
+            # An overflow already wiped the history, so the continue-session bump
+            # would be talking to an empty session with no state carried over —
+            # force the distilled fresh-restart path regardless of the setting.
+            force_restart = overflowed
+
             # Fresh-restart mode: distill this round, reset the session, and
             # restart clean carrying only the distilled state (no history bloat).
-            if int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
+            # Also forced after a context overflow, where the history is already
+            # gone and only the distilled state can carry anything forward.
+            if force_restart or int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
                 await self._fresh_restart(solver, model_spec, result, reason, bump_count)
             else:
                 solver.bump(await self._build_bump_payload(model_spec, reason, bump_count))

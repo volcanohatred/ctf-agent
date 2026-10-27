@@ -21,6 +21,7 @@ from backend.agents.swarm import ChallengeSwarm, publishable, split_tagged
 from backend.message_bus import KIND_EXCLUDED, KIND_FACT, ChallengeMessageBus
 from backend.solver_base import (
     CANCELLED,
+    ERROR,
     FLAG_FOUND,
     GAVE_UP,
     INFRA_ERROR,
@@ -567,6 +568,105 @@ async def test_empty_flag_is_rejected_without_consuming_a_submission() -> None:
     display, ok = await swarm.try_submit_flag("   ", "m1")
     assert ok is False and "Empty" in display
     assert swarm._submit_count == {}
+
+
+# ---------------------------------------------------------------------------
+# Context overflow — recoverable, and must not be counted as an error
+# ---------------------------------------------------------------------------
+
+def _overflow(findings: str = "partial work before the window filled") -> SolverResult:
+    r = SolverResult(flag=None, status=ERROR, findings_summary=findings,
+                     step_count=4, cost_usd=0.01, log_path="", tool_calls=4,
+                     api_error="prompt exceeds the context window")
+    r.context_overflow = True
+    return r
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_does_not_count_toward_the_error_retirement() -> None:
+    """The solver already self-healed by dropping history, so five overflows must
+    not retire a healthy solver via the consecutive-error guard."""
+    solver = ScriptedSolver("m1", [_overflow()] * 4 + [_flag()])
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=0, fresh_restart_rounds=0)
+
+    result = await swarm.run()
+
+    assert result is not None and result.status == FLAG_FOUND, swarm.retire_reason
+    assert solver.rounds == 5
+    assert "consecutive errors" not in swarm.retire_reason
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_forces_the_fresh_restart_path() -> None:
+    """After an overflow the history is already gone, so a continue-session bump
+    would talk to an empty session carrying no state."""
+    solver = ScriptedSolver("m1", [_overflow(), _flag()])
+    # fresh_restart_rounds=0 means the plain bump path — overflow must override it
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=DEFAULT_CAP,
+                   fresh_restart_rounds=0)
+
+    await swarm.run()
+
+    assert solver.forgets >= 1, "history was not reset after a context overflow"
+    assert any("context window" in b for b in solver.bumps), solver.bumps
+
+
+@pytest.mark.asyncio
+async def test_overflow_bump_explains_how_to_avoid_repeating_it() -> None:
+    solver = ScriptedSolver("m1", [_overflow(), _flag()])
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=DEFAULT_CAP,
+                   fresh_restart_rounds=0)
+
+    await swarm.run()
+
+    payload = "\n".join(solver.bumps)
+    # actionable guidance, not just "you failed"
+    assert "/challenge/workspace/" in payload
+
+
+@pytest.mark.asyncio
+async def test_genuine_errors_still_retire_after_five() -> None:
+    """The overflow exemption must not weaken the real error guard."""
+    broken = SolverResult(flag=None, status=ERROR, findings_summary="Error: backend died",
+                          step_count=1, cost_usd=0.01, log_path="", tool_calls=1,
+                          api_error="backend died")
+    solver = ScriptedSolver("m1", [broken])
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=0, fresh_restart_rounds=0)
+
+    await swarm.run()
+
+    assert "consecutive errors" in swarm.retire_reason, swarm.retire_reason
+    assert solver.rounds == 5
+
+
+@pytest.mark.asyncio
+async def test_restart_payload_states_why_the_previous_round_ended() -> None:
+    """`reason` was accepted by _build_restart_payload and then ignored, so a
+    restarted solver was never told it had timed out or blown its context window
+    and could not adjust its behaviour."""
+    solver = ScriptedSolver("m1", [_interrupted("work in progress"), _flag()])
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=DEFAULT_CAP,
+                   fresh_restart_rounds=5, solver_time_budget_s=1500,
+                   conclude_timeout_s=5)
+
+    await swarm.run()
+
+    payload = "\n".join(solver.bumps)
+    assert "上一轮为何结束" in payload, payload[:400]
+    assert "wall-clock time budget" in payload
+
+
+@pytest.mark.asyncio
+async def test_plain_failure_restart_says_so_too() -> None:
+    solver = ScriptedSolver("m1", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": solver}, max_attempts_per_challenge=DEFAULT_CAP,
+                   fresh_restart_rounds=5)
+
+    await swarm.run()
+
+    payload = "\n".join(solver.bumps)
+    assert "上一轮为何结束" in payload
+    assert "did not find the flag" in payload
 
 
 # ---------------------------------------------------------------------------

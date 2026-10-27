@@ -248,7 +248,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 147 tests, no Docker / no LLM / no network
+uv run pytest -q             # 337 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports

@@ -1,5 +1,21 @@
 """Self-contained single-page dashboard UI (served by web_dashboard.py)."""
 
+# Injected by render_dashboard() — the page needs the token to call its own API.
+TOKEN_PLACEHOLDER = "__DASHBOARD_TOKEN__"
+
+
+def render_dashboard(token: str) -> str:
+    """Return the dashboard HTML with the session token baked in.
+
+    The token is placed by `str.replace` (not `str.format`) because the page is
+    full of CSS/JS braces, and it is JSON-encoded so no character in a generated
+    token can break out of the string literal it lands in.
+    """
+    import json
+
+    return DASHBOARD_HTML.replace(TOKEN_PLACEHOLDER, json.dumps(token or ""))
+
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -90,13 +106,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </main>
 <div id="toast"></div>
 <script>
+const TOKEN = __DASHBOARD_TOKEN__;
 let STATE = null, SEL = null, SELSPEC = null;
 const openTraces = new Set();   // trace panels to keep open across refreshes
 let gTextContent = '';          // guidance textarea content — survives refreshes
 let gTextFocused = false;       // whether the operator is actively typing
 let gTextCaret = 0;             // caret position to restore after re-render
-async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
-function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+
+// HTML-escape INCLUDING quotes. `textContent → innerHTML` only escapes & < >,
+// which is not enough for values interpolated into attributes or inline
+// handlers — and challenge names come from CTFd, i.e. from the CTF organisers
+// (or, on a public instance, from anyone who can create a challenge).
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"'`/]/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+    "'": '&#39;', '`': '&#96;', '/': '&#47;'
+  })[c]);
+}
+// Escape for a value interpolated into a single-quoted JS string that itself
+// sits inside a double-quoted HTML attribute: onclick="f('__JSQ__')".
+function jsq(s) {
+  return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+    .replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function withToken(path) {
+  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
+async function api(path, opts) {
+  const o = Object.assign({}, opts, {
+    headers: Object.assign({ 'Authorization': 'Bearer ' + TOKEN }, (opts || {}).headers || {})
+  });
+  const r = await fetch(withToken(path), o);
+  if (r.status === 401) { toast('未授权：token 无效'); throw new Error('unauthorized'); }
+  return r.json();
+}
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 2200); }
 function fmtAgo(ts) {
   if (!ts) return '—';
@@ -137,7 +180,7 @@ function renderList() {
     const dots = Object.entries(s.agents || {}).map(([sp, a]) =>
       `<span class="${s.winner ? (s.winner_spec === sp ? 'd-win' : 'd-dead') : 'd-run'}" title="${esc(sp)}"></span>`).join('');
     const dimStyle = pending ? 'opacity:.55' : (solved ? 'opacity:.8' : '');
-    html += `<div class="card ${SEL === name ? 'sel' : ''}" style="${dimStyle}" onclick="sel('${esc(name)}')">
+    html += `<div class="card ${SEL === name ? 'sel' : ''}" style="${dimStyle}" onclick="sel('${jsq(name)}')">
       ${badge}
       <div class="name">${esc(name)}</div>
       <div class="meta">${esc(s.category)} · ${s.value}分 · bump ${s.bumps || 0}${cost ? ' · $' + cost.toFixed(3) : ''}</div>
@@ -165,17 +208,25 @@ async function renderDetail() {
       <span class="kv">状态 <b>${statusTxt}</b></span>
     </div>
     <div style="margin-top:8px">
-      <a href="/api/export?name=${encodeURIComponent(SEL)}&fmt=md" download><button>📥 导出 Markdown 报告</button></a>
-      <a href="/api/export?name=${encodeURIComponent(SEL)}&fmt=json" download><button class="ghost">JSON</button></a>
+      <a href="${esc(withToken('/api/export?name=' + encodeURIComponent(SEL) + '&fmt=md'))}" download><button>📥 导出 Markdown 报告</button></a>
+      <a href="${esc(withToken('/api/export?name=' + encodeURIComponent(SEL) + '&fmt=json'))}" download><button class="ghost">JSON</button></a>
+      <button class="purp" onclick="spawnSwarm()">🚀 重新 spawn 这题</button>
       <span class="muted">（含各模型的踩坑点 / 尝试过程 / 共享黑板 / 死路账本，可写 writeup）</span>
     </div>`;
   if (s.winner) html += `<div class="flagbox">🚩 ${esc(s.winner)}<span class="muted" style="font-weight:400">　by ${esc(s.winner_spec || '')}</span></div>`;
+  if (s.retire_reason)
+    html += `<div class="ledger" style="margin-top:8px">⏹ swarm 自行退役：<b>${esc(s.retire_reason)}</b></div>`;
+  if (s.infra_failures)
+    html += `<div class="ledger" style="margin-top:4px">⚠ 连续基础设施失败 ${esc(s.infra_failures)} 次（网关/网络问题，不是解题方向问题）</div>`;
   if (s.failed_approaches && s.failed_approaches.length)
     html += `<div class="ledger" style="margin-top:8px">🚫 已排除方向：${esc(s.failed_approaches.join('、'))}</div>`;
   html += `</div>`;
 
   if (s.pending) {
-    html += `<div class="panel muted">这道题还没 spawn swarm。等协调器排上它，或点下方手动 spawn。</div>`;
+    // The panel always promised a "手动 spawn" button that did not exist — the
+    // /api/spawn endpoint was wired up on the server and never called from here.
+    html += `<div class="panel muted">这道题还没 spawn swarm。等协调器排上它，或：
+      <div style="margin-top:8px"><button onclick="spawnSwarm()">🚀 手动 spawn 这题</button></div></div>`;
     el.innerHTML = html;
     return;
   }
@@ -188,11 +239,15 @@ async function renderDetail() {
 
   // per-solver table
   html += `<div class="panel"><table class="solvers"><thead><tr>
-    <th>模型</th><th>状态</th><th>💭 当前思路</th><th>最近动作</th><th>攻坚方向</th><th>步数</th><th>成本</th><th>静默</th><th></th>
+    <th>模型</th><th>状态</th><th>💭 当前思路</th><th>最近动作</th><th>攻坚方向</th><th>工具调用</th><th>步数</th><th>成本</th><th>静默</th><th></th>
   </tr></thead><tbody>`;
   for (const [spec, a] of Object.entries(s.agents)) {
     const win = s.winner_spec === spec;
-    const stuckTag = (a.quiet_s && a.quiet_s > 240) ? '<span class="tag t-stuck">卡死?</span>'
+    // A running solver with zero tool calls is the signature of a dead endpoint
+    // or broken tool wiring — the failure mode that used to be invisible.
+    const noWork = a.status === 'running' && !a.tool_calls;
+    const stuckTag = noWork ? '<span class="tag t-stuck">空转</span>'
+      : (a.quiet_s && a.quiet_s > 240) ? '<span class="tag t-stuck">卡死?</span>'
       : (a.status === 'running' ? '<span class="tag t-run">运行</span>' : '<span class="tag t-idle">—</span>');
     const short = spec.replace('claude-sdk/', '');
     html += `<tr>
@@ -201,12 +256,13 @@ async function renderDetail() {
       <td class="thinking">${esc((a.thinking || '').slice(0, 140)) || '<span class="muted">—</span>'}</td>
       <td class="last mono">${esc((a.last || '').slice(0, 90)) || '—'}</td>
       <td class="approach">${esc(a.approach ? a.approach.split('/').pop() : '—')}</td>
+      <td${noWork ? ' style="color:var(--red);font-weight:600"' : ''}>${a.tool_calls || 0}</td>
       <td>${a.steps || 0}</td>
       <td>$${(a.cost_usd || 0).toFixed(3)}</td>
       <td class="muted">${a.quiet_s != null ? fmtAgo(a.last_ts) : '—'}</td>
       <td><button class="ghost" onclick="event.stopPropagation();showTrace(this.dataset.spec)" data-spec="${esc(spec)}">轨迹</button>
           <button class="purp" onclick="event.stopPropagation();prepAdvise(this.dataset.spec)" data-spec="${esc(spec)}">提示</button></td>
-    </tr><tr style="display:none" id="tracerow-${esc(spec)}"><td colspan="9"><div class="trace" id="trace-${esc(spec)}"></div></td></tr>`;
+    </tr><tr style="display:none" id="tracerow-${esc(spec)}"><td colspan="10"><div class="trace" id="trace-${esc(spec)}"></div></td></tr>`;
   }
   html += `</tbody></table></div>`;
 
@@ -224,7 +280,7 @@ async function renderDetail() {
       html += `<div style="margin:8px 0;padding:8px 10px;background:#fef2f2;border-radius:6px;font-size:12.5px">
         <div class="muted" style="font-size:11px">${ts} · <b>${esc(mdl)}</b> 求助：</div>
         <div style="margin-top:3px;white-space:pre-wrap">${esc(h.question)}</div>
-        <button class="purp" style="margin-top:6px;font-size:11px" onclick="replyHelp('${esc(mdl)}', this)">回复它 →</button>
+        <button class="purp" style="margin-top:6px;font-size:11px" onclick="replyHelp('${jsq(mdl)}', this)">回复它 →</button>
       </div>`;
     }
   }
@@ -337,6 +393,20 @@ async function sendBroadcast() {
   document.getElementById('gText').value = '';
   gTextContent = '';
   toast('📢 已广播给本题所有 solver');
+}
+
+async function spawnSwarm() {
+  if (!SEL) { toast('先在左侧选一题'); return; }
+  toast('🚀 正在为 ' + SEL + ' 拉起 swarm…');
+  try {
+    const d = await api('/api/spawn', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challenge: SEL }) });
+    toast(d && d.result ? String(d.result).slice(0, 160) : '已提交');
+  } catch (e) {
+    toast('spawn 失败：' + e);
+    return;
+  }
+  setTimeout(refresh, 800);
 }
 
 refresh();

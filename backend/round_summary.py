@@ -7,11 +7,17 @@ carried-forward state stays tiny forever instead of exploding context.
 
 This replaces "continue the same bloated session with a bump" with
 "restart a clean session carrying only the distilled state".
+
+Every gateway call here is accounted for through CostTracker: these are real
+billed requests, and an earlier revision issued them without recording a cent,
+so the totals the operator saw silently excluded them.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -38,11 +44,35 @@ _META_PROMPT = (
 )
 
 
-async def _call_gateway(prompt: str, settings: object, model: str, timeout_s: float = 25.0) -> str:
+@dataclass(frozen=True)
+class SummaryResult:
+    """Outcome of a summarization attempt.
+
+    `condensed` distinguishes "the LLM actually condensed this" from "we handed
+    the input back unchanged". Callers MUST check it: treating a fallback join
+    as a successful condensation is what made the journal grow without bound
+    whenever the gateway was unavailable.
+    """
+
+    text: str
+    condensed: bool
+    model: str = ""
+
+
+async def _call_gateway(
+    prompt: str,
+    settings: object,
+    model: str,
+    timeout_s: float = 25.0,
+    cost_tracker: object | None = None,
+    agent_name: str = "",
+) -> str:
+    """One OpenAI-compatible chat completion. Returns "" on any failure."""
     base_url = getattr(settings, "gateway_base_url", "") or ""
     api_key = getattr(settings, "gateway_api_key", "") or ""
     if not base_url or not api_key:
         return ""
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(
@@ -53,17 +83,42 @@ async def _call_gateway(prompt: str, settings: object, model: str, timeout_s: fl
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             resp.raise_for_status()
-            return (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-    except Exception as e:
-        logger.debug(f"round_summary gateway call failed: {e}")
+            data = resp.json()
+            _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
+            return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    or "").strip()
+    except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
+        logger.debug("round_summary gateway call failed: %s", e)
         return ""
+
+
+def _record(cost_tracker, agent_name: str, model: str, data: dict, seconds: float) -> None:
+    """Fold a gateway completion into the shared cost tracker."""
+    if cost_tracker is None:
+        return
+    try:
+        usage = data.get("usage") or {}
+        cost_tracker.record_tokens(
+            agent_name or "summarizer", model,
+            input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            output_tokens=int(usage.get("completion_tokens", 0) or 0),
+            provider_spec="gateway",
+            duration_seconds=seconds,
+        )
+    except Exception as e:  # noqa: BLE001 — accounting must never break solving
+        logger.debug("cost accounting for summarizer failed: %s", e)
 
 
 def _model(settings: object) -> str:
     return getattr(settings, "summarizer_model", "") or DEFAULT_SUMMARIZER_MODEL
 
 
-async def summarize_round(finding_text: str, settings: object) -> str:
+async def summarize_round(
+    finding_text: str,
+    settings: object,
+    cost_tracker: object | None = None,
+    agent_name: str = "",
+) -> str:
     """Distill one round's output into a compact journal entry.
 
     On any failure returns the (trimmed) original so nothing is lost.
@@ -73,17 +128,35 @@ async def summarize_round(finding_text: str, settings: object) -> str:
         return ""
     if len(text) < 700:
         return text  # short enough already
-    out = await _call_gateway(_ROUND_PROMPT.format(text=text[:18000]), settings, _model(settings))
+    out = await _call_gateway(
+        _ROUND_PROMPT.format(text=text[:18000]), settings, _model(settings),
+        cost_tracker=cost_tracker, agent_name=agent_name,
+    )
     return out or text
 
 
-async def meta_summarize(journal: list[str], settings: object) -> str:
-    """Condense + dedup N journal entries into a tight collective state."""
+async def meta_summarize(
+    journal: list[str],
+    settings: object,
+    cost_tracker: object | None = None,
+    agent_name: str = "",
+) -> SummaryResult:
+    """Condense + dedup N journal entries into a tight collective state.
+
+    Returns `condensed=False` when the LLM was unavailable, so the caller keeps
+    its bounded list of entries instead of replacing them with one ever-growing
+    joined string.
+    """
     entries = [j.strip() for j in journal if j and j.strip()]
     if not entries:
-        return ""
+        return SummaryResult(text="", condensed=False)
     if len(entries) == 1:
-        return entries[0]
+        return SummaryResult(text=entries[0], condensed=True)
     joined = "\n---\n".join(f"[第{i+1}轮]\n{e}" for i, e in enumerate(entries))
-    out = await _call_gateway(_META_PROMPT.format(text=joined[:20000]), settings, _model(settings))
-    return out or "\n---\n".join(entries)
+    out = await _call_gateway(
+        _META_PROMPT.format(text=joined[:20000]), settings, _model(settings),
+        cost_tracker=cost_tracker, agent_name=agent_name,
+    )
+    if out:
+        return SummaryResult(text=out, condensed=True, model=_model(settings))
+    return SummaryResult(text=joined, condensed=False)

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36"
+# Distfiles are streamed to disk in chunks: a memory dump or disk image can be
+# hundreds of MB, and buffering it whole (`resp.content`) spikes the agent's RSS.
+DOWNLOAD_CHUNK = 1 << 20
 
 
 @dataclass
@@ -32,9 +38,12 @@ class CTFdClient:
     _csrf_token: str = ""
     _logged_in: bool = False
     _challenge_ids: dict[str, int] = field(default_factory=dict)
+    # The poller and every solver's submit path share one client; without a lock
+    # they raced through duplicate logins and duplicate client construction.
+    _auth_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is None:
+        if self._client is None or self._client.is_closed:
             # verify=False: CTFd instances often use self-signed certs or HTTP.
             # This is a CTF tool, not production infrastructure.
             self._client = httpx.AsyncClient(
@@ -49,31 +58,36 @@ class CTFdClient:
     async def _ensure_logged_in(self) -> None:
         if self._logged_in or self.token:
             return
-        client = await self._ensure_client()
+        async with self._auth_lock:
+            if self._logged_in:  # another coroutine won the race
+                return
+            client = await self._ensure_client()
 
-        # GET login page for nonce
-        resp = await client.get("/login")
-        m = re.search(r'id="nonce"[^>]*value="([^"]+)"', resp.text)
-        if not m:
-            m = re.search(r'name="nonce"[^>]*value="([^"]+)"', resp.text)
-        if not m:
-            raise RuntimeError("Could not find nonce on CTFd login page")
-        nonce = m.group(1)
+            # GET login page for nonce
+            resp = await client.get("/login")
+            m = re.search(r'id="nonce"[^>]*value="([^"]+)"', resp.text)
+            if not m:
+                m = re.search(r'name="nonce"[^>]*value="([^"]+)"', resp.text)
+            if not m:
+                raise RuntimeError("Could not find nonce on CTFd login page")
+            nonce = m.group(1)
 
-        # POST credentials
-        resp = await client.post(
-            "/login",
-            data={
-                "name": self.username,
-                "password": self.password,
-                "_submit": "Submit",
-                "nonce": nonce,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code == 200:
-            raise RuntimeError("CTFd login failed — bad credentials")
-        self._logged_in = True
+            # POST credentials
+            resp = await client.post(
+                "/login",
+                data={
+                    "name": self.username,
+                    "password": self.password,
+                    "_submit": "Submit",
+                    "nonce": nonce,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            # CTFd answers a successful form login with a redirect; a 200 means
+            # it re-rendered the page with an error.
+            if resp.status_code == 200:
+                raise RuntimeError("CTFd login failed — bad credentials")
+            self._logged_in = True
 
     async def _get_csrf(self) -> str:
         if self._csrf_token:
@@ -192,14 +206,12 @@ class CTFdClient:
             logger.warning("Could not fetch solved challenges", exc_info=True)
             return set()
 
-    async def pull_challenge(self, challenge: dict[str, Any], output_dir: str) -> str:
+    async def pull_challenge(self, challenge: dict[str, Any], output_dir: str,
+                             force: bool = False) -> str:
         """Download a challenge's distfiles and write metadata.yml.
 
         Returns the challenge directory path.
         """
-        from pathlib import Path
-        from urllib.parse import urlparse
-
         import yaml
 
         name = challenge.get("name", f"challenge-{challenge['id']}")
@@ -214,26 +226,26 @@ class CTFdClient:
         # Download distfiles using the logged-in session
         await self._ensure_logged_in()
         client = await self._ensure_client()
+        server_host = urlparse(self.base_url).hostname
         for raw_url in challenge.get("files") or []:
             dist_dir = ch_dir / "distfiles"
             dist_dir.mkdir(exist_ok=True)
-            url = raw_url if raw_url.startswith("http") else f"{self.base_url.rstrip('/')}/{raw_url.lstrip('/')}"
-            url_path = urlparse(url).path
-            fname = url_path.rstrip("/").rsplit("/", 1)[-1] or "file"
+            url = (raw_url if raw_url.startswith("http")
+                   else f"{self.base_url.rstrip('/')}/{raw_url.lstrip('/')}")
+            fname = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1] or "file"
             dest = dist_dir / fname
-            if not dest.exists():
-                try:
-                    # Only send auth headers to our CTFd server
-                    headers = self._base_headers() if urlparse(url).hostname == urlparse(self.base_url).hostname else {}
-                    resp = await client.get(
-                        url, headers=headers,
-                        follow_redirects=True, timeout=60.0,
-                    )
-                    resp.raise_for_status()
-                    dest.write_bytes(resp.content)
-                    logger.info(f"Downloaded: {fname} ({len(resp.content)} bytes)")
-                except Exception as e:
-                    logger.warning(f"Failed to download {url}: {e}")
+            # CTFd file URLs are content-addressed, so an existing file with the
+            # same name is already the right bytes — unless force is set.
+            if dest.exists() and not force:
+                continue
+            try:
+                # Only send auth headers to our own CTFd server
+                headers = self._base_headers() if urlparse(url).hostname == server_host else {}
+                total = await self._download_stream(client, url, dest, headers)
+                logger.info("Downloaded: %s (%d bytes)", fname, total)
+            except Exception as e:  # noqa: BLE001 — keep the other files going
+                logger.warning("Failed to download %s: %s", url, e)
+                dest.unlink(missing_ok=True)  # never leave a truncated distfile
 
         # Write metadata.yml
         from markdownify import markdownify as html2md
@@ -241,8 +253,8 @@ class CTFdClient:
         desc = challenge.get("description") or ""
         try:
             desc = html2md(desc, heading_style="atx", escape_asterisks=False)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — fall back to the raw description
+            logger.debug("markdownify failed for %s: %s", name, e)
 
         tags = [t["value"] if isinstance(t, dict) else str(t) for t in (challenge.get("tags") or [])]
         meta = {
@@ -265,11 +277,32 @@ class CTFdClient:
             meta["hints"] = hints
 
         (ch_dir / "metadata.yml").write_text(
-            yaml.dump(meta, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            yaml.dump(meta, allow_unicode=True, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
         )
 
         return str(ch_dir)
 
+    @staticmethod
+    async def _download_stream(client: httpx.AsyncClient, url: str, dest: Path,
+                               headers: dict[str, str]) -> int:
+        """Stream a URL to disk. Returns the number of bytes written."""
+        total = 0
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            async with client.stream("GET", url, headers=headers,
+                                     follow_redirects=True, timeout=120.0) as resp:
+                resp.raise_for_status()
+                with tmp.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes(DOWNLOAD_CHUNK):
+                        fh.write(chunk)
+                        total += len(chunk)
+            tmp.replace(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return total
+
     async def close(self) -> None:
-        if self._client:
+        if self._client and not self._client.is_closed:
             await self._client.aclose()
+        self._client = None

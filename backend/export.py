@@ -9,8 +9,21 @@ writeup-friendly).
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def _as_int(value: Any) -> int:
+    """Normalise a solver step/tool counter (list on one backend, int on the other)."""
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if value else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def collect_challenge_data(
@@ -23,13 +36,16 @@ def collect_challenge_data(
     if swarm is not None:
         meta = swarm.meta
         agents = {}
-        for spec in swarm.model_specs:
+        # _all_specs includes escalation solvers, which model_specs does not.
+        specs = list(getattr(swarm, "_all_specs", None) or swarm.model_specs)
+        for spec in dict.fromkeys([*specs, *swarm.solvers]):
             solver = swarm.solvers.get(spec)
             tracer = getattr(solver, "tracer", None)
             path = getattr(tracer, "path", None)
             agents[spec] = {
                 "status": "running" if solver else "not started",
-                "steps": getattr(solver, "_step_count", 0) if solver else 0,
+                "steps": _as_int(getattr(solver, "_step_count", 0)) if solver else 0,
+                "tool_calls": _as_int(getattr(solver, "_tool_calls", 0)) if solver else 0,
                 "findings": swarm.findings.get(spec, ""),
                 "thinking": "",
                 "trace_path": path,
@@ -38,24 +54,26 @@ def collect_challenge_data(
                 try:
                     from backend.trace_read import last_model_text
                     agents[spec]["thinking"] = last_model_text(path)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 — the report must still render
+                    logger.debug("could not read thinking for %s: %s", spec, e)
         feed = []
         bus = getattr(swarm, "message_bus", None)
         if bus is not None:
             for f in bus.findings:
-                feed.append({"model": f.model, "kind": f.kind, "content": f.content, "ts": f.timestamp})
+                feed.append({"model": f.model, "kind": f.kind, "content": f.content,
+                             "summary": f.summary, "ts": f.timestamp})
         return {
             "name": name,
             "category": getattr(meta, "category", ""),
             "value": getattr(meta, "value", 0),
             "description": getattr(meta, "description", ""),
             "tags": getattr(meta, "tags", []),
-            "solved": bool(swarm.winner),
-            "winner": swarm.winner.flag if swarm.winner else None,
+            "solved": bool(swarm.winner and swarm.winner.flag),
+            "winner": swarm.winner.flag if (swarm.winner and swarm.winner.flag) else None,
             "winner_spec": swarm.winner_spec,
             "bumps": getattr(swarm, "_total_bumps", 0),
             "failed_approaches": list(getattr(swarm, "_failed_approaches", [])),
+            "retire_reason": getattr(swarm, "retire_reason", ""),
             "agents": agents,
             "shared_feed": feed,
             "archived": False,
@@ -74,6 +92,7 @@ def collect_challenge_data(
         "winner_spec": archived.get("winner_spec", ""),
         "bumps": archived.get("bumps", 0),
         "failed_approaches": archived.get("failed_approaches", []),
+        "retire_reason": archived.get("retire_reason", ""),
         "agents": archived.get("agents", {}),
         "shared_feed": archived.get("shared_feed", []),
         "archived": True,
@@ -101,6 +120,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     if report.get("winner"):
         add(f"- **Flag**: `{report['winner']}`")
     add(f"- **bump 次数**: {report.get('bumps', 0)}　**导出于**: {report.get('exported_at_human', '')}")
+    if report.get("retire_reason"):
+        add(f"- **swarm 退役原因**: `{report['retire_reason']}`")
     add("")
 
     desc = (report.get("description") or "").strip()
@@ -134,7 +155,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         add("")
         for spec, a in agents.items():
             add(f"### {spec}")
-            add(f"- 状态: {a.get('status', '?')}　步数: {a.get('steps', 0)}")
+            add(f"- 状态: {a.get('status', '?')}　步数: {a.get('steps', 0)}"
+                f"　工具调用: {a.get('tool_calls', 0)}")
             th = (a.get("thinking") or "").strip()
             if th:
                 add(f"- 最后思路: {th}")

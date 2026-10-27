@@ -48,16 +48,22 @@ class ChallengeMessageBus:
     cursors: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _advice: dict[str, list[str]] = field(default_factory=dict)
+    max_findings: int = MAX_FINDINGS
+    max_advice_per_model: int = 10
 
     async def post(self, model: str, content: str, kind: str = KIND_FACT, summary: str = "") -> None:
         """Post a finding from a solver. `summary` (optional) is the LLM
         key-info extraction used when injecting into siblings."""
         async with self._lock:
             self.findings.append(Finding(model=model, content=content, kind=kind, summary=summary))
-            if len(self.findings) > MAX_FINDINGS:
-                trim = len(self.findings) - MAX_FINDINGS
+            if len(self.findings) > self.max_findings:
+                trim = len(self.findings) - self.max_findings
                 self.findings = self.findings[trim:]
                 self.cursors = {k: max(0, v - trim) for k, v in self.cursors.items()}
+                # Cursors for models that have not polled in a while are now
+                # stale; drop them so they re-read from the start of the list
+                # rather than holding a reference into trimmed history.
+                self.cursors = {k: v for k, v in self.cursors.items() if v >= 0}
 
     async def check(self, model: str) -> list[Finding]:
         """Get unread findings from other models. Advances the cursor."""
@@ -77,11 +83,15 @@ class ChallengeMessageBus:
 
     async def post_advice(self, model: str, content: str) -> None:
         """Drop guidance addressed to ONE running solver (mid-run pickup)."""
+        content = (content or "").strip()
+        if not content:
+            return
         async with self._lock:
-            self._advice.setdefault(model, []).append(content)
+            queue = self._advice.setdefault(model, [])
+            queue.append(content)
             # keep bounded
-            if len(self._advice[model]) > 10:
-                self._advice[model] = self._advice[model][-10:]
+            if len(queue) > self.max_advice_per_model:
+                self._advice[model] = queue[-self.max_advice_per_model:]
 
     async def check_advice(self, model: str) -> list[str]:
         """Drain pending advice for a solver (each item delivered once)."""
@@ -108,6 +118,10 @@ class ChallengeMessageBus:
         excluded = [f for f in findings if f.kind == KIND_EXCLUDED]
         facts = [f for f in findings if f.kind == KIND_FACT]
         broadcasts = [f for f in findings if f.kind == KIND_BROADCAST]
+        # Help requests used to be consumed by the cursor and then dropped by
+        # every branch below — silently discarding the fact that a peer is
+        # blocked. They are a real coordination signal, so surface them.
+        helps = [f for f in findings if f.kind == KIND_HELP]
 
         parts: list[str] = ["**Findings from other agents:**"]
         if broadcasts:
@@ -119,4 +133,12 @@ class ChallengeMessageBus:
         if facts:
             parts.append("\nConfirmed facts:")
             parts.extend(render(f) for f in facts)
+        if helps:
+            parts.append("\nTeammates currently blocked on a knowledge gap "
+                         "(a human may answer soon — don't duplicate their work):")
+            parts.extend(render(f) for f in helps)
         return "\n".join(parts)
+
+    def help_requests(self, limit: int = 50) -> list[Finding]:
+        """Outstanding human-help requests, newest last (for the dashboard)."""
+        return [f for f in self.findings if f.kind == KIND_HELP][-limit:]

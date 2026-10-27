@@ -23,12 +23,10 @@ import io
 import re
 import sys
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
-import yaml
-
 import aiohttp
+import yaml
 from bs4 import BeautifulSoup
 from markdownify import markdownify as html2md
 
@@ -92,7 +90,7 @@ async def verify_token(base_url: str, token: str) -> bool:
 # API helpers
 # ---------------------------------------------------------------------------
 
-async def api_get(session: aiohttp.ClientSession, url: str, extra_headers: Optional[dict] = None) -> Optional[dict]:
+async def api_get(session: aiohttp.ClientSession, url: str, extra_headers: dict | None = None) -> dict | None:
     headers = {"User-Agent": USER_AGENT}
     if extra_headers:
         headers.update(extra_headers)
@@ -105,7 +103,7 @@ async def api_get(session: aiohttp.ClientSession, url: str, extra_headers: Optio
         return data
 
 
-async def fetch_bytes(session: aiohttp.ClientSession, url: str, extra_headers: Optional[dict] = None) -> Optional[io.BytesIO]:
+async def fetch_bytes(session: aiohttp.ClientSession, url: str, extra_headers: dict | None = None) -> io.BytesIO | None:
     headers = {"User-Agent": USER_AGENT}
     if extra_headers:
         headers.update(extra_headers)
@@ -119,7 +117,7 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str, extra_headers: O
 # HTML / text helpers (mirrors Eruditus utils/formatting.py and utils/html.py)
 # ---------------------------------------------------------------------------
 
-def html_to_markdown(html: Optional[str]) -> str:
+def html_to_markdown(html: str | None) -> str:
     if not html:
         return ""
     md = html2md(html, heading_style="atx", escape_asterisks=False, escape_underscores=False)
@@ -154,7 +152,7 @@ def make_absolute(url: str, base_url: str) -> str:
 # Challenge pulling
 # ---------------------------------------------------------------------------
 
-async def get_csrf_nonce(session: aiohttp.ClientSession, base_url: str, extra_headers: Optional[dict]) -> Optional[str]:
+async def get_csrf_nonce(session: aiohttp.ClientSession, base_url: str, extra_headers: dict | None) -> str | None:
     """Fetch CSRF nonce from the challenges page. Not needed for token auth."""
     if extra_headers and "Authorization" in extra_headers:
         return None
@@ -167,7 +165,7 @@ async def fetch_hints(
     session: aiohttp.ClientSession,
     base_url: str,
     hints: list[dict],
-    extra_headers: Optional[dict] = None,
+    extra_headers: dict | None = None,
 ) -> list[dict]:
     """Fetch full hint content for all hints, unlocking free (cost <= 0) ones via
     POST /api/v1/unlocks then GET /api/v1/hints/{id}."""
@@ -220,7 +218,7 @@ async def fetch_hints(
     return result
 
 
-async def pull_challenges(session: aiohttp.ClientSession, base_url: str, extra_headers: Optional[dict] = None):
+async def pull_challenges(session: aiohttp.ClientSession, base_url: str, extra_headers: dict | None = None):
     """Yield full challenge dicts from the CTFd API."""
     data = await api_get(session, f"{base_url}/api/v1/challenges", extra_headers)
     if data is None:
@@ -280,7 +278,7 @@ async def save_challenge(
     base_url: str,
     challenge: dict,
     output_dir: Path,
-    extra_headers: Optional[dict] = None,
+    extra_headers: dict | None = None,
 ):
     slug = slugify(challenge.get("name", f"challenge-{challenge['id']}"))
     chdir = output_dir / slug
@@ -315,12 +313,12 @@ async def save_challenge(
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main(url: str, output: str, username: Optional[str], password: Optional[str], token: Optional[str]):
+async def main(url: str, output: str, username: str | None, password: str | None, token: str | None):
     base_url = url.rstrip("/")
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    extra_headers: Optional[dict] = None
+    extra_headers: dict | None = None
 
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:

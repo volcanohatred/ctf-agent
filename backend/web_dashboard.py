@@ -3,13 +3,22 @@
 Runs an aiohttp server alongside the coordinator event loop. Lets the operator
 see, per challenge and per solver: current status, last activity, findings —
 and inject guidance (advise / bump / broadcast) without leaving the browser.
+
+Security model: every route requires a bearer token. The dashboard can inject
+arbitrary instructions into solvers (which execute arbitrary code inside
+privileged sandboxes), spawn new containers, and export confirmed flags — so an
+unauthenticated listener on 0.0.0.0 was effectively a remote code-execution and
+flag-disclosure endpoint for anything that could reach the host, including the
+solver sandboxes themselves via host.docker.internal.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -20,8 +29,39 @@ from backend.trace_read import last_model_text, trace_activity
 
 logger = logging.getLogger(__name__)
 
+# Trace tails are re-read on every dashboard poll (default 2.5s) for every
+# solver. Caching by (path, size) keeps that off the event loop's critical path
+# without ever showing stale data: the size changes as soon as a line is appended.
+_TAIL_CACHE: dict[str, tuple[int, float, Any]] = {}
+TAIL_CACHE_TTL_S = 1.0
+STATE_FEED_LIMIT = 30
 
-def _tail_events(trace_path: str, n: int = 40) -> list[dict]:
+
+def _cache_get(key: str, size: int) -> Any | None:
+    hit = _TAIL_CACHE.get(key)
+    if not hit:
+        return None
+    cached_size, cached_at, value = hit
+    if cached_size != size or (time.monotonic() - cached_at) > TAIL_CACHE_TTL_S:
+        return None
+    return value
+
+
+def _cache_put(key: str, size: int, value: Any) -> None:
+    # Bound the cache: one entry per live solver, plus a little slack.
+    if len(_TAIL_CACHE) > 512:
+        _TAIL_CACHE.clear()
+    _TAIL_CACHE[key] = (size, time.monotonic(), value)
+
+
+def _file_size(path: str) -> int:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return -1
+
+
+def _tail_events_sync(trace_path: str, n: int = 40) -> list[dict]:
     """Parse the last N events of a solver trace into compact dicts."""
     try:
         with open(trace_path, "rb") as f:
@@ -29,39 +69,117 @@ def _tail_events(trace_path: str, n: int = 40) -> list[dict]:
             size = f.tell()
             f.seek(max(0, size - 65536))
             tail = f.read().decode("utf-8", errors="replace")
-        out = []
-        for line in tail.strip().splitlines():
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            t = ev.get("type", "?")
-            rec: dict[str, Any] = {"ts": ev.get("ts", 0), "type": t}
-            if t == "tool_call":
-                args = ev.get("args", {})
-                rec["tool"] = ev.get("tool", "?")
-                rec["args"] = (args.get("command") or json.dumps(args))[:400] if isinstance(args, dict) else str(args)[:400]
-            elif t == "tool_result":
-                rec["tool"] = ev.get("tool", "?")
-                rec["result"] = str(ev.get("result", ""))[:400]
-            elif t in ("bump", "error", "finish", "flag_confirmed", "model_response", "advice_picked", "session_reset", "start"):
-                rec.update({k: str(v)[:300] for k, v in ev.items() if k not in ("ts", "type")})
-            else:
-                continue
-            out.append(rec)
-        return out[-n:]
-    except Exception:
+    except OSError:
         return []
+    out = []
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = ev.get("type", "?")
+        rec: dict[str, Any] = {"ts": ev.get("ts", 0), "type": t}
+        if t == "tool_call":
+            args = ev.get("args", {})
+            rec["tool"] = ev.get("tool", "?")
+            rec["args"] = ((args.get("command") or json.dumps(args))[:400]
+                           if isinstance(args, dict) else str(args)[:400])
+        elif t == "tool_result":
+            rec["tool"] = ev.get("tool", "?")
+            rec["result"] = str(ev.get("result", ""))[:400]
+        elif t in ("bump", "error", "finish", "flag_confirmed", "flag_rejected",
+                   "model_response", "advice_picked", "session_reset",
+                   "session_forgotten", "start", "budget_interrupt",
+                   "conclude_ok", "conclude_failed", "still_working",
+                   "structured_flag_verified", "loop_break"):
+            rec.update({k: str(v)[:300] for k, v in ev.items() if k not in ("ts", "type")})
+        else:
+            continue
+        out.append(rec)
+    return out[-n:]
+
+
+async def _tail_events(trace_path: str, n: int = 40) -> list[dict]:
+    """Cached, off-loop variant of `_tail_events_sync`."""
+    size = await asyncio.to_thread(_file_size, trace_path)
+    if size < 0:
+        return []
+    key = f"{trace_path}#{n}"
+    cached = _cache_get(key, size)
+    if cached is not None:
+        return cached
+    events = await asyncio.to_thread(_tail_events_sync, trace_path, n)
+    _cache_put(key, size, events)
+    return events
+
+
+async def _trace_activity_cached(trace_path: str) -> tuple[float, list[str]]:
+    size = await asyncio.to_thread(_file_size, trace_path)
+    if size < 0:
+        return 0.0, []
+    key = f"{trace_path}#act"
+    cached = _cache_get(key, size)
+    if cached is not None:
+        return cached
+    value = await asyncio.to_thread(trace_activity, trace_path)
+    _cache_put(key, size, value)
+    return value
+
+
+async def _last_text_cached(trace_path: str) -> str:
+    size = await asyncio.to_thread(_file_size, trace_path)
+    if size < 0:
+        return ""
+    key = f"{trace_path}#txt"
+    cached = _cache_get(key, size)
+    if cached is not None:
+        return cached
+    value = await asyncio.to_thread(last_model_text, trace_path)
+    _cache_put(key, size, value)
+    return value
+
+
+def _as_int(value: Any) -> int:
+    """Normalise a solver step counter.
+
+    The Pydantic backend keeps `_step_count` as a one-element list (a mutable
+    reference shared with its toolset) while the Claude backend uses a plain
+    int, so the JSON field used to be an array for half the lineup.
+    """
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if value else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clip(text: Any, limit: int) -> str:
+    s = str(text or "")
+    if limit > 0 and len(s) > limit:
+        return s[:limit] + f"\n… [truncated for the live view — {len(s)} chars total; " \
+                           "use the export endpoint for the full text]"
+    return s
 
 
 class DashboardServer:
     """aiohttp server bound to the coordinator's shared deps."""
 
-    def __init__(self, deps: Any, host: str = "0.0.0.0", port: int = 8080) -> None:
+    def __init__(self, deps: Any, host: str = "127.0.0.1", port: int = 8080,
+                 token: str = "") -> None:
         self.deps = deps
         self.host = host
         self.port = port
         self._runner: web.AppRunner | None = None
+        # Never run silently unauthenticated: with no configured token, mint one
+        # and print it so the operator can still reach the UI.
+        self.token = token or secrets.token_urlsafe(24)
+        self._generated_token = not token
+        self.feed_chars = int(getattr(getattr(deps, "settings", None),
+                                      "dashboard_feed_chars", 4000) or 4000)
 
     async def start(self) -> None:
         app = web.Application()
@@ -74,125 +192,173 @@ class DashboardServer:
             web.post("/api/bump", self._bump),
             web.post("/api/broadcast", self._broadcast),
             web.post("/api/spawn", self._spawn),
+            web.get("/healthz", self._healthz),
         ])
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
-        logger.info(f"Dashboard listening on http://{self.host}:{self.port}")
+        logger.info("Dashboard listening on http://%s:%d (token required)", self.host, self.port)
+        if self._generated_token:
+            # Printed once, at INFO, because without it the UI is unreachable.
+            logger.info("Dashboard access token (no DASHBOARD_TOKEN was set): %s", self.token)
+            logger.info("  → open http://%s:%d/?token=%s", self.host, self.port, self.token)
+        if self.host not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(
+                "Dashboard is bound to %s. It can inject instructions into solvers "
+                "and export flags — put a reverse proxy with auth in front of it.",
+                self.host,
+            )
 
     async def stop(self) -> None:
         if self._runner:
             await self._runner.cleanup()
+            self._runner = None
+
+    # ------------------------------------------------------------- auth ----
+
+    def _authorized(self, req: web.Request) -> bool:
+        supplied = ""
+        header = req.headers.get("Authorization", "")
+        if header.lower().startswith("bearer "):
+            supplied = header[7:].strip()
+        if not supplied:
+            supplied = req.query.get("token", "")
+        return bool(supplied) and hmac.compare_digest(supplied, self.token)
+
+    def _unauthorized(self) -> web.Response:
+        return web.json_response(
+            {"error": "unauthorized",
+             "hint": "pass ?token=<DASHBOARD_TOKEN> or an Authorization: Bearer header"},
+            status=401,
+        )
 
     # ----------------------------------------------------------- handlers ----
 
-    async def _index(self, _req: web.Request) -> web.Response:
-        from backend.dashboard_ui import DASHBOARD_HTML
-        return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    async def _healthz(self, _req: web.Request) -> web.Response:
+        # Unauthenticated liveness probe — reveals nothing but "up".
+        return web.json_response({"ok": True})
 
-    def _swarm_summary(self, name: str, swarm: Any) -> dict:
+    async def _index(self, req: web.Request) -> web.Response:
+        if not self._authorized(req):
+            return self._unauthorized()
+        from backend.dashboard_ui import render_dashboard
+
+        return web.Response(text=render_dashboard(self.token), content_type="text/html")
+
+    async def _swarm_summary(self, name: str, swarm: Any) -> dict:
         meta = swarm.meta
         agents = {}
         cost_tracker = getattr(self.deps, "cost_tracker", None)
-        for spec in swarm.model_specs:
+        specs = list(getattr(swarm, "_all_specs", None) or swarm.model_specs)
+        # Escalated solvers are not in model_specs, so iterating that alone hid
+        # them from the operator entirely.
+        for spec in dict.fromkeys([*specs, *swarm.solvers]):
             solver = swarm.solvers.get(spec)
             agent: dict[str, Any] = {
                 "status": "not started", "last": "", "last_ts": 0.0,
-                "thinking": "", "quiet_s": None, "steps": 0, "cost_usd": 0.0,
-                "approach": "",
+                "thinking": "", "quiet_s": None, "steps": 0, "tool_calls": 0,
+                "cost_usd": 0.0, "approach": "",
             }
-            # per-solver cost from the shared tracker (agent_name = "<ch>/<model>")
             if cost_tracker is not None:
                 from backend.models import model_id_from_spec
                 ag = cost_tracker.by_agent.get(f"{name}/{model_id_from_spec(spec)}")
                 if ag:
                     agent["cost_usd"] = round(ag.cost_usd, 4)
-                    agent["steps"] = 0  # filled below if available
             if solver is None:
                 agents[spec] = agent
                 continue
             agent["status"] = "running"
-            agent["steps"] = getattr(solver, "_step_count", 0)
-            # rotation assignment (which technique it's been told to try)
+            agent["steps"] = _as_int(getattr(solver, "_step_count", 0))
+            agent["tool_calls"] = _as_int(getattr(solver, "_tool_calls", 0))
             assigned = getattr(swarm, "_assigned_approach", {}).get(spec, "")
             if assigned:
                 agent["approach"] = assigned
-            tracer = getattr(solver, "tracer", None)
-            path = getattr(tracer, "path", None)
-            if path and Path(path).exists():
-                last_ts, sigs = trace_activity(path)
+            path = getattr(getattr(solver, "tracer", None), "path", None)
+            if path:
+                last_ts, sigs = await _trace_activity_cached(path)
                 agent["last_ts"] = last_ts
                 agent["quiet_s"] = round(time.time() - last_ts) if last_ts else None
                 if sigs:
                     agent["last"] = sigs[-1][:200]
-                thinking = last_model_text(path)
-                if thinking:
-                    agent["thinking"] = thinking
+                agent["thinking"] = await _last_text_cached(path)
             agents[spec] = agent
+
         # Shared blackboard feed — what solvers posted for siblings (facts,
-        # excluded dead-ends, coordinator broadcasts). This is the
-        # "shared experience" across models on this challenge.
+        # excluded dead-ends, coordinator broadcasts). Content is clipped for
+        # the live view: findings are deliberately never truncated at rest, so
+        # streaming dozens of them in full every 2.5s was megabytes per poll.
         feed: list[dict] = []
         help_requests: list[dict] = []
-        try:
-            bus = getattr(swarm, "message_bus", None)
-            if bus is not None:
-                for f in bus.findings[-30:]:
-                    feed.append({
+        bus = getattr(swarm, "message_bus", None)
+        if bus is not None:
+            for f in bus.findings[-STATE_FEED_LIMIT:]:
+                feed.append({
+                    "model": f.model,
+                    "kind": f.kind,
+                    "content": _clip(f.content, self.feed_chars),
+                    "chars": len(f.content or ""),
+                    "ts": f.timestamp,
+                })
+                if f.kind == "help":
+                    help_requests.append({
                         "model": f.model,
-                        "kind": f.kind,
-                        "content": f.content,  # full text — the dashboard shows it whole
+                        "question": _clip(f.content, self.feed_chars),
                         "ts": f.timestamp,
                     })
-                    if f.kind == "help":
-                        help_requests.append({
-                            "model": f.model, "question": f.content, "ts": f.timestamp,
-                        })
-        except Exception:
-            pass
         return {
             "challenge": name,
             "category": getattr(meta, "category", ""),
             "value": getattr(meta, "value", 0),
             "cancelled": swarm.cancel_event.is_set(),
-            "winner": swarm.winner.flag if swarm.winner else None,
+            "winner": swarm.winner.flag if (swarm.winner and swarm.winner.flag) else None,
             "winner_spec": swarm.winner_spec,
             "bumps": getattr(swarm, "_total_bumps", 0),
-            "failed_approaches": getattr(swarm, "_failed_approaches", []),
+            "failed_approaches": list(getattr(swarm, "_failed_approaches", [])),
+            "retire_reason": getattr(swarm, "retire_reason", ""),
+            "infra_failures": getattr(swarm, "_infra_failures", 0),
             "agents": agents,
-            "findings": dict(swarm.findings),
+            "findings": {k: _clip(v, self.feed_chars) for k, v in dict(swarm.findings).items()},
             "shared_feed": feed,
             "help_requests": help_requests,
         }
 
-    async def _state(self, _req: web.Request) -> web.Response:
+    async def _state(self, req: web.Request) -> web.Response:
+        if not self._authorized(req):
+            return self._unauthorized()
         deps = self.deps
-        swarms = {name: self._swarm_summary(name, s) for name, s in deps.swarms.items()}
+        swarms: dict[str, Any] = {}
+        for name, s in list(deps.swarms.items()):
+            swarms[name] = await self._swarm_summary(name, s)
         # Archived (finished) swarms — keep them visible as completed.
-        history = getattr(deps, "swarms_history", {})
-        for name, hist in history.items():
-            if name not in swarms:
-                hist = dict(hist)
-                hist.setdefault("cancelled", True)
-                hist.setdefault("archived", True)
-                swarms[name] = hist
+        for name, hist in list(getattr(deps, "swarms_history", {}).items()):
+            if name in swarms:
+                continue
+            hist = dict(hist)
+            hist.setdefault("cancelled", True)
+            hist.setdefault("archived", True)
+            hist["shared_feed"] = [
+                {**f, "content": _clip(f.get("content"), self.feed_chars)}
+                for f in (hist.get("shared_feed") or [])[-STATE_FEED_LIMIT:]
+            ]
+            swarms[name] = hist
         # Challenges known to CTFd but not yet spawned → shown as "待解题".
-        for name, meta in getattr(deps, "challenge_metas", {}).items():
-            if name not in swarms:
-                swarms[name] = {
-                    "challenge": name,
-                    "category": getattr(meta, "category", ""),
-                    "value": getattr(meta, "value", 0),
-                    "cancelled": False,
-                    "winner": None,
-                    "winner_spec": "",
-                    "bumps": 0,
-                    "failed_approaches": [],
-                    "agents": {},
-                    "findings": {},
-                    "pending": True,
-                }
+        for name, meta in list(getattr(deps, "challenge_metas", {}).items()):
+            if name in swarms:
+                continue
+            swarms[name] = {
+                "challenge": name,
+                "category": getattr(meta, "category", ""),
+                "value": getattr(meta, "value", 0),
+                "cancelled": False,
+                "winner": None,
+                "winner_spec": "",
+                "bumps": 0,
+                "failed_approaches": [],
+                "agents": {},
+                "findings": {},
+                "pending": True,
+            }
         data = {
             "ts": time.time(),
             "solved": list(getattr(deps, "results", {}).keys()),
@@ -203,57 +369,101 @@ class DashboardServer:
         return web.json_response(data)
 
     async def _trace(self, req: web.Request) -> web.Response:
+        if not self._authorized(req):
+            return self._unauthorized()
         name = req.query.get("name", "")
         spec = req.query.get("spec", "")
-        n = int(req.query.get("n", "50"))
+        try:
+            n = max(1, min(int(req.query.get("n", "50")), 500))
+        except ValueError:
+            n = 50
         swarm = self.deps.swarms.get(name)
         if not swarm:
             return web.json_response({"error": "no such swarm"}, status=404)
         solver = swarm.solvers.get(spec)
-        tracer = getattr(solver, "tracer", None) if solver else None
-        path = getattr(tracer, "path", None)
-        if not path or not Path(path).exists():
+        path = getattr(getattr(solver, "tracer", None), "path", None) if solver else None
+        if not path:
             return web.json_response({"events": []})
-        return web.json_response({"events": _tail_events(path, n)})
+        return web.json_response({"events": await _tail_events(path, n)})
+
+    async def _json_body(self, req: web.Request) -> dict | None:
+        try:
+            body = await req.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        return body if isinstance(body, dict) else None
 
     async def _advise(self, req: web.Request) -> web.Response:
-        body = await req.json()
-        name, spec, advice = body.get("challenge", ""), body.get("model_spec", ""), body.get("advice", "")
+        if not self._authorized(req):
+            return self._unauthorized()
+        body = await self._json_body(req)
+        if body is None:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = body.get("challenge", "")
+        spec = body.get("model_spec", "")
+        advice = str(body.get("advice", "")).strip()
+        if not advice:
+            return web.json_response({"error": "advice is empty"}, status=400)
         swarm = self.deps.swarms.get(name)
         if not swarm:
             return web.json_response({"error": "no such swarm"}, status=404)
         await swarm.message_bus.post_advice(spec, f"[operator] {advice}")
+        logger.info("Operator advised %s/%s (%d chars)", name, spec, len(advice))
         return web.json_response({"ok": True})
 
     async def _bump(self, req: web.Request) -> web.Response:
-        body = await req.json()
-        name, spec = body.get("challenge", ""), body.get("model_spec", "")
-        insights = body.get("insights", "")
+        if not self._authorized(req):
+            return self._unauthorized()
+        body = await self._json_body(req)
+        if body is None:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = body.get("challenge", "")
+        spec = body.get("model_spec", "")
+        insights = str(body.get("insights", "")).strip()
         swarm = self.deps.swarms.get(name)
         solver = swarm.solvers.get(spec) if swarm else None
         if not solver:
             return web.json_response({"error": "no such solver"}, status=404)
-        solver.bump(f"[operator guidance] {insights}" if insights else "[operator] retry with a fresh approach")
+        solver.bump(f"[operator guidance] {insights}" if insights
+                    else "[operator] retry with a fresh approach")
+        logger.info("Operator bumped %s/%s", name, spec)
         return web.json_response({"ok": True})
 
     async def _broadcast(self, req: web.Request) -> web.Response:
-        body = await req.json()
-        name, message = body.get("challenge", ""), body.get("message", "")
+        if not self._authorized(req):
+            return self._unauthorized()
+        body = await self._json_body(req)
+        if body is None:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = body.get("challenge", "")
+        message = str(body.get("message", "")).strip()
+        if not message:
+            return web.json_response({"error": "message is empty"}, status=400)
         swarm = self.deps.swarms.get(name)
         if not swarm:
             return web.json_response({"error": "no such swarm"}, status=404)
         await swarm.message_bus.broadcast(f"[operator] {message}")
+        logger.info("Operator broadcast to %s (%d chars)", name, len(message))
         return web.json_response({"ok": True})
 
     async def _spawn(self, req: web.Request) -> web.Response:
-        body = await req.json()
-        name = body.get("challenge", "")
+        if not self._authorized(req):
+            return self._unauthorized()
+        body = await self._json_body(req)
+        if body is None:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = str(body.get("challenge", "")).strip()
+        if not name:
+            return web.json_response({"error": "challenge is required"}, status=400)
         from backend.agents.coordinator_core import do_spawn_swarm
         result = await do_spawn_swarm(self.deps, name)
+        logger.info("Operator spawned swarm for %s: %s", name, result[:120])
         return web.json_response({"ok": True, "result": result})
 
     async def _export(self, req: web.Request) -> web.Response:
         """Download a full challenge report (JSON or Markdown)."""
+        if not self._authorized(req):
+            return self._unauthorized()
         from backend.export import build_report, render_json, render_markdown
 
         name = req.query.get("name", "")
@@ -262,17 +472,20 @@ class DashboardServer:
         archived = getattr(self.deps, "swarms_history", {}).get(name)
         if swarm is None and archived is None:
             return web.json_response({"error": "no such challenge"}, status=404)
-        report = build_report(name, swarm, archived, self.deps)
+        report = await asyncio.to_thread(build_report, name, swarm, archived, self.deps)
         if fmt == "json":
-            body = render_json(report)
-            ctype = "application/json"
-            ext = "json"
+            body, ctype, ext = render_json(report), "application/json", "json"
         else:
-            body = render_markdown(report)
-            ctype = "text/markdown"
-            ext = "md"
-        fname = f"ctf-report-{name}.{ext}"
+            body, ctype, ext = render_markdown(report), "text/markdown", "md"
+        # ASCII-only filename: challenge names come from CTFd and routinely
+        # contain non-ASCII text, quotes and slashes. `str.isalnum()` is True for
+        # 'ä' and for CJK, so it must be paired with isascii() or the value ends
+        # up in a header that cannot represent it.
+        safe = "".join(
+            c if (c.isascii() and (c.isalnum() or c in "-_")) else "_" for c in name
+        ).strip("_")[:80] or "challenge"
+        fname = f"ctf-report-{safe}.{ext}"
         return web.Response(
-            text=body, content_type=ctype,
+            text=body, content_type=ctype, charset="utf-8",
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )

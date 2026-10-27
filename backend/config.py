@@ -2,7 +2,34 @@
 
 from __future__ import annotations
 
+import re
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+# An unquoted value followed by whitespace + '#' is a trailing comment. This is
+# python-dotenv's rule, and it has to be applied here too: Docker's own
+# `--env-file` / compose `env_file:` parsers take everything after the first '='
+# verbatim, so `SOLVER_TIME_BUDGET_S=1500   # per-attempt wall clock` arrives as
+# the literal string "1500   # per-attempt wall clock" and fails int validation.
+# Under `docker compose` this was masked only because the environment: block
+# re-declares those two keys with clean values; any other key with a trailing
+# comment broke the same way.
+_INLINE_COMMENT_RE = re.compile(r"\s+#.*$")
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Drop a trailing ` # comment` from an unquoted value.
+
+    Quoted values are returned untouched, and a '#' with no preceding whitespace
+    is left alone, so passwords and flag-ish strings survive.
+    """
+    if not value:
+        return value
+    stripped = value.strip()
+    if stripped[:1] in ("'", '"'):
+        return value
+    return _INLINE_COMMENT_RE.sub("", value).rstrip()
 
 
 class Settings(BaseSettings):
@@ -55,23 +82,81 @@ class Settings(BaseSettings):
     # Infra
     sandbox_image: str = "ctf-sandbox"
     max_concurrent_challenges: int = 10
-    max_attempts_per_challenge: int = 3
+    # Hard cap on bump/retry rounds per solver. A solver that keeps coming back
+    # GAVE_UP is retired after this many rounds instead of spinning forever.
+    # 0 = unlimited (only sane in coordinator mode against a live CTFd).
+    max_attempts_per_challenge: int = 6
     container_memory_limit: str = "16g"
+    # CPU quota per sandbox container (NanoCpus = limit * 1e9).
+    container_cpu_limit: float = 2.0
+    # Per-command wall clock inside the sandbox (seconds). Enforced by wrapping
+    # every command in coreutils `timeout`, so a killed solver cannot leave an
+    # orphaned process burning CPU in its container.
+    sandbox_command_timeout_s: int = 900
+    # Timeout for the Claude Code CLI's own HTTP calls to the gateway (ms).
+    # 0 = CLI default (which can stall indefinitely on a half-open connection).
+    cli_api_timeout_ms: int = 600_000
+    # Sweep leftover sandbox containers/workspaces from a crashed previous run at
+    # startup. Turn this OFF on one of them if you run two agents concurrently
+    # (e.g. a coordinator plus a bench): the sweep matches by label, not by
+    # owner, so it would delete the other agent's LIVE sandboxes.
+    cleanup_orphans_on_start: bool = True
     # Optional HTTP(S) proxy injected into sandbox containers (e.g.
     # "http://host.docker.internal:7890" so solvers can reach github etc.).
     sandbox_proxy_url: str = ""
+    # Comma-separated hostnames the AGENT process may fetch with web_fetch even
+    # though they resolve to a non-public address. Everything else private is
+    # blocked by resolved IP (not by hostname prefix), because the agent holds
+    # /var/run/docker.sock. Keep this list as short as possible.
+    web_fetch_allow_hosts: str = "host.docker.internal"
+
+    # Startup health check — probe the gateway before launching anything so a
+    # misconfigured/unreachable endpoint fails in seconds instead of grinding
+    # through hours of "API Error: Connection refused" rounds.
+    startup_health_check: bool = True
+    health_check_timeout_s: float = 20.0
+    # Probe attempts before declaring an endpoint dead. A local gateway that is
+    # merely busy answers a later attempt, and failing the whole run on one
+    # ReadTimeout is worse than the outage the probe exists to catch. Auth
+    # failures are never retried.
+    health_check_retries: int = 3
 
     # Solver behavior
-    # Wall-clock budget per solver attempt (seconds). On expiry the attempt is
-    # interrupted, findings are harvested (Cairn-style conclude), and the solver
-    # is bumped with fresh direction. 0 = no budget.
+    # Wall-clock budget per solver attempt (seconds). On expiry the turn is
+    # INTERRUPTED (not killed), a Cairn-style conclude phase harvests the
+    # session, and the solver is bumped with fresh direction. 0 = no budget.
     solver_time_budget_s: int = 1500
+    # Independent budget for the phase-2 conclude harvest (seconds). Kept
+    # separate from solver_time_budget_s so harvesting always has room to run.
+    conclude_timeout_s: int = 90
+    # Consecutive infrastructure failures (connection refused / 5xx / auth)
+    # across a swarm before the whole swarm is retired. Stops a dead gateway
+    # from burning the entire time limit.
+    max_infra_failures: int = 3
+    # Grace period for siblings to wind down after one solver wins. They watch
+    # cancel_event and exit their stream loop within a couple of seconds, which
+    # lets each finish its own container/workspace teardown. Only stragglers are
+    # hard-cancelled after this.
+    solver_teardown_grace_s: int = 60
+    # Backoff between bump rounds: wait base + step*round, capped at max.
+    # Configurable (rather than a hardcoded formula) so the retry cadence can be
+    # tightened for benchmarks and loosened for a live competition.
+    bump_cooldown_base_s: int = 5
+    bump_cooldown_step_s: int = 10
+    bump_cooldown_max_s: int = 120
+    # Backoff after a quota/rate-limit error with no fallback endpoint available.
+    quota_backoff_base_s: int = 60
+    quota_backoff_max_s: int = 300
     # Start injecting skill-library hints after this many failed attempts (bumps).
-    # Default 2 = first retry is lean (rotation only); skills join from the 2nd failure.
-    skill_after_bumps: int = 2
+    # 1 = hints join from the first retry. Matches README / .env.example /
+    # docker-compose.
+    skill_after_bumps: int = 1
     # Coordinator model — use your STRONGEST model here (it coaches weaker
     # solvers). Empty = CLI --coordinator-model, else built-in default.
     coordinator_model: str = ""
+    # Wall-clock cap for a single coordinator LLM turn (seconds). Without it a
+    # hung gateway freezes the whole event loop (poller, patrol, operator UI).
+    coordinator_turn_timeout_s: int = 300
     # Proactive coordinator patrol: scan active solvers every N seconds for
     # stuck patterns (quiet too long / looping), alert + advise them.
     patrol_interval_s: int = 120
@@ -94,6 +179,35 @@ class Settings(BaseSettings):
     # Operator web dashboard (live swarm view + guidance mailbox UI).
     # 0 disables. Default 8080.
     dashboard_port: int = 8080
-    dashboard_host: str = "0.0.0.0"
+    # Loopback by default: the dashboard exposes unauthenticated-write-grade
+    # control (advise / bump / broadcast / spawn) plus flag export, and solver
+    # sandboxes can reach the host via host.docker.internal. Bind explicitly to
+    # 0.0.0.0 only behind a reverse proxy that adds auth.
+    dashboard_host: str = "127.0.0.1"
+    # Bearer token required on every dashboard request. Empty = generate a
+    # random token at startup and print it once (never silently unauthenticated).
+    dashboard_token: str = ""
+    # Max characters of blackboard content returned by /api/state per finding
+    # (the export endpoint still returns everything).
+    dashboard_feed_chars: int = 4000
+    # Operator message endpoint (ctf-msg). 0 = auto-pick a free port, which
+    # breaks `ctf-msg`'s default of 9400 — set it explicitly in .env/compose.
+    msg_port: int = 9400
+    msg_host: str = "127.0.0.1"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_inline_comments(cls, data):
+        """Strip trailing ` # comments` from env-sourced string values.
+
+        Runs before field validation so an int field never sees the comment text.
+        Only plain dicts are touched; already-constructed inputs pass through.
+        """
+        if not isinstance(data, dict):
+            return data
+        return {
+            k: _strip_inline_comment(v) if isinstance(v, str) else v
+            for k, v in data.items()
+        }

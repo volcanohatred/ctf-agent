@@ -113,6 +113,25 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
 
+# ---------------------------------------------------------------------------
+# Process-wide caches
+#
+# The skill library is large (hundreds of writeups). A per-SkillRouter cache
+# meant every swarm re-scanned and re-read it from scratch — with 10 concurrent
+# challenges that is 10 full `rglob` passes over the whole tree. Keyed by the
+# resolved root so two different libraries coexist safely.
+# ---------------------------------------------------------------------------
+_INDEX_CACHE: dict[str, dict[str, str]] = {}
+_WP_META_CACHE: dict[str, list[tuple[str, str, str]]] = {}
+_PACK_FILES_CACHE: dict[str, dict[str, list[str]]] = {}
+
+
+def clear_caches() -> None:
+    """Drop every cached skill-library read (used by tests and hot reloads)."""
+    _INDEX_CACHE.clear()
+    _WP_META_CACHE.clear()
+    _PACK_FILES_CACHE.clear()
+
 
 def _strip_frontmatter(text: str) -> str:
     return _FRONTMATTER_RE.sub("", text, count=1)
@@ -126,9 +145,7 @@ class SkillRouter:
     max_packs: int = 2
     _enabled: bool = field(init=False, default=False)
     _root: Path | None = field(init=False, default=None)
-    _index_cache: dict[str, str] = field(init=False, default_factory=dict)
-    # Lazy: list of (relpath, one_liner, searchable_text) for zh-knowledge WPs
-    _wp_meta_cache: list[tuple[str, str, str]] | None = field(init=False, default=None)
+    _cache_key: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         if self.skills_dir:
@@ -136,6 +153,7 @@ class SkillRouter:
             if root.is_dir() and any(root.glob("ctf-*/INDEX.md")):
                 self._root = root
                 self._enabled = True
+                self._cache_key = str(root.resolve())
             else:
                 logger.warning("Skills dir %s has no ctf-*/INDEX.md packs — disabled", self.skills_dir)
 
@@ -206,11 +224,16 @@ class SkillRouter:
         if level <= 1:
             # Level 1: SHORT pointer only — don't spend tokens on content yet.
             # Just tell the solver the pack exists and where its index is.
-            pack_list = ", ".join(f"{SANDBOX_SKILLS_ROOT}/{p}/" for p in pack_ids)
+            # One full path per pack: joining bare directories and appending a
+            # single "INDEX.md" used to emit "/skills/a/, /skills/b/INDEX.md",
+            # whose first half is not a readable file.
+            index_list = ", ".join(
+                f"`{SANDBOX_SKILLS_ROOT}/{p}/INDEX.md`" for p in pack_ids
+            )
             return (
                 "KNOWLEDGE BASE: this challenge matches a technique pack in the "
                 f"library mounted read-only at {SANDBOX_SKILLS_ROOT}/. "
-                f"If you're stuck, skim `{pack_list}INDEX.md` and read ONE relevant file. "
+                f"If you're stuck, skim {index_list} and read ONE relevant file. "
                 "(Only escalate to reading full docs if a quick retry fails.)"
             )
 
@@ -255,8 +278,9 @@ class SkillRouter:
     # ------------------------------------------------------------------
 
     def _index_excerpt(self, pack_id: str) -> str:
-        if pack_id in self._index_cache:
-            return self._index_cache[pack_id]
+        cache = _INDEX_CACHE.setdefault(self._cache_key, {})
+        if pack_id in cache:
+            return cache[pack_id]
         assert self._root is not None
         path = self._root / pack_id / "INDEX.md"
         text = ""
@@ -265,28 +289,32 @@ class SkillRouter:
             text = _strip_frontmatter(raw).strip()
             if len(text) > MAX_INDEX_CHARS:
                 text = text[:MAX_INDEX_CHARS] + "\n... [truncated — read the full INDEX.md in the sandbox]"
-        except FileNotFoundError:
-            logger.warning("Pack index missing: %s", path)
-        self._index_cache[pack_id] = text
+        except OSError as e:
+            logger.warning("Pack index unreadable (%s): %s", path, e)
+        cache[pack_id] = text
         return text
 
     def _pack_files(self, pack_id: str) -> list[str]:
+        cache = _PACK_FILES_CACHE.setdefault(self._cache_key, {})
+        if pack_id in cache:
+            return cache[pack_id]
         assert self._root is not None
         pack_dir = self._root / pack_id
         try:
-            return sorted(
-                f.name for f in pack_dir.glob("*.md") if f.name != "INDEX.md"
-            )
+            files = sorted(f.name for f in pack_dir.glob("*.md") if f.name != "INDEX.md")
         except OSError:
-            return []
+            files = []
+        cache[pack_id] = files
+        return files
 
     def _load_wp_meta(self) -> list[tuple[str, str, str]]:
-        """Lazily scan zh-knowledge writeup .meta.md files.
+        """Lazily scan zh-knowledge writeup .meta.md files (process-wide cache).
 
         Returns list of (relpath, one_liner, searchable_text).
         """
-        if self._wp_meta_cache is not None:
-            return self._wp_meta_cache
+        cached = _WP_META_CACHE.get(self._cache_key)
+        if cached is not None:
+            return cached
         assert self._root is not None
         results: list[tuple[str, str, str]] = []
         wp_root = self._root / "zh-knowledge"
@@ -308,7 +336,7 @@ class SkillRouter:
                 one_liner = m.group(1).strip().strip("\"'") if m else ""
             rel = meta_path.relative_to(self._root).as_posix()
             results.append((rel, one_liner, text))
-        self._wp_meta_cache = results
+        _WP_META_CACHE[self._cache_key] = results
         return results
 
     def _search_writeups(self, keywords: list[str]) -> list[tuple[str, str]]:

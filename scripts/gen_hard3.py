@@ -186,7 +186,7 @@ int main(int argc, char **argv) {{
     _meta(ch, "reg3-reverse-mba", "reverse", 400,
           "check verifies the flag through per-character constraints written with\n"
           "mixed boolean-arithmetic identities. The binary is stripped.\n"
-          "Recover the flag (length {} chars).".format(len(flag)),
+          f"Recover the flag (length {len(flag)} chars).",
           flag)
 
     # self-check

@@ -1,7 +1,7 @@
 # CTF Agent — docker-compose for the orchestrator container.
 #
 # Prerequisites:
-#   1. cp .env.example .env  and fill in keys (ANTHROPIC_API_KEY, GATEWAY_*, ...)
+#   1. cp .env.example .env  and fill in keys (ANTHROPIC_*, GATEWAY_*, ...)
 #   2. Set HOST_PROJECT_DIR in .env to the ABSOLUTE path of this directory on
 #      the Docker host (e.g. D:/code/ctf/ctf-agent-main/ctf-agent-main or
 #      /home/you/ctf-agent). Required: the agent spawns sandbox containers via
@@ -18,6 +18,16 @@
 #     docker compose run --rm agent ctf-bench --challenges-dir challenges -v
 #   Send a hint to the running coordinator:
 #     docker compose exec agent uv run --no-sync ctf-msg "focus on the JWT kid param"
+#
+# Ports (both published loopback-only on the HOST, so neither the LAN nor a
+# sandbox container can reach them via host.docker.internal):
+#   9400 — operator message endpoint (ctf-msg). MSG_PORT must match.
+#   8080 — web dashboard, bearer-token gated. It can inject instructions into
+#          solvers and export confirmed flags, so keep it loopback-only or put a
+#          reverse proxy with auth in front. The token is auto-generated when
+#          DASHBOARD_TOKEN is empty and printed once at startup with the
+#          ready-to-open URL; to fetch it again:
+#            docker compose logs agent | grep -i "access token"
 
 services:
   agent:
@@ -28,13 +38,32 @@ services:
     environment:
       # DooD: sandbox binds must use HOST paths
       HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?Set HOST_PROJECT_DIR in .env (absolute project path on the docker host)}
-      # Skills: /skills inside containers; SKILLS_HOST_DIR is the host path
+      # Skills: BOTH are required. SKILLS_DIR is what the agent itself reads
+      # (triage / index rendering / the technique-rotation queue);
+      # SKILLS_HOST_DIR is what gets bind-mounted into each sandbox.
       SKILLS_DIR: /skills
       SKILLS_HOST_DIR: ${SKILLS_HOST_DIR:-}
       # Tuning pass-through (host env overrides .env for one-off runs)
       SOLVER_TIME_BUDGET_S: ${SOLVER_TIME_BUDGET_S:-1500}
+      CONCLUDE_TIMEOUT_S: ${CONCLUDE_TIMEOUT_S:-90}
+      MAX_ATTEMPTS_PER_CHALLENGE: ${MAX_ATTEMPTS_PER_CHALLENGE:-6}
+      MAX_INFRA_FAILURES: ${MAX_INFRA_FAILURES:-3}
       SKILL_AFTER_BUMPS: ${SKILL_AFTER_BUMPS:-1}
+      ESCALATE_AFTER_BUMPS: ${ESCALATE_AFTER_BUMPS:-8}
+      SANDBOX_COMMAND_TIMEOUT_S: ${SANDBOX_COMMAND_TIMEOUT_S:-900}
       SANDBOX_PROXY_URL: ${SANDBOX_PROXY_URL:-}
+      COORDINATOR_MODEL: ${COORDINATOR_MODEL:-}
+      COORDINATOR_TURN_TIMEOUT_S: ${COORDINATOR_TURN_TIMEOUT_S:-300}
+      # 9400 must match `ctf-msg`'s default and the published port below.
+      MSG_PORT: ${MSG_PORT:-9400}
+      # Inside the container these MUST be 0.0.0.0 or Docker cannot forward the
+      # published port. Exposure is controlled host-side by the 127.0.0.1 bind
+      # in `ports:` below, plus the dashboard's bearer token.
+      MSG_HOST: ${MSG_HOST:-0.0.0.0}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8080}
+      DASHBOARD_HOST: ${DASHBOARD_HOST:-0.0.0.0}
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      STARTUP_HEALTH_CHECK: ${STARTUP_HEALTH_CHECK:-true}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./challenges:/app/challenges
@@ -42,8 +71,10 @@ services:
       - ./.workspaces:/app/.workspaces
       - ${SKILLS_HOST_DIR:-./skills}:/skills:ro
     ports:
-      - "9400:9400"  # operator message endpoint (ctf-msg)
-      - "8080:8080"  # web dashboard (live swarm view + guidance)
+      # Loopback-only on the HOST: reachable from your machine, not from the LAN
+      # and not from a sandbox container via host.docker.internal.
+      - "127.0.0.1:9400:9400"  # operator message endpoint (ctf-msg)
+      - "127.0.0.1:8080:8080"  # web dashboard
     tty: true
     stdin_open: true
     restart: "no"

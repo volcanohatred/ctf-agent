@@ -46,10 +46,17 @@ ENV UV_INDEX_URL=${UV_INDEX_URL}
 
 WORKDIR /app
 
-# Install python dependencies first (better layer caching)
-COPY pyproject.toml ./
+# Install dependencies first, from the committed lockfile, WITHOUT the project
+# itself — so editing backend/ does not invalidate the (slow) dependency layer.
+# An earlier revision copied backend/ before `uv sync`, which defeated the layer
+# caching the comment claimed, and uv.lock was gitignored so every build
+# re-resolved from scratch.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Now the code, and the project's own entry points.
 COPY backend ./backend
-RUN uv sync --no-dev
+RUN uv sync --frozen --no-dev
 
 # Runtime layout (mount points):
 #   /app/challenges   — challenge dirs (metadata.yml + distfiles/)
@@ -62,4 +69,6 @@ ENTRYPOINT ["uv", "run", "--no-sync"]
 # Default: start the coordinator. Override the command, e.g.:
 #   docker compose run --rm agent ctf-solve --challenge challenges/baby-pwn -v
 #   docker compose run --rm agent ctf-bench --challenges-dir challenges -v
-CMD ["ctf-solve", "--msg-port", "9400"]
+# MSG_PORT defaults to 9400 in backend/config.py, matching the published port
+# and `ctf-msg`'s own default, so no flag is needed here.
+CMD ["ctf-solve"]

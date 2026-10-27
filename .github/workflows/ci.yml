@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# The suite is stdlib-plus-fakes: no Docker, no LLM, no network. It runs in
+# seconds, so it is worth running on every push.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Lint (ruff)
+        run: uv run --frozen --no-dev ruff check .
+      - name: Format check
+        run: uv run --frozen --no-dev ruff format --diff backend tests || true
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Type check (ty)
+        run: uv run --frozen ty check backend
+        continue-on-error: true   # advisory until the baseline is clean
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: uv sync --frozen
+      - name: Unit tests
+        run: uv run --no-sync pytest -q
+
+  integration:
+    # Real-Docker tests for the sandbox layer: bind mounts, answer-key
+    # sanitization, the `timeout -k 5` command ceiling, run-id labelling and
+    # container/workspace reclamation. They skip themselves when no engine or no
+    # `ctf-sandbox` image is present, so this job is green-but-inert on runners
+    # without Docker and meaningful on self-hosted ones.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --frozen
+      - name: Build the sandbox image (best effort)
+        run: docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox . || echo "image build skipped"
+      - name: Sandbox integration tests
+        run: uv run --no-sync pytest tests/test_sandbox_integration.py -q -rs
+
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: uv.lock is up to date with pyproject.toml
+        run: uv lock --check
+
+  smoke:
+    # Verifies the CLI wiring end to end without Docker or a gateway: the
+    # commands must load, parse, and fail loudly on a missing sandbox rather
+    # than at import time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --frozen
+      - name: Entry points load
+        run: |
+          uv run --no-sync ctf-solve --help
+          uv run --no-sync ctf-bench --help
+          uv run --no-sync ctf-msg --help
+      - name: Every backend module imports
+        run: uv run --no-sync python tests/import_check.py
+      - name: Wiring check (dashboard auth, hooks, reset dispatch, wrapping)
+        run: uv run --no-sync python tests/wiring_check.py
+      - name: E2E — a dead gateway must fail fast, not grind
+        # Points both endpoints at a closed port and asserts the run aborts in
+        # seconds via the startup health check, rather than burning the whole
+        # time limit on rounds that all come back "API Error: Connection refused".
+        # Needs no Docker: sandbox startup is never reached.
+        run: uv run --no-sync python tests/e2e_dead_gateway.py

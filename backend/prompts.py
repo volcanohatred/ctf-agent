@@ -11,6 +11,35 @@ import yaml
 
 from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
 
+# ---------------------------------------------------------------------------
+# Phase-2 "conclude" prompt (Cairn-style timeout harvesting).
+#
+# Sent on the SAME session right after the wall-clock budget interrupted a
+# turn. Its job is to convert an in-flight, half-finished exploration into a
+# compact state card the next round can start from — using ONLY information
+# that was already confirmed before the interrupt.
+# ---------------------------------------------------------------------------
+CONCLUDE_PROMPT = """\
+This is the CONCLUDE phase. It overrides any earlier instruction in this session.
+
+Your time budget just expired. STOP immediately:
+- Do NOT run any more commands or tool calls.
+- Do NOT start a new line of investigation.
+- Base everything below ONLY on what was already CONFIRMED before this message.
+
+Reply with plain text (no tools), at most 25 lines, in this exact shape:
+
+[excluded] directions you already tried and ruled out — be specific (one per line)
+[fact] hard findings: file paths, offsets, addresses, keys, credentials, \
+decoded content, service behaviour (one per line)
+[artifacts] files you created under /challenge/workspace/ and what each contains
+[next] the single most promising untried direction and why
+
+If you have nothing confirmed for a section, write "none" for it. Do not \
+speculate and do not invent findings — an empty section is far better than a \
+guess, because your teammates will treat [fact] lines as ground truth.
+"""
+
 
 @dataclass
 class ChallengeMeta:
@@ -26,7 +55,13 @@ class ChallengeMeta:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ChallengeMeta:
-        with open(path) as f:
+        # encoding must be explicit: metadata.yml is UTF-8 (challenge
+        # descriptions routinely contain Chinese), but open() otherwise falls
+        # back to the platform locale. On a Windows agent that is cp936/GBK, and
+        # every affected challenge was silently SKIPPED by discovery with only a
+        # "bad metadata.yml" warning — the run then reported fewer challenges
+        # than the directory contained.
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         raw_flags = data.get("flags")
         if raw_flags is None and data.get("flag"):
@@ -179,9 +214,10 @@ def build_prompt(
             "For RSA: use `RsaCtfTool`, sage ECM, or `cado-nfs`."
         ),
         "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
-        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
+        "4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.",
         f"5. {submit_hint}",
-        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
+        "6. Only report a flag you have actually verified. If you have NOT verified a "
+        "flag, say so and keep working — never invent one to end your turn.",
         "7. Do not guess. Do not ask. Cover maximum surface area.",
         (
             '8. **Knowledge gaps**: if you hit something you genuinely don\'t understand '

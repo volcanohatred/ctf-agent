@@ -112,13 +112,38 @@ docker compose run --rm --service-ports agent
 docker compose exec agent uv run --no-sync ctf-msg "这题是 JWT，试 kid 注入"
 ```
 
+`ctf-msg` 默认打 9400 端口，与 `MSG_PORT` 和 compose 发布的端口一致；改过其中一个就要同步改另外两个。
+
+### 运营面板（Dashboard）
+
+启动后浏览器打开 `http://127.0.0.1:8080`，可以看到每题每个模型的实时思路、最近动作、攻坚方向、工具调用数、成本、静默时长，以及模型间的共享黑板和求助项；可以直接喂提示、广播、导出复盘报告。
+
+面板能给 solver 注入指令（solver 在特权沙箱里执行任意代码）、拉起新容器、导出已确认的 flag，所以**必须带 token**。没设 `DASHBOARD_TOKEN` 时会在启动日志里随机生成一个并打印出可直接点开的 URL：
+
+```bash
+docker compose logs agent | grep -i "access token"
+# Dashboard access token (no DASHBOARD_TOKEN was set): <token>
+#   → open http://127.0.0.1:8080/?token=<token>
+```
+
+compose 里两个端口都只发布到宿主的 `127.0.0.1`，所以局域网和沙箱容器（走 `host.docker.internal`）都碰不到。要对外开放请自己在前面挂一层带鉴权的反代。
+
+面板新增的两个排障信号值得留意：
+
+- **工具调用 = 0 且状态"运行"**：显示为红色"空转"。这是网关挂了或工具链没接上的特征，不是题目难。
+- **`swarm 自行退役：<原因>`**：可能是 `round cap reached`（轮次上限）、`quota retries exhausted`（配额耗尽）或 `N consecutive infrastructure failures`（基础设施连续失败）。第三种说明该去查网关，不是去换解题方向。
+
 ### ③ 离线评测（本地题目集 + 答案自动校验）
 
 ```bash
 docker compose run --rm agent ctf-bench --challenges-dir challenges --concurrency 2 -v
 ```
 
-报告写在 `logs/bench-*.json`（解题率 / 每题耗时 / 成本）。题目格式见下方"自带题目"。
+报告写在 `logs/bench-*.json`（解题率 / 每题耗时 / 成本 / 每题 `retire_reason`）。题目格式见下方"自带题目"。
+
+**先看 `benchmark.usable_run` 再看解题率。** 它为 `false` 时表示大部分题目是被基础设施问题（网关不可达、配额、鉴权）判死的，这次的数字不代表模型能力。每题的 `infra_failure` 和 `retire_reason` 会说明具体原因。
+
+`--time-limit` 若小于 `SOLVER_TIME_BUDGET_S`，单轮预算和它的 conclude 收割永远不会触发，每题都只会以外层 timeout 收尾，报告也就无法区分"解得慢"和"网关死了"——启动时会直接告警。
 
 ---
 

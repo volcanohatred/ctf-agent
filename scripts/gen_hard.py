@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path("/work") if Path("/work").exists() else Path(__file__).resolve().parent.parent

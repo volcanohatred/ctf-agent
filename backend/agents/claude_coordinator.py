@@ -62,13 +62,24 @@ KNOWLEDGE BASE:
   /skills/ctf-pwn/heap-techniques.md — the tcache poisoning section matches your case").
 
 CRITICAL RULES:
-- NEVER kill a swarm. Solvers will keep trying indefinitely with different approaches.
-  Even when stuck, they often unstick themselves after several bumps. Your job is to
-  HELP them, not give up on them. The only time a swarm should die is when the flag
-  is confirmed correct.
-- When a solver seems stuck, bump it with very specific technical guidance based on
-  its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
-- Cost is not a concern. Keep all swarms running.
+- Do NOT kill a swarm because it looks stuck. Solvers rotate techniques, harvest
+  their own findings on timeout, and often unstick themselves after several
+  bumps. Your job is to HELP them, not give up on them.
+- A swarm CAN retire itself, and you will see why in check_swarm_status
+  (`retire_reason`): "round cap reached", "quota retries exhausted", or
+  "N consecutive infrastructure failures". Round-cap retirement means the
+  challenge is genuinely hard — re-spawn only with a concrete new idea.
+- On an "INFRA ALERT" the gateway itself is failing. Do NOT bump that solver
+  with new techniques; that wastes turns on a networking problem. Report it to
+  the operator and leave the swarm alone.
+- When a solver seems stuck, bump it with very specific technical guidance based
+  on its trace. Tell it exactly what to try next — specific tools, techniques,
+  approaches. Prefer advise_agent (reaches a RUNNING solver) over bump_agent
+  (only takes effect on its next round).
+- Solvers may end a turn with `still_working` instead of a flag. That is normal
+  and honest — it is NOT a failure, and it is never a reason to kill a swarm.
+- Spend deliberately: keep all swarms running while they are making progress,
+  but do not re-spawn the same dead direction indefinitely.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """
@@ -102,9 +113,11 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def submit_flag(args: dict) -> dict:
         return _text(await do_submit_flag(deps, args["challenge_name"], args["flag"]))
 
-    @tool("kill_swarm", "Cancel all agents for a challenge.", {"challenge_name": str})
+    @tool("kill_swarm", "Cancel all agents for a challenge. Requires a reason, which is "
+          "recorded and shown to the operator — a killed swarm must never look like a crash.",
+          {"challenge_name": str, "reason": str})
     async def kill_swarm(args: dict) -> dict:
-        return _text(await do_kill_swarm(deps, args["challenge_name"]))
+        return _text(await do_kill_swarm(deps, args["challenge_name"], args.get("reason", "")))
 
     @tool("bump_agent", "Send targeted insights to a stuck agent.", {"challenge_name": str, "model_spec": str, "insights": str})
     async def bump_agent(args: dict) -> dict:
@@ -190,19 +203,47 @@ async def run_claude_coordinator(
     )
 
     async with ClaudeSDKClient(options=options) as client:
-        async def turn_fn(msg: str) -> None:
-            logger.debug(f"Coordinator query: {msg[:200]}")
+        # Session-high-water mark for the CLI's cumulative cost field.
+        cost_hwm: list[float] = [0.0]
+
+        async def turn_fn(msg: str) -> float:
+            """Send one message to the coordinator LLM; return this turn's cost.
+
+            The reported cost is a session high-water mark in current CLI
+            versions and per-turn in older ones, so it is tracked adaptively —
+            the same rule the solvers use — to avoid double-counting.
+            """
+            logger.debug("Coordinator query: %s", msg[:200])
             await client.query(msg)
             msg_count = 0
+            cost = 0.0
             async for message in client.receive_response():
                 msg_count += 1
-                msg_type = type(message).__name__
-                logger.debug(f"Coordinator received: {msg_type}")
+                logger.debug("Coordinator received: %s", type(message).__name__)
                 if isinstance(message, ResultMessage):
-                    cost = getattr(message, "total_cost_usd", 0)
-                    session = getattr(message, "session_id", None)
-                    logger.info(f"Claude coordinator turn done (messages={msg_count}, cost=${cost:.4f}, session={session})")
+                    reported = float(getattr(message, "total_cost_usd", 0.0) or 0.0)
+                    if reported >= cost_hwm[0]:
+                        cost = reported - cost_hwm[0]
+                        cost_hwm[0] = reported
+                    else:
+                        cost = reported
+                    logger.info(
+                        "Coordinator turn done (messages=%d, turn=$%.4f, total=$%.4f, session=%s)",
+                        msg_count, cost, cost_hwm[0], getattr(message, "session_id", None),
+                    )
+                    if getattr(message, "is_error", False):
+                        logger.error(
+                            "Coordinator turn reported an error: status=%s errors=%s",
+                            getattr(message, "api_error_status", None),
+                            getattr(message, "errors", None),
+                        )
             if msg_count == 0:
                 logger.warning("Coordinator turn produced no messages!")
+            return cost
 
-        return await run_event_loop(deps, ctfd, cost_tracker, turn_fn)
+        # Assigned then returned outside the `async with` so the client is fully
+        # closed before the result escapes, and every code path returns a dict.
+        results = await run_event_loop(
+            deps, ctfd, cost_tracker, turn_fn, coordinator_model=resolved_model,
+        )
+    return results

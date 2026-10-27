@@ -84,9 +84,11 @@ async def notify_coordinator(ctx: RunContext[SolverDeps], message: str) -> str:
 async def web_fetch(ctx: RunContext[SolverDeps], url: str, method: str = "GET", body: str = "") -> str:
     """Fetch a URL from the host. Useful for web challenges.
 
-    Prefer bash+curl inside the sandbox for cookies/sessions.
+    Prefer bash+curl inside the sandbox for cookies/sessions. Private/internal
+    addresses are blocked by resolved IP, except for the operator's allowlist.
     """
-    return await do_web_fetch(url, method, body)
+    return await do_web_fetch(url, method, body,
+                              allow_hosts=ctx.deps.web_fetch_allow_hosts)
 
 
 async def webhook_create(ctx: RunContext[SolverDeps]) -> str:

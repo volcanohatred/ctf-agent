@@ -73,7 +73,7 @@ def _calc_fallback_cost(usage: RunUsage, model: str) -> float | None:
     input_rate = pricing.get("input", 0)
     cached_rate = pricing.get("cached_input", input_rate)
     output_rate = pricing.get("output", 0)
-    uncached = max(0, usage.input_tokens - usage.cache_read_tokens)
+    uncached = _uncached_input(usage)
     return (
         (uncached * input_rate) / 1_000_000
         + (usage.cache_read_tokens * cached_rate) / 1_000_000
@@ -111,11 +111,31 @@ def _fmt_tokens(n: int) -> str:
 
 
 def _cache_rate(usage: RunUsage) -> str:
-    """Compute cache hit rate as a percentage string."""
-    if usage.input_tokens == 0:
+    """Compute cache hit rate as a percentage string.
+
+    Providers disagree on whether `input_tokens` already includes cached tokens.
+    Anthropic (and therefore the claude-sdk path, which is the default lineup)
+    reports them DISJOINTLY, so cache_read can legitimately exceed input — which
+    used to render as "378% hit". Detect the disjoint case and use the right
+    denominator so the figure is always a real percentage.
+    """
+    cached = usage.cache_read_tokens
+    total_input = usage.input_tokens
+    denominator = total_input + cached if cached > total_input else total_input
+    if denominator <= 0:
         return "n/a"
-    rate = (usage.cache_read_tokens / usage.input_tokens) * 100
-    return f"{rate:.0f}%"
+    return f"{(cached / denominator) * 100:.0f}%"
+
+
+def _uncached_input(usage: RunUsage) -> int:
+    """Input tokens billed at the full (non-cached) rate.
+
+    Mirrors `_cache_rate`'s provider detection: when cache_read exceeds input the
+    two are disjoint and ALL of input_tokens is uncached.
+    """
+    if usage.cache_read_tokens > usage.input_tokens:
+        return usage.input_tokens
+    return max(0, usage.input_tokens - usage.cache_read_tokens)
 
 
 @dataclass
@@ -140,14 +160,22 @@ class CostTracker:
         cache_read_tokens: int = 0,
         provider_spec: str = "",
         duration_seconds: float = 0.0,
+        cost_usd: float | None = None,
     ) -> None:
-        """Record token usage without requiring pydantic_ai.RunUsage."""
+        """Record token usage without requiring pydantic_ai.RunUsage.
+
+        `cost_usd`, when given, is the provider-reported cost for this call and
+        takes precedence over the local price table. Gateway models are priced
+        at 0.0 in FALLBACK_PRICING, so without this the whole run reports $0.00
+        no matter how much traffic it pushed.
+        """
         usage = RunUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
         )
-        self.record(agent_name, usage, model_name, provider_spec, duration_seconds)
+        self.record(agent_name, usage, model_name, provider_spec, duration_seconds,
+                    cost_usd=cost_usd)
 
     def record(
         self,
@@ -156,8 +184,12 @@ class CostTracker:
         model_name: str,
         provider_spec: str = "",
         duration_seconds: float = 0.0,
+        cost_usd: float | None = None,
     ) -> None:
-        cost = calc_cost(usage, model_name, provider_spec)
+        if cost_usd is not None and cost_usd > 0:
+            cost = float(cost_usd)
+        else:
+            cost = calc_cost(usage, model_name, provider_spec)
 
         if agent_name not in self.by_agent:
             self.by_agent[agent_name] = AgentUsage(
@@ -175,6 +207,25 @@ class CostTracker:
             f"{_fmt_tokens(usage.cache_read_tokens)} cached ({_cache_rate(usage)} hit) / "
             f"{_fmt_tokens(usage.output_tokens)} out | ${cost:.4f} | {duration_seconds:.1f}s"
         )
+
+    def record_cost_only(
+        self, agent_name: str, model_name: str, cost_usd: float,
+        provider_spec: str = "claude-sdk", duration_seconds: float = 0.0,
+    ) -> None:
+        """Record a provider-reported cost with no token breakdown.
+
+        Used for the coordinator, whose spend was previously only logged and
+        therefore missing from every total the operator ever saw.
+        """
+        if not cost_usd or cost_usd <= 0:
+            return
+        if agent_name not in self.by_agent:
+            self.by_agent[agent_name] = AgentUsage(
+                model_name=model_name, provider_spec=provider_spec
+            )
+        agent = self.by_agent[agent_name]
+        agent.cost_usd += cost_usd
+        agent.duration_seconds += duration_seconds
 
     @property
     def total_cost_usd(self) -> float:

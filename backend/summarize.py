@@ -9,6 +9,7 @@ is always kept; the summary is only what siblings get injected with.
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
@@ -31,11 +32,15 @@ async def summarize_for_siblings(
     model: str | None = None,
     max_chars_in: int = 20000,
     timeout_s: float = 25.0,
+    cost_tracker: object | None = None,
+    agent_name: str = "",
 ) -> str:
     """Return a concise key-info summary of a (possibly long) finding.
 
     Uses the OpenAI-compatible gateway. On ANY failure returns the original
     text unchanged (never truncates — a summary failure must not lose info).
+    Callers that need to tell "summarized" from "fell back" should compare the
+    result against the input.
     """
     text = text.strip()
     if not text:
@@ -52,6 +57,7 @@ async def summarize_for_siblings(
         "max_tokens": 700,
         "temperature": 0.2,
     }
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(
@@ -61,8 +67,31 @@ async def summarize_for_siblings(
             )
             resp.raise_for_status()
             data = resp.json()
-            summary = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+            _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
+            summary = ((data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                       or "").strip()
             return summary or text
-    except Exception as e:
-        logger.debug(f"summarize_for_siblings failed ({e}) — keeping full text")
+    except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
+        logger.debug("summarize_for_siblings failed (%s) — keeping full text", e)
         return text
+
+
+def _record(cost_tracker, agent_name: str, model: str, data: dict, seconds: float) -> None:
+    """Fold a gateway completion into the shared cost tracker.
+
+    These calls are real billed traffic; an earlier revision issued them without
+    recording anything, so operator-visible totals silently excluded them.
+    """
+    if cost_tracker is None:
+        return
+    try:
+        usage = data.get("usage") or {}
+        cost_tracker.record_tokens(
+            agent_name or "summarizer", model,
+            input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            output_tokens=int(usage.get("completion_tokens", 0) or 0),
+            provider_spec="gateway",
+            duration_seconds=seconds,
+        )
+    except Exception as e:  # noqa: BLE001 — accounting must never break solving
+        logger.debug("cost accounting for summarizer failed: %s", e)

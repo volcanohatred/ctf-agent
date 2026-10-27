@@ -20,7 +20,8 @@ build/
 .venv/
 .mypy_cache/
 .ruff_cache/
-uv.lock
+.pytest_cache/
+# uv.lock is COMMITTED — it is what makes the Docker build reproducible.
 
 # Runtime
 workspace/

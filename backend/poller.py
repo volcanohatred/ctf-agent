@@ -54,14 +54,22 @@ class CTFdPoller:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:  # noqa: BLE001 — shutdown is best-effort
+                logger.debug("poller stop error: %s", e)
+            self._task = None
 
     async def get_event(self, timeout: float = 1.0) -> PollEvent | None:
-        """Non-blocking get — returns None if no event within timeout."""
+        """Wait up to `timeout` for the next event; None when none arrived.
+
+        CancelledError is deliberately NOT swallowed here: swallowing it turned
+        an outer cancellation of the coordinator loop into a silent "no event",
+        which made shutdown hang instead of propagating.
+        """
         try:
             return await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError:
             return None
 
     def drain_events(self) -> list[PollEvent]:
@@ -88,9 +96,15 @@ class CTFdPoller:
             current_names = {ch["name"] for ch in stubs}
             current_solved = await self.ctfd.fetch_solved_names()
 
-            # Sanity check: if results look bogus compared to what we know, skip.
-            if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:
-                logger.warning(f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping")
+            # Sanity check: if the list shrank dramatically, the API probably
+            # returned a partial/errored page. Comparing against `known // 2`
+            # (integer division) made this a no-op for any small instance — with
+            # 1 known challenge the threshold was 0, so nothing was ever skipped.
+            if self._known_challenges and len(current_names) * 2 < len(self._known_challenges):
+                logger.warning(
+                    "Poll returned suspicious data (%d challenges vs %d known) — skipping",
+                    len(current_names), len(self._known_challenges),
+                )
                 return
             # Don't let solved count regress (API might return empty on errors)
             if self._known_solved and not current_solved:

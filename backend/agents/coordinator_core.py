@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
@@ -12,6 +13,86 @@ from backend.prompts import ChallengeMeta
 from backend.solver_base import FLAG_FOUND
 
 logger = logging.getLogger(__name__)
+
+# Archived swarm summaries are kept for the dashboard/export. Bounded so a
+# long competition cannot grow this without limit.
+MAX_SWARMS_HISTORY = 200
+
+
+def _archive_swarm(deps: CoordinatorDeps, name: str, swarm) -> None:
+    """Snapshot a finished swarm into deps.swarms_history (bounded)."""
+    try:
+        feed = []
+        bus = getattr(swarm, "message_bus", None)
+        if bus is not None:
+            for f in bus.findings:
+                feed.append({"model": f.model, "kind": f.kind,
+                             "content": f.content, "ts": f.timestamp})
+        agents_hist = {}
+        for spec in getattr(swarm, "_all_specs", None) or swarm.model_specs:
+            solver = swarm.solvers.get(spec)
+            agents_hist[spec] = {
+                "status": "finished",
+                "findings": swarm.findings.get(spec, ""),
+                "steps": getattr(solver, "_step_count", 0),
+                "tool_calls": getattr(solver, "_tool_calls", 0),
+            }
+        entry = {
+            "challenge": name,
+            "category": getattr(swarm.meta, "category", ""),
+            "value": getattr(swarm.meta, "value", 0),
+            "description": getattr(swarm.meta, "description", ""),
+            "tags": getattr(swarm.meta, "tags", []),
+            "winner": swarm.winner.flag if (swarm.winner and swarm.winner.flag) else None,
+            "winner_spec": swarm.winner_spec,
+            "bumps": getattr(swarm, "_total_bumps", 0),
+            "failed_approaches": getattr(swarm, "_failed_approaches", []),
+            "retire_reason": getattr(swarm, "retire_reason", ""),
+            "agents": agents_hist,
+            "shared_feed": feed,
+            "finished_at": time.time(),
+        }
+    except Exception as e:  # noqa: BLE001 — archiving must never block spawning
+        logger.warning("Could not archive swarm %s: %s", name, e)
+        entry = {"challenge": name, "winner": None}
+
+    deps.swarms_history[name] = entry
+    # Evict oldest-first once over the cap (insertion order == archive order).
+    while len(deps.swarms_history) > MAX_SWARMS_HISTORY:
+        oldest = next(iter(deps.swarms_history))
+        deps.swarms_history.pop(oldest, None)
+
+
+async def reap_finished_swarms(deps: CoordinatorDeps) -> list[str]:
+    """Retire swarms whose run task has actually completed.
+
+    Two bugs fixed here:
+      * Retirement used to trigger on `cancel_event.is_set()` alone. That flag
+        means "cancellation requested", not "finished" — the task can still be
+        inside `finally: await solver.stop()`. Archiving and dropping it at that
+        point left an un-awaited task (orphan containers) and under-counted
+        capacity, since `len(deps.swarms)` no longer included a live swarm.
+      * Finished tasks were popped without ever reading `task.result()`, so any
+        exception inside `swarm.run()` was silently swallowed.
+    """
+    retired: list[str] = []
+    for name, task in list(deps.swarm_tasks.items()):
+        if not task.done():
+            continue
+        swarm = deps.swarms.get(name)
+        if swarm is not None:
+            _archive_swarm(deps, name, swarm)
+            del deps.swarms[name]
+        deps.swarm_tasks.pop(name, None)
+        retired.append(name)
+
+        if task.cancelled():
+            logger.info("Swarm %s was cancelled", name)
+            continue
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Swarm %s failed: %s", name, exc, exc_info=exc)
+    return retired
 
 
 async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
@@ -33,60 +114,27 @@ async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
 
 async def do_get_solve_status(deps: CoordinatorDeps) -> str:
     solved = await deps.ctfd.fetch_solved_names()
+    await reap_finished_swarms(deps)
     swarm_status = {name: swarm.get_status() for name, swarm in deps.swarms.items()}
-    return json.dumps({"solved": sorted(solved), "active_swarms": swarm_status}, indent=2)
+    return json.dumps(
+        {"solved": sorted(solved), "active_swarms": swarm_status,
+         "archived": sorted(deps.swarms_history)},
+        indent=2,
+    )
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    # Retire ALL finished swarms before checking capacity — but ARCHIVE their
-    # summaries first so the dashboard keeps showing them as completed.
-    finished = [
-        name for name, swarm in deps.swarms.items()
-        if swarm.cancel_event.is_set()
-        or (name in deps.swarm_tasks and deps.swarm_tasks[name].done())
-    ]
-    for name in finished:
-        swarm = deps.swarms[name]
-        try:
-            # Preserve the blackboard feed + per-agent findings so the export
-            # and the dashboard still show the full picture after archival.
-            feed = []
-            bus = getattr(swarm, "message_bus", None)
-            if bus is not None:
-                for f in bus.findings:
-                    feed.append({"model": f.model, "kind": f.kind,
-                                 "content": f.content, "ts": f.timestamp})
-            agents_hist = {}
-            for spec in swarm.model_specs:
-                agents_hist[spec] = {
-                    "status": "finished",
-                    "findings": swarm.findings.get(spec, ""),
-                }
-            deps.swarms_history[name] = {
-                "challenge": name,
-                "category": getattr(swarm.meta, "category", ""),
-                "value": getattr(swarm.meta, "value", 0),
-                "description": getattr(swarm.meta, "description", ""),
-                "tags": getattr(swarm.meta, "tags", []),
-                "winner": swarm.winner.flag if swarm.winner else None,
-                "winner_spec": swarm.winner_spec,
-                "bumps": getattr(swarm, "_total_bumps", 0),
-                "failed_approaches": getattr(swarm, "_failed_approaches", []),
-                "agents": agents_hist,
-                "shared_feed": feed,
-                "finished_at": __import__("time").time(),
-            }
-        except Exception:
-            deps.swarms_history[name] = {"challenge": name, "winner": None}
-        del deps.swarms[name]
-        deps.swarm_tasks.pop(name, None)
-
-    active_count = len(deps.swarms)
-    if active_count >= deps.max_concurrent_challenges:
-        return f"At capacity ({active_count}/{deps.max_concurrent_challenges} challenges running). Wait for one to finish."
+    # Retire genuinely-finished swarms first — archiving their summaries so the
+    # dashboard and export keep showing them as completed.
+    await reap_finished_swarms(deps)
 
     if challenge_name in deps.swarms:
         return f"Swarm still running for {challenge_name}"
+
+    active_count = len(deps.swarm_tasks)
+    if active_count >= deps.max_concurrent_challenges:
+        return (f"At capacity ({active_count}/{deps.max_concurrent_challenges} "
+                "challenges running). Wait for one to finish.")
 
     # Auto-pull challenge if needed
     if challenge_name not in deps.challenge_dirs:
@@ -107,16 +155,23 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         ctfd=deps.ctfd,
         cost_tracker=deps.cost_tracker,
         settings=deps.settings,
-        model_specs=deps.model_specs,
+        model_specs=list(deps.model_specs),
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
     )
     deps.swarms[challenge_name] = swarm
 
     async def _run_and_cleanup() -> None:
-        result = await swarm.run()
+        try:
+            result = await swarm.run()
+        finally:
+            # A swarm that retired itself (round cap, infra failure, quota) must
+            # stay visible to the operator instead of looking "still running".
+            reason = getattr(swarm, "retire_reason", "")
+            if reason:
+                logger.warning("Swarm %s retired: %s", challenge_name, reason)
         # Flag already submitted/confirmed by solver's submit_fn — just record the result
-        if result and result.status == FLAG_FOUND:
+        if result and result.status == FLAG_FOUND and result.flag:
             deps.results[challenge_name] = {
                 "flag": result.flag,
                 "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
@@ -144,12 +199,16 @@ async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) 
         return f"submit_flag error: {e}"
 
 
-async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
+async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str, reason: str = "") -> str:
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"
-    swarm.kill()
-    return f"Swarm for {challenge_name} cancelled"
+    why = (reason or "").strip() or "killed by the coordinator (no reason given)"
+    swarm.kill(f"operator/coordinator kill: {why}")
+    # Logged explicitly: this used to be the one swarm-termination path that left
+    # no trace anywhere, so a killed swarm was indistinguishable from a crash.
+    logger.warning("Swarm %s killed on request: %s", challenge_name, why)
+    return f"Swarm for {challenge_name} cancelled ({why})"
 
 
 async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str) -> str:
@@ -183,38 +242,57 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
         return f"No swarm for {challenge_name}"
     solver = swarm.solvers.get(model_spec)
     if not solver:
-        return f"No solver for {model_spec}"
-    trace_path = getattr(solver, "tracer", None)
-    if not trace_path:
+        known = ", ".join(sorted(swarm.solvers)) or "(none)"
+        return f"No solver for {model_spec}. Running: {known}"
+    tracer = getattr(solver, "tracer", None)
+    path = getattr(tracer, "path", None) or (str(tracer) if tracer else "")
+    if not path:
         return "No tracer on solver"
-    path = trace_path.path if hasattr(trace_path, "path") else str(trace_path)
+    last_n = max(1, min(int(last_n or 20), 400))
     try:
-        lines = Path(path).read_text().strip().split("\n")
-        recent = lines[-last_n:]
-        summary = []
-        for line in recent:
-            try:
-                d = json.loads(line)
-                t = d.get("type", "?")
-                if t == "tool_call":
-                    args_str = str(d.get("args", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {args_str}")
-                elif t == "tool_result":
-                    result_str = str(d.get("result", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {result_str}")
-                elif t in ("finish", "error", "bump", "turn_failed"):
-                    summary.append(f"** {t}: {json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
-                elif t == "usage":
-                    summary.append(f"usage: in={d.get('input_tokens',0)} out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
-                else:
-                    summary.append(f"{t}: {str(d)[:80]}")
-            except Exception:
-                summary.append(line[:100])
-        return "\n".join(summary)
+        # Blocking file I/O off the event loop: traces grow large and the
+        # coordinator loop must keep servicing the poller and patrol.
+        lines = (await asyncio.to_thread(_read_tail_lines, path, last_n * 4))[-last_n:]
     except FileNotFoundError:
         return f"Trace file not found: {path}"
-    except Exception as e:
+    except OSError as e:
         return f"Error reading trace: {e}"
+
+    summary = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+            t = d.get("type", "?")
+            if t == "tool_call":
+                summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: "
+                               f"{str(d.get('args', ''))[:100]}")
+            elif t == "tool_result":
+                summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: "
+                               f"{str(d.get('result', ''))[:100]}")
+            elif t in ("finish", "error", "bump", "turn_failed", "budget_interrupt",
+                       "conclude_ok", "conclude_failed", "loop_break", "flag_rejected",
+                       "structured_flag_verified"):
+                summary.append(f"** {t}: "
+                               f"{json.dumps({k: v for k, v in d.items() if k != 'ts'})[:300]}")
+            elif t == "usage":
+                summary.append(f"usage: in={d.get('input_tokens',0)} "
+                               f"out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
+            else:
+                summary.append(f"{t}: {str(d)[:80]}")
+        except json.JSONDecodeError:
+            summary.append(line[:100])
+    return "\n".join(summary) or "(trace is empty)"
+
+
+def _read_tail_lines(path: str, n: int, chunk: int = 65536) -> list[str]:
+    """Return the last `n` non-empty lines without loading the whole file."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        fh.seek(max(0, size - chunk * max(1, n // 50)))
+        tail = fh.read()
+    lines = [line for line in tail.splitlines() if line.strip()]
+    return lines[-n:]
 
 
 async def do_broadcast(deps: CoordinatorDeps, challenge_name: str, message: str) -> str:

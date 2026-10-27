@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 import boto3
 from pydantic_ai.models import Model
@@ -16,6 +16,12 @@ from pydantic_ai.settings import ModelSettings
 
 if TYPE_CHECKING:
     from backend.config import Settings
+
+# Effort levels accepted by ClaudeAgentOptions(effort=...). Kept as our own alias
+# rather than importing the SDK's, so this module stays importable without the
+# claude-agent-sdk installed (only the claude-sdk backend needs it).
+EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 # Default model lineup — all via Claude Code CLI routed through the unified
 # gateway (ANTHROPIC_BASE_URL). The gateway fronts multiple model families
@@ -72,13 +78,12 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                         region_name=settings.aws_region,
                     ),
                 )
-            else:
-                session = boto3.Session()
-                client = session.client("bedrock-runtime", region_name=settings.aws_region)
-                return BedrockConverseModel(
-                    model_id,
-                    provider=BedrockProvider(bedrock_client=client),
-                )
+            session = boto3.Session()
+            client = session.client("bedrock-runtime", region_name=settings.aws_region)
+            return BedrockConverseModel(
+                model_id,
+                provider=BedrockProvider(bedrock_client=client),
+            )
         case "azure":
             return OpenAIChatModel(
                 model_id,
@@ -122,6 +127,17 @@ def resolve_model(spec: str, settings: Settings) -> Model:
             raise ValueError(f"Unknown provider: {provider}")
 
 
+def _cast_thinking_level(level: str):
+    """Narrow a plain string to google-genai's ThinkingLevel alias.
+
+    Kept as a helper so the provider-specific type never appears in a signature
+    of this provider-agnostic module.
+    """
+    from google.genai.types import ThinkingLevel
+
+    return cast(ThinkingLevel, level)
+
+
 def resolve_model_settings(spec: str) -> ModelSettings:
     """Get provider-specific model settings with caching enabled."""
     provider = spec.split("/", 1)[0]
@@ -147,12 +163,18 @@ def resolve_model_settings(spec: str) -> ModelSettings:
                 max_tokens=16_000,
             )
         case "google":
+            from pydantic_ai.models.google import ThinkingConfigDict
+
+            # google-genai types `thinking_level` as its own ThinkingLevel alias;
+            # the wire value is the plain string, so the dict is constructed
+            # through the provider's own TypedDict rather than importing a
+            # provider-specific enum into this provider-agnostic module.
             return GoogleModelSettings(
                 max_tokens=64_000,
-                google_thinking_config={
-                    "thinking_level": "high",
-                    "include_thoughts": True,
-                },
+                google_thinking_config=ThinkingConfigDict(
+                    thinking_level=_cast_thinking_level("high"),
+                    include_thoughts=True,
+                ),
             )
         case _:
             return ModelSettings(max_tokens=128_000)
@@ -169,15 +191,19 @@ def provider_from_spec(spec: str) -> str:
     return spec.split("/", 1)[0]
 
 
-def effort_from_spec(spec: str) -> str | None:
-    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
+def effort_from_spec(spec: str) -> EffortLevel | None:
+    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'.
+
+    Typed as the SDK's Literal so passing it to ClaudeAgentOptions(effort=...)
+    does not widen to `str`.
+    """
     parts = spec.split("/")
-    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
-        return parts[2]
+    if len(parts) >= 3 and parts[2] in EFFORT_LEVELS:
+        return cast("EffortLevel", parts[2])
     return None
 
 
-def claude_cli_env(settings: "Settings") -> dict[str, str]:
+def claude_cli_env(settings: Settings) -> dict[str, str]:
     """Env vars for the Claude Code CLI subprocess (claude-agent-sdk).
 
     When anthropic_base_url is set, the CLI talks to the unified gateway
@@ -191,6 +217,32 @@ def claude_cli_env(settings: "Settings") -> dict[str, str]:
     # (our agent container runs as root); IS_SANDBOX=1 marks the container
     # as an intentional sandbox and unlocks it.
     env["IS_SANDBOX"] = "1"
+
+    # Bound the CLI's own HTTP call. Without this a half-open gateway connection
+    # can stall a turn indefinitely — the wall-clock budget then interrupts a
+    # turn that was never making progress, and the reason is invisible.
+    api_timeout_ms = int(getattr(settings, "cli_api_timeout_ms", 0) or 0)
+    if api_timeout_ms > 0:
+        env["API_TIMEOUT_MS"] = str(api_timeout_ms)
+
+    # Bash tool timeouts. The CLI's default cap (~2 min) is far too short for
+    # CTF work (compiles, sage/cado-nfs runs, volatility passes), so raise it to
+    # just above the in-container `timeout` wrapper: the container must kill the
+    # process first so the model sees a real exit code and stderr, rather than a
+    # CLI-side kill with no explanation.
+    cmd_s = int(getattr(settings, "sandbox_command_timeout_s", 0) or 0)
+    if cmd_s > 0:
+        bash_ms = str((cmd_s + 30) * 1000)
+        env["BASH_DEFAULT_TIMEOUT_MS"] = str(min(cmd_s, 120) * 1000)
+        env["BASH_MAX_TIMEOUT_MS"] = bash_ms
+
+    # Stop the CLI from phoning home: with a gateway base URL these calls either
+    # fail slowly or leak usage data, and neither is wanted here.
+    env["DISABLE_TELEMETRY"] = "1"
+    env["DISABLE_ERROR_REPORTING"] = "1"
+    env["DISABLE_AUTOUPDATER"] = "1"
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+
     base_url = getattr(settings, "anthropic_base_url", "") or ""
     token = (
         getattr(settings, "anthropic_auth_token", "")
@@ -212,3 +264,43 @@ def supports_vision(spec: str) -> bool:
 def context_window(spec: str) -> int:
     """Get context window size for a model spec."""
     return CONTEXT_WINDOWS.get(model_id_from_spec(spec), 200_000)
+
+
+# Preference order for the escalation ladder: strongest/most-capable first.
+# Only used for entries not already in the running lineup.
+ESCALATION_CANDIDATES: tuple[str, ...] = (
+    "claude-opus-4-6",
+    "claude-sonnet-4-5",
+    "gpt-5.4",
+    "gemini-3-flash-preview",
+    "qwen3.8-max",
+    "deepseek-v4-pro",
+    "kimi-k3",
+    "glm-5.3",
+    "deepseek-v4-flash",
+)
+
+
+def escalation_spec(current_specs: list[str], settings: Settings) -> str | None:
+    """Pick a stronger model that is NOT already in the running lineup.
+
+    Returning None means "there is nobody left to escalate to" — the caller must
+    then stop trying. The previous implementation always resolved to
+    `claude-sdk/<coordinator_model or qwen3.8-max>`, which collided with the
+    default lineup's first entry and silently made the whole escalation ladder a
+    no-op.
+    """
+    running = {"/".join(s.split("/")[:2]) for s in current_specs}
+    preferred = [
+        getattr(settings, "coordinator_model", "") or "",
+        *ESCALATION_CANDIDATES,
+    ]
+    for candidate in preferred:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        spec = candidate if "/" in candidate else f"claude-sdk/{candidate}"
+        base = "/".join(spec.split("/")[:2])
+        if base not in running:
+            return spec
+    return None

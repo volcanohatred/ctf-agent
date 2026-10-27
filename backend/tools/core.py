@@ -1,7 +1,11 @@
 """SDK-agnostic tool logic — pure async functions, no Pydantic AI types."""
 
+from __future__ import annotations
+
+import ipaddress
 import json
 import shlex
+from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
@@ -87,29 +91,109 @@ async def do_submit_flag(ctfd, challenge_name: str, flag: str) -> tuple[str, boo
         return f"submit_flag error: {e}", False
 
 
-def _is_internal_url(url: str) -> bool:
+def _ip_is_forbidden(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+        # Docker's bridge gateway and the metadata endpoints solvers should not
+        # be able to reach from the agent process (which holds the docker socket).
+        or (ip.version == 4 and ip.packed[0] == 169 and ip.packed[1] == 254)
+    )
+
+
+def resolve_target(url: str, allow_hosts: str | Sequence[str] = ()) -> tuple[bool, str, list[str]]:
+    """Decide whether `url` may be fetched from the AGENT process.
+
+    Returns (allowed, reason, resolved_ips).
+
+    An earlier revision matched the hostname against a list of string prefixes,
+    which `http://2130706433:2375/` (decimal IP), `http://0x7f.1/`, IPv6
+    literals and any DNS name pointing at the host all walked straight past.
+    Since the agent container holds /var/run/docker.sock, that was a path from a
+    solver to the Docker API. Resolution is done here and EVERY returned address
+    must be public — a name that resolves to both a public and a private IP is
+    rejected, so a multi-record answer cannot smuggle one through.
+
+    `allow_hosts` is an explicit operator-controlled exception list. Challenge
+    services are normally reached from the agent container as
+    `host.docker.internal`, which resolves to a private gateway address, so
+    without a narrow allowlist this tool would block its own primary use case.
+    The allowlist is matched on the HOSTNAME, not the resolved IP, so it cannot
+    be widened by DNS.
+
+    Residual risk, stated plainly: this is still a check-then-connect, so a
+    deliberately rebinding DNS server can change its answer in between. Closing
+    that needs connection pinning, which is out of scope for a CTF utility.
+    Redirects are NOT followed, so a public URL cannot bounce to an internal one.
+    """
+    import ipaddress
+    import socket
     from urllib.parse import urlparse
-    host = urlparse(url).hostname or ""
-    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-        return True
-    if host.startswith("169.254.") or host.startswith("10.") or host.startswith("192.168."):
-        return True
-    if host.startswith("172."):
-        try:
-            second_octet = int(host.split(".")[1])
-            if 16 <= second_octet <= 31:
-                return True
-        except (ValueError, IndexError):
-            pass
-    return False
 
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False, f"scheme '{parsed.scheme or '(none)'}' is not allowed", []
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        return False, "no host in URL", []
 
-async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
-    if _is_internal_url(url):
-        return "Fetch error: access to internal/private networks is blocked."
+    allowed_names = {str(h).strip().rstrip(".").lower() for h in _as_seq(allow_hosts) if str(h).strip()}
+    host_allowed = host in allowed_names
+
     try:
-        # verify=False: CTF challenge services often use self-signed certs
-        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        return False, f"DNS resolution failed for {host}: {e}", []
+
+    ips: list[str] = []
+    for info in infos:
+        # getaddrinfo's sockaddr[0] is typed str|int by typeshed; coerce so the
+        # IPv6 zone-id strip ("fe80::1%eth0") is always valid.
+        raw = str(info[4][0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            return False, f"unparsable address {raw!r} for {host}", []
+        ips.append(str(ip))
+        if host_allowed:
+            continue
+        if _ip_is_forbidden(ip):
+            return False, f"{host} resolves to a non-public address ({ip})", ips
+
+    if not ips:
+        return False, f"{host} resolved to no addresses", []
+    return True, "", ips
+
+
+def _as_seq(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [p for p in value.split(",") if p.strip()]
+    return list(value)
+
+
+def _is_internal_url(url: str, allow_hosts=()) -> bool:
+    """Back-compat predicate: True when the URL must not be fetched."""
+    allowed, _reason, _ips = resolve_target(url, allow_hosts)
+    return not allowed
+
+
+async def do_web_fetch(url: str, method: str = "GET", body: str = "",
+                       allow_hosts=()) -> str:
+    allowed, reason, _ips = resolve_target(url, allow_hosts)
+    if not allowed:
+        return f"Fetch error: blocked — {reason}"
+    try:
+        # verify=False: CTF challenge services often use self-signed certs.
+        # follow_redirects stays False so an allowed public URL cannot bounce the
+        # request to an internal address after the check above.
+        async with httpx.AsyncClient(verify=False, timeout=30.0,
+                                     follow_redirects=False) as client:
             resp = await client.request(
                 method,
                 url,
@@ -118,10 +202,13 @@ async def do_web_fetch(url: str, method: str = "GET", body: str = "") -> str:
             )
             text = resp.text
             prefix = f"HTTP {resp.status_code} {resp.reason_phrase}\n{'─' * 40}\n"
+            if resp.is_redirect:
+                return (prefix + "[redirect not followed — re-issue the request with "
+                        f"the Location URL: {resp.headers.get('location', '?')}]")
             if len(text) > 20_000:
                 text = text[:20_000] + f"\n... [truncated, total {len(resp.text)} bytes]"
             return prefix + text
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — every failure is reported to the model
         return f"Fetch error: {e}"
 
 

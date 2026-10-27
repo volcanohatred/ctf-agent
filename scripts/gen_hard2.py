@@ -15,7 +15,6 @@ from __future__ import annotations
 import random
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path("/work") if Path("/work").exists() else Path(__file__).resolve().parent.parent
@@ -248,7 +247,6 @@ int main(void) {{
 def gen_forensics_layers() -> None:
     """Multi-stage: pcap with HTTP object (PNG+appended ZIP) + DNS TXT with the
     ZIP password → unzip → flag.txt. Designed to break single-tool workflows."""
-    import gzip
     import zipfile
 
     from scapy.all import DNS, DNSQR, DNSRR, IP, TCP, Raw, wrpcap

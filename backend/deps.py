@@ -33,6 +33,8 @@ class SolverDeps:
     submit_fn: SubmitFn | None = None  # Deduped flag submission via swarm
     no_submit: bool = False
     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
+    # Hostnames web_fetch may reach even though they resolve privately.
+    web_fetch_allow_hosts: str = ""
 
 
 @dataclass
@@ -45,7 +47,8 @@ class CoordinatorDeps:
     no_submit: bool = False
     max_concurrent_challenges: int = 10
 
-    msg_port: int = 0  # 0 = auto-pick free port
+    msg_port: int = 0  # 0 = auto-pick free port (breaks ctf-msg's 9400 default)
+    msg_host: str = "127.0.0.1"
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

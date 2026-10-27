@@ -57,10 +57,27 @@ failures (`SKILL_AFTER_BUMPS`, default 1) the swarm injects escalating hints fro
 the skill library: L1 pack index → L2 full file menu → L3 similar Chinese
 writeups. Solvers then read concrete techniques from `/skills/` themselves.
 
-**Wall-clock degradation (Cairn-style)**: each solver attempt has a time budget
-(`SOLVER_TIME_BUDGET_S`, default 1500s). On expiry the attempt is interrupted,
-findings are harvested to the blackboard as *excluded dead-ends*, and the solver
-resumes with a fresh direction — no silent 6-hour stalls.
+**Wall-clock degradation (Cairn-style, two phases)**: each solver attempt has a
+time budget (`SOLVER_TIME_BUDGET_S`, default 1500s). On expiry the turn is
+**interrupted through the SDK** — not task-cancelled, so the session survives —
+and a second phase resumes that same session with a conclude prompt under its own
+independent budget (`CONCLUDE_TIMEOUT_S`, default 90s), with all tools denied.
+The distilled `[excluded]` / `[fact]` / `[artifacts]` / `[next]` state card is
+what gets harvested to the blackboard. If the conclude phase fails, **nothing is
+written** — a partial or invented harvest is worse than none, because siblings
+treat it as ground truth. The solver then resumes with a fresh direction.
+
+**Fail fast on a dead gateway**: `STARTUP_HEALTH_CHECK` probes both endpoints
+before anything launches. This matters more than it sounds — the Claude CLI
+reports `API Error: Connection refused` as an *ordinary assistant text block*,
+so an unreachable gateway used to look exactly like a hard challenge: every
+round "gave up", the swarm rotated techniques and escalated skill hints at a
+networking problem, and the benchmark report said `timeout after 600s`. Those
+texts are now classified as `INFRA_ERROR`/`QUOTA_ERROR`, never published to the
+blackboard, and `MAX_INFRA_FAILURES` consecutive ones retire the swarm. A round
+that executed **zero tool calls** is treated the same way, and `ctf-bench`
+reports `usable_run: false` when infrastructure rather than the models decided
+the outcome.
 
 ## Quick Start (Docker — recommended)
 
@@ -101,6 +118,19 @@ uv sync
 docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
 cp .env.example .env   # set SKILLS_DIR to the skill library path
 uv run ctf-solve --ctfd-url https://ctf.example.com --ctfd-token ... -v
+```
+
+**Windows hosts**: `backend/sandbox.py` auto-detects Docker Desktop's named pipe
+(`npipe:////./pipe/docker_engine`) when `DOCKER_HOST` is unset. This matters
+because aiodocker's own fallback is `https://127.0.0.1:2376`, which Docker
+Desktop does not expose — without the detection, local mode failed on every
+Windows host with `Cannot connect to Docker Engine`. If you use a remote engine
+or a non-default context, set `DOCKER_HOST` explicitly; it always wins.
+
+Single-challenge mode also takes a hard wall-clock cap, so it cannot run away:
+
+```bash
+uv run ctf-solve --challenge challenges/regression/misc-encoding --no-submit --time-limit 600 -v
 ```
 
 ## Solver Models
@@ -168,6 +198,38 @@ flag: "flag{r3al_answ3r}"                # optional answer key → local verific
 keys, and writes a JSON report (`logs/bench-<ts>.json`) with per-challenge
 time/cost and overall solve rate — use it for regression testing after changes.
 
+The report also carries `retire_reason`, `infra_failure` and `bumps` per
+challenge, plus an overall `infra_failures` count and a `usable_run` flag.
+**Check `usable_run` before reading a solve rate**: when it is `false`,
+infrastructure rather than the models decided the outcome, and the number means
+nothing. `ctf-bench` also warns up front when `--time-limit` is below
+`SOLVER_TIME_BUDGET_S`, a combination in which the per-round budget and its
+conclude harvest can never fire, so every challenge ends as a bare outer timeout.
+
+## Tests
+
+```bash
+uv sync                      # or: pip install -e ".[dev]"
+uv run pytest -q             # 147 tests, no Docker / no LLM / no network
+uv run ruff check .
+uv run ty check backend
+uv run python tests/import_check.py     # every module imports
+uv run python tests/wiring_check.py     # ~80 wiring assertions (auth, hooks, wrapping)
+uv run python tests/e2e_dead_gateway.py # a dead gateway must fail in seconds
+```
+
+The suite is deliberately dependency-light: swarms are driven by scripted fake
+solvers, `httpx` goes through a `MockTransport` subclass, and DNS cases use
+numeric literals. That is what makes the scheduler logic testable at all — the
+round loop, two-phase timeout harvest, dead-end ledger, escalation ladder, flag
+verification and infrastructure-failure guard in `tests/test_swarm.py` are the
+parts that changed most often and previously had no coverage. Each file also
+passes when run on its own, so there are no hidden import-order dependencies.
+
+CI runs all of the above on every push (`.github/workflows/ci.yml`), including a
+`uv lock --check` gate so `pyproject.toml` and the committed lockfile cannot
+drift apart.
+
 ## Sandbox Tooling
 
 | Category | Tools |
@@ -182,14 +244,44 @@ time/cost and overall solve rate — use it for regression testing after changes
 
 ## Configuration
 
-See `.env.example` for all settings. Key tuning knobs:
+See `.env.example` for all settings (every knob is documented there). Key ones:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SOLVER_TIME_BUDGET_S` | `1500` | Per-attempt wall clock; 0 disables |
+| `STARTUP_HEALTH_CHECK` | `true` | Probe both gateway endpoints before launching; fail in seconds instead of grinding |
+| `SOLVER_TIME_BUDGET_S` | `1500` | Per-attempt wall clock; on expiry the turn is interrupted and phase 2 harvests it. 0 disables |
+| `CONCLUDE_TIMEOUT_S` | `90` | Independent budget for the phase-2 conclude harvest |
+| `MAX_ATTEMPTS_PER_CHALLENGE` | `6` | Hard cap on retry rounds per solver. 0 = unlimited |
+| `MAX_INFRA_FAILURES` | `3` | Consecutive infra failures before a swarm retires itself |
 | `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts |
+| `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
+| `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |
+| `SANDBOX_COMMAND_TIMEOUT_S` | `900` | Per-command `timeout -k 5` inside the sandbox — no orphaned processes |
+| `COORDINATOR_TURN_TIMEOUT_S` | `300` | Cap on one coordinator turn; a stalling gateway would otherwise freeze the whole event loop |
 | `CONTAINER_MEMORY_LIMIT` | `16g` | Per-sandbox memory |
+| `CONTAINER_CPU_LIMIT` | `2.0` | Per-sandbox CPU quota |
 | `MAX_CONCURRENT_CHALLENGES` | `10` | Parallel swarms |
+| `DASHBOARD_HOST` / `DASHBOARD_TOKEN` | `127.0.0.1` / auto | Loopback + bearer token by default (see below) |
+| `MSG_PORT` | `9400` | Must match what `ctf-msg` dials |
+
+### Operator dashboard
+
+The dashboard can inject instructions into solvers (which execute arbitrary code
+inside privileged sandboxes), spawn containers, and export confirmed flags. It is
+therefore bound to `127.0.0.1` and requires a bearer token on every route. With
+`DASHBOARD_TOKEN` unset, a random token is generated at startup and logged once
+together with the ready-to-open URL:
+
+```
+Dashboard access token (no DASHBOARD_TOKEN was set): <token>
+  → open http://127.0.0.1:8080/?token=<token>
+```
+
+Under Docker the listeners bind `0.0.0.0` *inside* the container (otherwise the
+port cannot be forwarded) and compose publishes them as `127.0.0.1:8080:8080`, so
+neither the LAN nor a sandbox container can reach them via
+`host.docker.internal`. Bind to `0.0.0.0` on the host only behind a reverse proxy
+that adds its own auth.
 
 ## Requirements
 

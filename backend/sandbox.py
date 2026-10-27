@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import shlex
+import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +21,52 @@ import aiodocker
 logger = logging.getLogger(__name__)
 
 CONTAINER_LABEL = "ctf-agent"
+# Per-process run id, stamped on every container and workspace this agent
+# creates. Without it, `cleanup_orphan_containers()` deletes containers belonging
+# to a *concurrently running* agent (e.g. a bench run next to a coordinator).
+RUN_ID = uuid.uuid4().hex[:8]
+RUN_LABEL = "ctf-agent-run"
+WORKSPACE_PREFIX = "ctf-workspace-"
+# Workspaces older than this are considered leaked (a live solver refreshes its
+# directory mtime by writing into it, and a round is bounded by the time budget).
+WORKSPACE_MAX_AGE_S = 12 * 3600
+
+# On Windows, Docker Desktop serves the engine over a named pipe. aiodocker's
+# fallback when DOCKER_HOST is unset is https://127.0.0.1:2376, which Docker
+# Desktop does NOT expose — so local (non-container) mode failed on every Windows
+# host with "Cannot connect to Docker Engine". The containerized DooD path is
+# unaffected: it uses /var/run/docker.sock.
+WINDOWS_PIPE_ROOT = r"\\.\pipe"
+WINDOWS_NPIPE_URL = "npipe:////./pipe/docker_engine"
+
+
+def resolve_docker_host() -> str | None:
+    """The Docker endpoint aiodocker should use, or None to let it decide.
+
+    An explicit DOCKER_HOST always wins (remote engines, custom contexts).
+    """
+    if os.environ.get("DOCKER_HOST"):
+        return None
+    if sys.platform != "win32":
+        return None
+    try:
+        # os.path.exists() is False for named pipes, and Path.iterdir() does not
+        # work on the \\.\pipe namespace at all — enumerating it with os.listdir
+        # is the only reliable check.
+        if "docker_engine" in os.listdir(WINDOWS_PIPE_ROOT):  # noqa: PTH208
+            return WINDOWS_NPIPE_URL
+    except OSError as e:
+        logger.debug("Could not enumerate the Windows pipe namespace: %s", e)
+    return None
+
+
+def new_docker_client() -> aiodocker.Docker:
+    """Build an aiodocker client against the right endpoint for this platform."""
+    url = resolve_docker_host()
+    if url:
+        logger.debug("Docker endpoint: %s", url)
+        return aiodocker.Docker(url=url)
+    return aiodocker.Docker()
 
 # Concurrency control
 _start_semaphore: asyncio.Semaphore | None = None
@@ -47,26 +96,80 @@ async def _track_stop() -> None:
         _active_count = max(0, _active_count - 1)
 
 
-async def cleanup_orphan_containers() -> None:
-    """Kill any leftover ctf-agent containers from a previous run."""
+async def cleanup_orphan_containers(only_this_run: bool = False) -> int:
+    """Kill leftover ctf-agent containers from a previous run.
+
+    `only_this_run=True` restricts the sweep to containers stamped with this
+    process's RUN_ID, which is what a second concurrent agent must use so it
+    does not delete the first agent's live sandboxes.
+    """
+    filters: dict[str, Any] = {"label": [CONTAINER_LABEL]}
+    if only_this_run:
+        filters = {"label": [CONTAINER_LABEL, f"{RUN_LABEL}={RUN_ID}"]}
+    removed = 0
+    docker: aiodocker.Docker | None = None
     try:
-        docker = aiodocker.Docker()
-        try:
-            containers = await docker.containers.list(
-                all=True,
-                filters={"label": [CONTAINER_LABEL]},
-            )
-            for c in containers:
-                try:
-                    await c.delete(force=True)
-                except Exception:
-                    pass
-            if containers:
-                logger.info("Cleaned up %d orphan container(s)", len(containers))
-        finally:
-            await docker.close()
-    except Exception as e:
+        docker = new_docker_client()
+        containers = await docker.containers.list(all=True, filters=filters)
+        for c in containers:
+            try:
+                await c.delete(force=True)
+                removed += 1
+            except Exception as e:  # noqa: BLE001 — best effort, keep sweeping
+                logger.debug("Could not remove orphan container: %s", e)
+        if removed:
+            logger.info("Cleaned up %d orphan container(s)", removed)
+    except Exception as e:  # noqa: BLE001 — no docker socket is not fatal here
         logger.warning("Orphan cleanup failed: %s", e)
+    finally:
+        if docker is not None:
+            try:
+                await docker.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return removed
+
+
+def cleanup_orphan_workspaces(workspace_root: str, max_age_s: float = WORKSPACE_MAX_AGE_S) -> int:
+    """Delete leaked per-sandbox workspace directories.
+
+    `DockerSandbox.stop()` removes its own workspace, but a hard crash (or a
+    container force-kill) leaves them behind; they accumulate inside the repo
+    because the default root is <project>/.workspaces. Only directories matching
+    the workspace naming scheme and older than `max_age_s` are touched.
+    """
+    if not workspace_root:
+        return 0
+    root = Path(workspace_root)
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max_age_s
+    removed = 0
+    import shutil
+
+    for entry in root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith(WORKSPACE_PREFIX):
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError as e:
+            logger.debug("Could not remove stale workspace %s: %s", entry, e)
+    if removed:
+        logger.info("Cleaned up %d stale workspace(s) under %s", removed, root)
+    return removed
+
+
+def default_workspace_root(settings: object) -> str:
+    """The workspace base dir this configuration will use ("" = system temp)."""
+    explicit = getattr(settings, "workspace_root", "") or ""
+    if explicit:
+        return explicit
+    if getattr(settings, "host_project_dir", ""):
+        return str(Path.cwd() / ".workspaces")
+    return tempfile.gettempdir()
 
 
 @dataclass
@@ -88,7 +191,7 @@ def to_host_path(path: str, host_prefix_map: tuple[str, str] | None) -> str:
     return path
 
 
-def sandbox_from_settings(challenge_dir: str, settings: object) -> "DockerSandbox":
+def sandbox_from_settings(challenge_dir: str, settings: object) -> DockerSandbox:
     """Build a DockerSandbox honoring docker-in-docker path translation.
 
     - When settings.host_project_dir is set (agent runs in a container), all
@@ -112,6 +215,8 @@ def sandbox_from_settings(challenge_dir: str, settings: object) -> "DockerSandbo
         image=getattr(settings, "sandbox_image", "ctf-sandbox"),
         challenge_dir=challenge_dir,
         memory_limit=getattr(settings, "container_memory_limit", "16g"),
+        cpu_limit=float(getattr(settings, "container_cpu_limit", 2.0) or 2.0),
+        command_timeout_s=int(getattr(settings, "sandbox_command_timeout_s", 900) or 900),
         workspace_root=workspace_root,
         skills_host_dir=skills_dir,
         host_prefix_map=prefix_map,
@@ -131,6 +236,8 @@ class DockerSandbox:
     image: str
     challenge_dir: str
     memory_limit: str = "16g"
+    cpu_limit: float = 2.0
+    command_timeout_s: int = 900
     workspace_dir: str = ""
     workspace_root: str = ""  # base dir for workspaces (default: system temp)
     skills_host_dir: str = ""  # host path of skill library, mounted at /skills:ro
@@ -139,6 +246,14 @@ class DockerSandbox:
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Teardown runs at most once, even if several solvers share a sandbox and
+    # each calls stop() as the swarm winds down.
+    _stopping: bool = field(default=False, repr=False)
+
+    @property
+    def is_running(self) -> bool:
+        """True once a container exists. Public replacement for poking `_container`."""
+        return self._container is not None
 
     @property
     def container_id(self) -> str:
@@ -167,10 +282,10 @@ class DockerSandbox:
         if self.workspace_root:
             root = Path(self.workspace_root)
             root.mkdir(parents=True, exist_ok=True)
-            ws = root / f"ctf-workspace-{uuid.uuid4().hex[:12]}"
+            ws = root / f"{WORKSPACE_PREFIX}{uuid.uuid4().hex[:12]}-{RUN_ID}"
             ws.mkdir()
             return str(ws)
-        return tempfile.mkdtemp(prefix="ctf-workspace-")
+        return tempfile.mkdtemp(prefix=WORKSPACE_PREFIX)
 
     def _sanitized_metadata(self, meta_yml: str) -> str:
         """Copy metadata.yml into the workspace dir without flag/flags keys."""
@@ -183,69 +298,112 @@ class DockerSandbox:
             dest = Path(self.workspace_dir) / ".metadata.sanitized.yml"
             dest.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
             return str(dest)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — fall back to the original file
             logger.warning("Could not sanitize metadata (%s) — mounting original", e)
             return meta_yml
+
+    def _build_config(self, binds: list[str], env: list[str], with_devices: bool) -> dict:
+        host_config: dict[str, Any] = {
+            "Binds": binds,
+            "ExtraHosts": ["host.docker.internal:host-gateway"],
+            "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
+            "SecurityOpt": ["seccomp=unconfined"],
+            "Memory": self._parse_memory_limit(),
+            "NanoCpus": int(max(0.1, self.cpu_limit) * 1e9),
+            # Fork bombs are a real hazard when running untrusted challenge
+            # binaries; cap the process count instead of relying on the OOM killer.
+            "PidsLimit": 4096,
+        }
+        if with_devices:
+            # Needed for losetup/mount-based forensics. Absent on some Docker
+            # Desktop hosts, so creation is retried without it (see start()).
+            host_config["Devices"] = [{
+                "PathOnHost": "/dev/loop-control",
+                "PathInContainer": "/dev/loop-control",
+                "CgroupPermissions": "rwm",
+            }]
+        return {
+            "Image": self.image,
+            "Cmd": ["sleep", "infinity"],
+            "WorkingDir": "/challenge",
+            "Tty": False,
+            "Labels": {CONTAINER_LABEL: "true", RUN_LABEL: RUN_ID},
+            "Env": env,
+            "HostConfig": host_config,
+        }
+
+    def _prepare_binds(self) -> list[str]:
+        """Blocking filesystem prep: workspace, distfile/metadata probes, sanitizing.
+
+        Kept synchronous and driven through `asyncio.to_thread` — with 40 sandboxes
+        starting at once these stat/read/write calls would otherwise stall the
+        coordinator's event loop.
+        """
+        self.workspace_dir = self._make_workspace()
+
+        challenge_root = Path(self.challenge_dir).resolve()
+        distfiles = str(challenge_root / "distfiles")
+        meta_yml = str(challenge_root / "metadata.yml")
+
+        binds: list[str] = [f"{self._to_host(self.workspace_dir)}:/challenge/workspace:rw"]
+        if Path(distfiles).exists():
+            binds.append(f"{self._to_host(distfiles)}:/challenge/distfiles:ro")
+        if Path(meta_yml).exists():
+            # Mount a SANITIZED copy: strip answer-key fields (flag/flags)
+            # so offline solvers can't read the solution from the sandbox.
+            sanitized = self._sanitized_metadata(meta_yml)
+            binds.append(f"{self._to_host(str(sanitized))}:/challenge/metadata.yml:ro")
+        if self.skills_host_dir:
+            binds.append(f"{self.skills_host_dir}:/skills:ro")
+        return binds
 
     async def start(self) -> None:
         sem = _start_semaphore or asyncio.Semaphore(50)
         async with sem:
-            self._docker = aiodocker.Docker()
+            self._docker = new_docker_client()
+            try:
+                binds = await asyncio.to_thread(self._prepare_binds)
 
-            self.workspace_dir = self._make_workspace()
+                env: list[str] = []
+                if self.proxy_url:
+                    env += [
+                        f"HTTP_PROXY={self.proxy_url}",
+                        f"HTTPS_PROXY={self.proxy_url}",
+                        "NO_PROXY=localhost,127.0.0.1,host.docker.internal,.local",
+                    ]
 
-            challenge_root = Path(self.challenge_dir).resolve()
-            distfiles = str(challenge_root / "distfiles")
-            meta_yml = str(challenge_root / "metadata.yml")
+                try:
+                    self._container = await self._docker.containers.create(
+                        self._build_config(binds, env, with_devices=True)
+                    )
+                except aiodocker.exceptions.DockerError as e:
+                    # /dev/loop-control is not available on every Docker host.
+                    if "loop-control" not in str(e):
+                        raise
+                    logger.warning("Retrying sandbox creation without /dev/loop-control")
+                    self._container = await self._docker.containers.create(
+                        self._build_config(binds, env, with_devices=False)
+                    )
+                await self._container.start()
+                await _track_start()
 
-            binds: list[str] = [f"{self._to_host(self.workspace_dir)}:/challenge/workspace:rw"]
-            if Path(distfiles).exists():
-                binds.append(f"{self._to_host(distfiles)}:/challenge/distfiles:ro")
-            if Path(meta_yml).exists():
-                # Mount a SANITIZED copy: strip answer-key fields (flag/flags)
-                # so offline solvers can't read the solution from the sandbox.
-                sanitized = self._sanitized_metadata(meta_yml)
-                binds.append(f"{self._to_host(str(sanitized))}:/challenge/metadata.yml:ro")
-            if self.skills_host_dir:
-                binds.append(f"{self.skills_host_dir}:/skills:ro")
-
-            env: list[str] = []
-            if self.proxy_url:
-                env += [
-                    f"HTTP_PROXY={self.proxy_url}",
-                    f"HTTPS_PROXY={self.proxy_url}",
-                    "NO_PROXY=localhost,127.0.0.1,host.docker.internal,.local",
-                ]
-
-            config = {
-                "Image": self.image,
-                "Cmd": ["sleep", "infinity"],
-                "WorkingDir": "/challenge",
-                "Tty": False,
-                "Labels": {CONTAINER_LABEL: "true"},
-                "Env": env,
-                "HostConfig": {
-                    "Binds": binds,
-                    "ExtraHosts": ["host.docker.internal:host-gateway"],
-                    "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
-                    "SecurityOpt": ["seccomp=unconfined"],
-                    "Devices": [{"PathOnHost": "/dev/loop-control", "PathInContainer": "/dev/loop-control", "CgroupPermissions": "rwm"}],
-                    "Memory": self._parse_memory_limit(),
-                    "NanoCpus": int(2 * 1e9),
-                },
-            }
-
-            self._container = await self._docker.containers.create(config)
-            await self._container.start()
-            await _track_start()
-
-            info = await self._container.show()
-            short_id = info["Id"][:12]
-            logger.info("Sandbox started: %s", short_id)
+                info = await self._container.show()
+                logger.info("Sandbox started: %s", info["Id"][:12])
+            except BaseException:
+                # Never leak a docker client, a half-created container, or a
+                # workspace directory when startup fails partway through.
+                await self.stop()
+                raise
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
         if not self._container:
             raise RuntimeError("Sandbox not started")
+
+        # Never let a caller (or a model-supplied timeout_seconds) exceed the
+        # configured per-command ceiling.
+        ceiling = int(self.command_timeout_s or 0)
+        if ceiling > 0 and (timeout_s <= 0 or timeout_s > ceiling):
+            timeout_s = ceiling
 
         async with self._lock:
             try:
@@ -255,9 +413,12 @@ class DockerSandbox:
                 return ExecResult(exit_code=-1, stdout="", stderr=f"Container gone: {e}")
 
     async def _exec_inner(self, command: str, timeout_s: int) -> ExecResult:
-        # Wrap command with `timeout` so the container kills the process on expiry.
-        # --signal=KILL ensures hard kill; --kill-after=5 is a safety net.
-        wrapped = f"timeout --signal=KILL --kill-after=5 {timeout_s} bash -c {shlex.quote(command)}"
+        # Wrap with coreutils `timeout` so the container kills the process on
+        # expiry: TERM first (lets tools clean up), KILL 5s later as the safety
+        # net. Mirrors the wrapper the claude-sdk path applies in
+        # ClaudeSolver._wrap_for_sandbox, so neither backend can leave an
+        # orphaned process burning the container's quota.
+        wrapped = f"timeout -k 5 {timeout_s} bash -c {shlex.quote(command)}"
         exec_instance = await self._container.exec(
             cmd=["bash", "-c", wrapped],
             stdout=True,
@@ -361,30 +522,68 @@ class DockerSandbox:
     async def copy_from(self, container_path: str, host_path: str) -> None:
         """Copy a file from the container to the host."""
         data = await self.read_file_bytes(container_path)
-        Path(host_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(host_path).write_bytes(data)
+        await asyncio.to_thread(_write_bytes, host_path, data)
 
     async def stop(self) -> None:
-        if self._container:
+        """Tear down container, client and workspace exactly once.
+
+        The whole teardown runs as ONE shielded unit. Its steps are
+        order-dependent — deleting the container needs the aiodocker client's
+        connector, which the next step closes — so a cancellation must never
+        land between them. Shielding per-step (an earlier attempt) made things
+        worse: swallowing the cancel let step 2 close the connector out from
+        under step 1's still-in-flight delete, so the container was left running.
+
+        The swarm cancels siblings the instant one solver wins, so this path is
+        hit on every solved challenge.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        try:
+            await asyncio.shield(self._stop_inner())
+        except asyncio.CancelledError:
+            # The shielded inner task keeps running to completion; there is
+            # nothing left for this frame to do but let the cancel through.
+            logger.debug("sandbox teardown detached (caller cancelled)")
+            raise
+
+    async def _stop_inner(self) -> None:
+        if self._container is not None:
+            container, self._container = self._container, None
             try:
-                await self._container.delete(force=True)
-            except Exception:
-                pass
-            self._container = None
+                await container.delete(force=True)
+            except Exception as e:  # noqa: BLE001 — teardown is best-effort
+                logger.debug("container delete failed: %s", e)
             await _track_stop()
 
-        if self._docker:
+        if self._docker is not None:
+            docker, self._docker = self._docker, None
             try:
-                await self._docker.close()
-            except Exception:
-                pass
-            self._docker = None
+                await docker.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("docker client close failed: %s", e)
 
         if self.workspace_dir:
-            import shutil
+            workspace, self.workspace_dir = self.workspace_dir, ""
             try:
-                shutil.rmtree(self.workspace_dir, ignore_errors=True)
-            except Exception:
-                pass
-            self.workspace_dir = ""
+                # Off the loop: a workspace can hold gigabytes of carved or
+                # extracted challenge data.
+                await asyncio.to_thread(_remove_workspace, workspace)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not remove workspace %s: %s", workspace, e)
         logger.info("Sandbox stopped")
+
+
+def _write_bytes(host_path: str, data: bytes) -> None:
+    Path(host_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(host_path).write_bytes(data)
+
+
+def _remove_workspace(workspace: str) -> None:
+    import shutil
+
+    try:
+        shutil.rmtree(workspace, ignore_errors=True)
+    except OSError as e:
+        logger.warning("Could not remove workspace %s: %s", workspace, e)

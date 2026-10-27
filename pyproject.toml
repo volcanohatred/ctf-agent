@@ -1,21 +1,25 @@
 [project]
 name = "ctf-agent-two"
-version = "0.1.0"
+version = "0.2.0"
 description = "CTF agent v2 — multi-model solver swarm"
 requires-python = ">=3.14"
+# Pinned to a compatible band, not left open. An unpinned `pydantic-ai[openai,google]`
+# silently broke when 2.61 folded those extras into the base package: pip only
+# warns, uv hard-errors, and either way the Docker image stops being reproducible.
+# uv.lock is committed — bump these deliberately, then re-lock.
 dependencies = [
-    "pydantic-ai[bedrock,openai,google]",
-    "pydantic-settings",
-    "genai-prices",
-    "boto3",
-    "aiodocker",
-    "claude-agent-sdk",
-    "httpx",
-    "pyyaml",
-    "rich",
-    "click",
-    "markdownify",
-    "aiohttp",
+    "pydantic-ai[bedrock]>=2.61,<3",
+    "pydantic-settings>=2.16,<3",
+    "genai-prices>=0.1.13,<0.2",
+    "boto3>=1.43,<2",
+    "aiodocker>=0.27,<0.28",
+    "claude-agent-sdk>=0.2.170,<0.3",
+    "httpx>=0.28,<0.29",
+    "pyyaml>=6.0,<7",
+    "rich>=15.0,<16",
+    "click>=8.5,<9",
+    "markdownify>=1.2,<2",
+    "aiohttp>=3.14,<4",
 ]
 
 [project.scripts]
@@ -32,10 +36,10 @@ package = true
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0",
-    "pytest-asyncio>=1.3",
-    "ruff>=0.14",
-    "ty>=0.0.2",
+    "pytest>=9.0,<10",
+    "pytest-asyncio>=1.3,<2",
+    "ruff>=0.14,<0.18",
+    "ty>=0.0.92,<0.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -46,11 +50,43 @@ target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "N", "C4", "PTH"]
-ignore = ["E501", "SIM105", "SIM115", "PTH123"]
+select = ["E", "F", "I", "UP", "B", "SIM", "N", "C4", "PTH", "ASYNC", "BLE", "RET", "ARG"]
+ignore = [
+    "E501",     # line length is handled by the formatter
+    "SIM105",   # contextlib.suppress is not always clearer
+    "SIM115",   # tracer/socket file handles have explicit lifecycles
+    "PTH123",   # open() is fine where a Path adds no clarity
+    "ARG001",   # hook callbacks must match the SDK's (input, id, ctx) signature
+    "ARG002",
+    "ARG004",
+    "RET504",   # `x = ...; return x` reads better in the trace/parse helpers
+    "RET505",   # explicit else-after-return matches the match/case style here
+    "ASYNC109", # poller.get_event(timeout=) is a deliberate public API shape
+    "BLE001",   # deliberately broad excepts are annotated inline where used
+]
+
+[tool.ruff.lint.per-file-ignores]
+# One-off challenge generators: uppercase matrix/coefficient names are the
+# convention in crypto writeups, and these are not library code.
+"scripts/*.py" = ["N806", "N816"]
+# Standalone one-shot utility script, not part of the agent's hot loop.
+"pull_challenges.py" = ["ASYNC240"]
+# Tests build settings via dict(**kwargs) for readability, deliberately fake
+# exception class names that mirror pydantic-ai's real ones (ModelRateLimitError
+# etc., which do not follow the *Error convention either), and assert on the
+# filesystem inline — blocking Path calls are fine in a test body.
+"tests/*.py" = ["ARG001", "ARG005", "C408", "N818", "ASYNC240"]
+"tests/import_check.py" = ["E402"]
+"tests/wiring_check.py" = ["E402"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["backend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ty.rules]
 unresolved-import = "ignore"

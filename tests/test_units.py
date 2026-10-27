@@ -21,7 +21,6 @@ from backend.message_bus import ChallengeMessageBus  # noqa: E402
 from backend.sandbox import to_host_path  # noqa: E402
 from backend.skills import SkillRouter  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # SkillRouter
 # ---------------------------------------------------------------------------
@@ -208,30 +207,35 @@ def test_swarm_summary_shared_feed() -> None:
     from backend.message_bus import ChallengeMessageBus
     from backend.web_dashboard import DashboardServer
 
-    bus = ChallengeMessageBus()
-    asyncio.run(bus.post("m1", "found weak CRC32", kind="fact"))
-    asyncio.run(bus.post("m2", "format string ruled out", kind="excluded"))
-    asyncio.run(bus.broadcast("coordinator hint"))
+    async def _run() -> None:
+        bus = ChallengeMessageBus()
+        await bus.post("m1", "found weak CRC32", kind="fact")
+        await bus.post("m2", "format string ruled out", kind="excluded")
+        await bus.broadcast("coordinator hint")
 
-    swarm = SimpleNamespace(
-        meta=SimpleNamespace(category="crypto", value=100),
-        model_specs=["m1"],
-        solvers={},
-        cancel_event=asyncio.Event(),
-        winner=None, winner_spec="",
-        _total_bumps=0, _failed_approaches=[],
-        findings={},
-        message_bus=bus,
-    )
-    deps = SimpleNamespace(cost_tracker=None)
-    srv = DashboardServer(deps)
-    out = srv._swarm_summary("chal", swarm)
-    feed = out["shared_feed"]
-    assert len(feed) == 3, feed
-    assert feed[0]["kind"] == "fact" and "CRC32" in feed[0]["content"]
-    assert feed[1]["kind"] == "excluded"
-    assert feed[2]["kind"] == "broadcast"
-    assert feed[0]["model"] == "m1"
+        swarm = SimpleNamespace(
+            meta=SimpleNamespace(category="crypto", value=100),
+            model_specs=["m1"],
+            _all_specs=["m1"],
+            solvers={},
+            cancel_event=asyncio.Event(),
+            winner=None, winner_spec="",
+            _total_bumps=0, _failed_approaches=[], _assigned_approach={},
+            retire_reason="", _infra_failures=0,
+            findings={},
+            message_bus=bus,
+        )
+        deps = SimpleNamespace(cost_tracker=None, settings=SimpleNamespace(dashboard_feed_chars=4000))
+        srv = DashboardServer(deps)
+        out = await srv._swarm_summary("chal", swarm)
+        feed = out["shared_feed"]
+        assert len(feed) == 3, feed
+        assert feed[0]["kind"] == "fact" and "CRC32" in feed[0]["content"]
+        assert feed[1]["kind"] == "excluded"
+        assert feed[2]["kind"] == "broadcast"
+        assert feed[0]["model"] == "m1"
+
+    asyncio.run(_run())
 
 
 def test_export_report() -> None:
@@ -301,11 +305,17 @@ def test_round_summary_fallback() -> None:
         settings = SimpleNamespace(gateway_base_url="", gateway_api_key="", summarizer_model="")
         # short text passes through
         assert await summarize_round("short note", settings) == "short note"
-        # no gateway → meta_summarize falls back to a clean join (deduped join of entries)
+        # no gateway → meta_summarize reports condensed=False so the caller keeps
+        # its bounded entry list instead of collapsing it into one huge string
         out = await meta_summarize(["tried A, failed", "tried B, failed"], settings)
-        assert "tried A" in out and "tried B" in out
-        # empty journal → empty
-        assert await meta_summarize([], settings) == ""
+        assert out.condensed is False
+        assert "tried A" in out.text and "tried B" in out.text
+        # a single entry is already condensed
+        single = await meta_summarize(["only one"], settings)
+        assert single.condensed and single.text == "only one"
+        # empty journal → empty, not condensed
+        empty = await meta_summarize([], settings)
+        assert empty.text == "" and empty.condensed is False
 
     asyncio.run(_run())
 

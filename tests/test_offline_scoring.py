@@ -230,3 +230,69 @@ def test_bundled_regression_set_is_fully_keyed() -> None:
         if not (data.get("flag") or data.get("flags")):
             keyless.append(str(meta_path.parent.relative_to(root)))
     assert not keyless, f"regression challenges without an answer key: {keyless}"
+
+
+# ---------------------------------------------------------------------------
+# ctf-solve must warn, not silently produce an unscorable run
+# ---------------------------------------------------------------------------
+
+def _run_single_kwargs(tmp_path: Path, yaml_text: str) -> dict:
+    d = _write_challenge(tmp_path, "chal", yaml_text)
+    return {"challenge_dir": str(d)}
+
+
+def test_single_challenge_mode_warns_when_unscoreable(tmp_path) -> None:
+    """The trap that cost a real 600s run: a keyless challenge under --no-submit
+    can never confirm a flag, and it used to end in a bare "No flag found" that
+    looked exactly like a model failure.
+
+    Synchronous on purpose — CliRunner drives the command, which calls
+    asyncio.run() itself, and that cannot be nested inside a running loop.
+    """
+    from click.testing import CliRunner
+
+    from backend.cli import main
+
+    d = _write_challenge(tmp_path, "keyless", KEYLESS)
+    runner = CliRunner()
+    # --skip-health-check and a tiny time limit keep this fast and offline; the
+    # warning is printed before any solver work starts.
+    result = runner.invoke(
+        main,
+        ["--challenge", str(d), "--no-submit", "--time-limit", "1",
+         "--skip-health-check", "--models", "claude-sdk/fake"],
+        catch_exceptions=False,
+    )
+
+    out = result.output
+    assert "No answer key" in out, out[:1200]
+    # and it must say what to do about it, not just that something is wrong
+    assert "flag:" in out or "--no-submit" in out
+
+
+def test_keyed_challenge_does_not_warn(tmp_path) -> None:
+    from click.testing import CliRunner
+
+    from backend.cli import main
+
+    d = _write_challenge(tmp_path, "keyed", KEYED)
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["--challenge", str(d), "--no-submit", "--time-limit", "1",
+         "--skip-health-check", "--models", "claude-sdk/fake"],
+        catch_exceptions=False,
+    )
+    assert "No answer key" not in result.output
+
+
+def test_metadata_flags_reach_the_swarm_expected_flags(tmp_path) -> None:
+    """The warning must key off the same field the verifier uses."""
+    from backend.prompts import ChallengeMeta
+
+    d = _write_challenge(tmp_path, "keyed", KEYED)
+    meta = ChallengeMeta.from_yaml(d / "metadata.yml")
+    assert meta.flags == ["flag{real_answer}"]
+
+    d2 = _write_challenge(tmp_path, "keyless", KEYLESS)
+    assert ChallengeMeta.from_yaml(d2 / "metadata.yml").flags == []

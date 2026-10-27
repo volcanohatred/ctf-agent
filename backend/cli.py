@@ -194,6 +194,23 @@ async def _run_single(
     if time_limit > 0:
         console.print(f"[dim]Wall-clock cap: {time_limit}s[/dim]")
 
+    # Without an answer key, --no-submit cannot confirm anything: every submission
+    # answers DRY RUN, so FLAG_FOUND is unreachable and the run always ends in
+    # "No flag found" no matter how well the models did. Say so up front instead
+    # of letting it look like a capability failure. (challenges/ holds keyless
+    # flat duplicates of the keyed canonical sets, and a challenge's NAME is not
+    # always its directory name, so this is easy to hit by accident.)
+    if no_submit and not meta.flags:
+        console.print(
+            "[bold red]No answer key in metadata.yml[/bold red] — with --no-submit nothing "
+            "can ever be confirmed, so this run cannot report a solve regardless of "
+            "what the models find.\n"
+            f"  [dim]path: {meta_path}\n"
+            "  Add `flag: \"...\"` to that metadata.yml, or point --challenge at the "
+            "keyed copy (e.g. challenges/regression/<dir> rather than a flat "
+            "challenges/<name> duplicate), or drop --no-submit to verify against CTFd.[/dim]"
+        )
+
     ctfd = CTFdClient(
         base_url=settings.ctfd_url,
         token=settings.ctfd_token,

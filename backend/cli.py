@@ -353,10 +353,23 @@ def bench(
         f"({summary['solve_rate']:.0%})[/bold] | "
         f"wall {summary['total_wall_time_s']:.0f}s | ${summary['total_cost_usd']:.2f}"
     )
+    if summary.get("unscoreable_no_answer_key"):
+        console.print(
+            f"[bold yellow]{summary['unscoreable_no_answer_key']} challenge(s) had NO answer "
+            "key[/bold yellow] — offline scoring is impossible for them (every submission "
+            "answers DRY RUN), so they are excluded from the solve rate. Add "
+            "`flag:` to their metadata.yml, or check that the path selects the keyed "
+            "copy: a challenge's NAME and its directory name are not always the same."
+        )
     if summary.get("infra_failures"):
         console.print(
             f"[bold red]{summary['infra_failures']} challenge(s) retired on infrastructure "
             "failures[/bold red] — the gateway, not the models, was the problem."
+        )
+    if not summary.get("usable_run", True):
+        console.print(
+            "[bold red]usable_run=false[/bold red] — this run does NOT measure model "
+            "capability. Fix the infrastructure or the answer keys first."
         )
 
 

@@ -124,7 +124,16 @@ async def _solve_one(
                 # offline: only a flag that matches the answer key counts
                 result.solved = result.verified
             else:
-                result.solved = True
+                # Unreachable in practice, and that is the point: with no answer
+                # key, try_submit_flag can only answer DRY RUN, so a solver never
+                # reaches FLAG_FOUND and this challenge cannot be scored at all.
+                # Say so instead of reporting a bare "unsolved".
+                result.solved = False
+                result.error = ("no answer key in metadata.yml — offline scoring is "
+                                "impossible (every submission answers DRY RUN, so no "
+                                "flag can ever be confirmed)")
+                logger.error("[bench] %s has no answer key — its result is meaningless",
+                             ch.name)
     except TimeoutError:
         result.duration_s = time.monotonic() - t0
         result.error = f"timeout after {time_limit_s}s"
@@ -184,6 +193,26 @@ async def run_benchmark(
     if not challenges:
         return {"error": f"no challenges found under {challenges_root}", "results": []}
 
+    # A challenge with no answer key cannot be scored offline at all: every
+    # submission answers DRY RUN, so no solver can ever reach FLAG_FOUND. Warn up
+    # front rather than letting it surface as a mysterious "unsolved" — and note
+    # that the directory name is not always the challenge name, so a typo'd path
+    # can quietly select a keyless duplicate of a keyed challenge.
+    keyless = [c.name for c in challenges if not c.meta.flags]
+    if keyless:
+        logger.warning(
+            "[bench] %d/%d challenge(s) have NO answer key and cannot be scored "
+            "offline: %s", len(keyless), len(challenges), ", ".join(keyless[:12]),
+        )
+        if len(keyless) == len(challenges):
+            return {
+                "error": "none of the selected challenges have an answer key "
+                         "(flag:/flags: in metadata.yml), so nothing can be verified "
+                         "offline. Check the path — the challenge NAME and its "
+                         "directory name are not always the same.",
+                "results": [],
+            }
+
     # Escalation can add a solver beyond the configured lineup, so leave headroom.
     configure_semaphore(max(1, concurrency * (len(specs) + 1)))
     prune_old_traces()
@@ -220,6 +249,10 @@ async def run_benchmark(
 
     solved = sum(1 for r in results if r.solved)
     infra = sum(1 for r in results if r.infra_failure)
+    unscoreable = sum(1 for r in results if not r.has_answer_key)
+    # Only challenges that could actually be scored belong in the denominator;
+    # including unscoreable ones understates the solve rate and hides why.
+    scoreable = len(results) - unscoreable
     report = {
         "benchmark": {
             "challenges_root": challenges_root,
@@ -230,11 +263,17 @@ async def run_benchmark(
             "max_attempts_per_challenge": settings.max_attempts_per_challenge,
             "total_challenges": len(results),
             "solved": solved,
-            "solve_rate": round(solved / len(results), 4) if results else 0.0,
-            # A run where most challenges died on infrastructure is not a
-            # measurement of the models, and the report must say so.
+            "solve_rate": round(solved / scoreable, 4) if scoreable else 0.0,
+            # Challenges with no answer key cannot be verified offline at all —
+            # every submission answers DRY RUN, so FLAG_FOUND is unreachable.
+            # They are excluded from the denominator and reported separately.
+            "unscoreable_no_answer_key": unscoreable,
+            # A run where infrastructure decided the outcome is not a measurement
+            # of the models. The test is a proportion, not a count with a floor:
+            # `infra <= max(1, n//4)` rated a single-challenge run that died
+            # entirely on infra failures as usable, because the floor allowed one.
             "infra_failures": infra,
-            "usable_run": infra <= max(1, len(results) // 4),
+            "usable_run": (infra * 4 <= len(results)) and scoreable > 0,
             "total_wall_time_s": round(total_s, 1),
             "total_cost_usd": round(cost_tracker.total_cost_usd, 4),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),

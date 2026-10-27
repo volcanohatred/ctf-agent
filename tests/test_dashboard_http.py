@@ -328,3 +328,120 @@ async def test_index_page_carries_the_token() -> None:
 
     assert r.status == 200
     assert f'const TOKEN = "{TOKEN}"' in html
+
+
+# ---------------------------------------------------------------------------
+# Solved state must come from CTFd, not from this session's results
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_solved_reflects_ctfd_after_a_restart() -> None:
+    """Regression observed live: a full 14-challenge run finished, the
+    coordinator was restarted, and the dashboard then reported 0 solved with all
+    22 challenges as "待解题" — while the coordinator's own STATUS line, which
+    reads the poller, correctly said 14 solved.
+
+    `deps.results` only accumulates during the current session, so it is empty
+    after a restart. CTFd is the authority.
+    """
+    deps = _deps({})
+    deps.results = {}                      # fresh session: nothing recorded yet
+    deps.ctfd_solved = {"chal-a", "chal-b"}
+    deps.ctfd_challenges = {"chal-a", "chal-b", "chal-c"}
+    deps.challenge_metas = {
+        n: SimpleNamespace(category="misc", value=10)
+        for n in ("chal-a", "chal-b", "chal-c", "local-only")
+    }
+
+    srv = DashboardServer(deps, host="127.0.0.1", port=0, token=TOKEN)
+    await srv.start()
+    try:
+        base = f"http://127.0.0.1:{_bound_port(srv)}"
+        async with ClientSession() as s:
+            data = await (await s.get(base + f"/api/state?token={TOKEN}")).json()
+    finally:
+        await srv.stop()
+
+    assert sorted(data["solved"]) == ["chal-a", "chal-b"]
+    assert data["ctfd_solved"] == ["chal-a", "chal-b"]
+
+
+@pytest.mark.asyncio
+async def test_session_results_and_ctfd_solved_are_unioned() -> None:
+    """A solve confirmed this session must survive even if the poller has not
+    picked it up yet."""
+    deps = _deps({})
+    deps.results = {"session-win": {"flag": "flag{x}", "submit": "confirmed by solver"}}
+    deps.ctfd_solved = {"poller-win"}
+    deps.ctfd_challenges = {"session-win", "poller-win"}
+
+    srv = DashboardServer(deps, host="127.0.0.1", port=0, token=TOKEN)
+    await srv.start()
+    try:
+        base = f"http://127.0.0.1:{_bound_port(srv)}"
+        async with ClientSession() as s:
+            data = await (await s.get(base + f"/api/state?token={TOKEN}")).json()
+    finally:
+        await srv.stop()
+
+    assert sorted(data["solved"]) == ["poller-win", "session-win"]
+
+
+@pytest.mark.asyncio
+async def test_local_only_challenges_are_not_marked_pending() -> None:
+    """challenges/ can hold sets that were never seeded to CTFd. Showing them as
+    "待解题" implied the coordinator was neglecting work it could never see."""
+    deps = _deps({})
+    deps.ctfd_solved = set()
+    deps.ctfd_challenges = {"on-ctfd"}
+    deps.challenge_metas = {
+        "on-ctfd": SimpleNamespace(category="misc", value=10),
+        "local-only": SimpleNamespace(category="misc", value=10),
+    }
+
+    srv = DashboardServer(deps, host="127.0.0.1", port=0, token=TOKEN)
+    await srv.start()
+    try:
+        base = f"http://127.0.0.1:{_bound_port(srv)}"
+        async with ClientSession() as s:
+            data = await (await s.get(base + f"/api/state?token={TOKEN}")).json()
+    finally:
+        await srv.stop()
+
+    assert data["swarms"]["on-ctfd"]["pending"] is True
+    assert data["swarms"]["on-ctfd"].get("local_only") is False
+    assert data["swarms"]["local-only"]["pending"] is False
+    assert data["swarms"]["local-only"]["local_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_ctfd_set_does_not_mark_everything_local_only() -> None:
+    """Before the poller's first tick ctfd_challenges is empty; treating that as
+    "nothing is on CTFd" would flag the whole board as local-only."""
+    deps = _deps({})
+    deps.ctfd_solved = set()
+    deps.ctfd_challenges = set()          # not yet populated
+    deps.challenge_metas = {"chal": SimpleNamespace(category="misc", value=10)}
+
+    srv = DashboardServer(deps, host="127.0.0.1", port=0, token=TOKEN)
+    await srv.start()
+    try:
+        base = f"http://127.0.0.1:{_bound_port(srv)}"
+        async with ClientSession() as s:
+            data = await (await s.get(base + f"/api/state?token={TOKEN}")).json()
+    finally:
+        await srv.stop()
+
+    assert data["swarms"]["chal"]["pending"] is True
+    assert data["swarms"]["chal"]["local_only"] is False
+
+
+def test_ui_distinguishes_local_only_from_pending() -> None:
+    from backend.dashboard_ui import render_dashboard
+
+    html = render_dashboard(TOKEN)
+    assert "local_only" in html, "the UI never reads the local_only flag"
+    assert "未上 CTFd" in html
+    # solved must take precedence over pending in the badge, or a solved
+    # challenge that is also still in challenge_metas renders as 待解题
+    assert html.index("已解") < html.index("待解题")

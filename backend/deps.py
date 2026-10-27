@@ -58,6 +58,18 @@ class CoordinatorDeps:
     results: dict[str, dict] = field(default_factory=dict)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)
+    # CTFd's authoritative view, refreshed from the poller every loop iteration.
+    #
+    # `results` only accumulates during the CURRENT session (from a solver's
+    # FLAG_FOUND or a challenge_solved event), so after a restart the dashboard
+    # showed 0 solved and every challenge as "待解题" while the coordinator's own
+    # STATUS line correctly reported 14 solved. The dashboard must not depend on
+    # session history for something CTFd already knows.
+    ctfd_solved: set = field(default_factory=set)
+    # Challenges that actually exist on CTFd. The local challenges/ directory can
+    # hold sets (hard/, hard3/, example-static) that were never seeded, and
+    # showing those as "待解题" implies the coordinator is neglecting them.
+    ctfd_challenges: set = field(default_factory=set)
     # How many times each challenge has been auto-spawned. Bounds the periodic
     # re-spawn so a genuinely hopeless challenge is not re-queued forever.
     spawn_attempts: dict[str, int] = field(default_factory=dict)

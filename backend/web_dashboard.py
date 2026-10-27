@@ -342,10 +342,20 @@ class DashboardServer:
                 for f in (hist.get("shared_feed") or [])[-STATE_FEED_LIMIT:]
             ]
             swarms[name] = hist
-        # Challenges known to CTFd but not yet spawned → shown as "待解题".
+        # Challenges known locally but with no swarm. Two distinct cases, which
+        # used to look identical:
+        #   - on CTFd and unsolved → genuinely waiting for the coordinator
+        #   - not on CTFd at all   → a local set that was never seeded; showing
+        #     it as "待解题" implied the coordinator was neglecting it
+        # An EMPTY ctfd_challenges means the poller has not populated it yet,
+        # i.e. "unknown" — not "nothing is on CTFd". Treating it as the latter
+        # would flag the entire board as local-only on a fresh start.
+        ctfd_names = set(getattr(deps, "ctfd_challenges", None) or ())
+        ctfd_known = bool(ctfd_names)
         for name, meta in list(getattr(deps, "challenge_metas", {}).items()):
             if name in swarms:
                 continue
+            on_ctfd = (name in ctfd_names) if ctfd_known else True
             swarms[name] = {
                 "challenge": name,
                 "category": getattr(meta, "category", ""),
@@ -357,14 +367,24 @@ class DashboardServer:
                 "failed_approaches": [],
                 "agents": {},
                 "findings": {},
-                "pending": True,
+                "pending": on_ctfd,
+                "local_only": not on_ctfd,
             }
+
+        # CTFd is the authority on what is solved. `results` only accumulates
+        # during the current session, so relying on it alone showed 0 solved
+        # after every restart even though the coordinator's own STATUS line —
+        # which reads the poller — reported the true count.
+        solved = set(getattr(deps, "results", {}).keys())
+        solved |= set(getattr(deps, "ctfd_solved", None) or ())
         data = {
             "ts": time.time(),
-            "solved": list(getattr(deps, "results", {}).keys()),
+            "solved": sorted(solved),
             "swarms": swarms,
             "cost_usd": round(getattr(deps.cost_tracker, "total_cost_usd", 0.0), 4),
             "results": getattr(deps, "results", {}),
+            "ctfd_solved": sorted(getattr(deps, "ctfd_solved", None) or ()),
+            "ctfd_challenges": sorted(ctfd_names),
         }
         return web.json_response(data)
 

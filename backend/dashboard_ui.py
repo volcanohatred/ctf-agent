@@ -161,9 +161,9 @@ function renderList() {
   const el = document.getElementById('challenges');
   const names = Object.keys(STATE.swarms).sort((a, b) => {
     const sa = STATE.swarms[a], sb = STATE.swarms[b];
-    const ra = sa.pending ? 2 : (sa.winner ? 1 : 0);
-    const rb = sb.pending ? 2 : (sb.winner ? 1 : 0);
-    return ra - rb;  // running first, then solved, then pending
+    const ra = sa.local_only ? 3 : (sa.pending ? 2 : (sa.winner ? 1 : 0));
+    const rb = sb.local_only ? 3 : (sb.pending ? 2 : (sb.winner ? 1 : 0));
+    return ra - rb;  // running first, then solved, then pending, then not-on-CTFd
   });
   const solvedSet = new Set(STATE.solved);
   let html = '';
@@ -171,15 +171,21 @@ function renderList() {
     const s = STATE.swarms[name];
     const solved = solvedSet.has(name) || s.winner;
     const pending = !!s.pending;
-    const stuck = !solved && !pending && Object.values(s.agents).some(a => a.quiet_s && a.quiet_s > 240);
-    const badge = pending ? '<span class="badge" style="background:#e2e8f0;color:var(--dim)">待解题</span>'
-      : solved ? '<span class="badge b-solved">✔ 已解</span>'
+    // A challenge that only exists in the local challenges/ directory was never
+    // seeded to CTFd, so the coordinator can never pick it up. Labelling it
+    // "待解题" implied neglect; say what it actually is.
+    const localOnly = !!s.local_only;
+    const stuck = !solved && !pending && !localOnly
+      && Object.values(s.agents).some(a => a.quiet_s && a.quiet_s > 240);
+    const badge = solved ? '<span class="badge b-solved">✔ 已解</span>'
+      : localOnly ? '<span class="badge" style="background:#e2e8f0;color:var(--dim)">未上 CTFd</span>'
+      : pending ? '<span class="badge" style="background:#e2e8f0;color:var(--dim)">待解题</span>'
       : stuck ? '<span class="badge b-stuck">⚠ 疑似卡死</span>'
       : '<span class="badge b-run">● 进行中</span>';
     const cost = Object.values(s.agents || {}).reduce((x, a) => x + (a.cost_usd || 0), 0);
     const dots = Object.entries(s.agents || {}).map(([sp, a]) =>
       `<span class="${s.winner ? (s.winner_spec === sp ? 'd-win' : 'd-dead') : 'd-run'}" title="${esc(sp)}"></span>`).join('');
-    const dimStyle = pending ? 'opacity:.55' : (solved ? 'opacity:.8' : '');
+    const dimStyle = (pending || localOnly) ? 'opacity:.55' : (solved ? 'opacity:.8' : '');
     html += `<div class="card ${SEL === name ? 'sel' : ''}" style="${dimStyle}" onclick="sel('${jsq(name)}')">
       ${badge}
       <div class="name">${esc(name)}</div>
@@ -197,7 +203,10 @@ async function renderDetail() {
   if (!s) return;
   const el = document.getElementById('detail');
   const cost = Object.values(s.agents || {}).reduce((x, a) => x + (a.cost_usd || 0), 0);
-  const statusTxt = s.pending ? '⏸ 待解题（尚未 spawn）' : s.winner ? '✅ 已解出' : (s.cancelled ? '⏹ 已停止' : '▶ 进行中');
+  const statusTxt = s.local_only ? '⊘ 本地题目，未上 CTFd（协调器不会自动接管）'
+    : s.pending ? '⏸ 待解题（尚未 spawn）'
+    : s.winner ? '✅ 已解出'
+    : (s.cancelled ? '⏹ 已停止' : '▶ 进行中');
   let html = `<div class="panel">
     <h2 style="font-size:16px">${esc(SEL)}</h2>
     <div style="margin-top:6px">
@@ -221,6 +230,15 @@ async function renderDetail() {
   if (s.failed_approaches && s.failed_approaches.length)
     html += `<div class="ledger" style="margin-top:8px">🚫 已排除方向：${esc(s.failed_approaches.join('、'))}</div>`;
   html += `</div>`;
+
+  if (s.local_only) {
+    html += `<div class="panel muted">这道题只存在于本地 <code>challenges/</code> 目录，CTFd 上没有它，
+      所以协调器不会自动接管。要打它请用 <code>ctf-bench</code>（离线、按答案钥校验），
+      或先用 <code>scripts/seed_ctfd.py</code> 把它种到 CTFd 上。
+      <div style="margin-top:8px"><button onclick="spawnSwarm()">🚀 仍然手动 spawn</button></div></div>`;
+    el.innerHTML = html;
+    return;
+  }
 
   if (s.pending) {
     // The panel always promised a "手动 spawn" button that did not exist — the

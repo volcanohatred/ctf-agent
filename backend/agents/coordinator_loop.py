@@ -117,6 +117,11 @@ async def run_event_loop(
     )
 
     unsolved = poller.known_challenges - poller.known_solved
+    # Seed the dashboard's authoritative view before the first loop iteration, so
+    # a freshly restarted coordinator does not briefly show every already-solved
+    # challenge as pending.
+    deps.ctfd_solved = poller.known_solved
+    deps.ctfd_challenges = poller.known_challenges
     initial_msg = (
         f"CTF is LIVE. {len(poller.known_challenges)} challenges, "
         f"{len(poller.known_solved)} solved.\n"
@@ -201,6 +206,12 @@ async def run_event_loop(
             if evt:
                 events.append(evt)
             events.extend(poller.drain_events())
+
+            # Publish CTFd's authoritative view for the dashboard. Doing it every
+            # iteration rather than at startup is what makes the UI correct after
+            # a restart, and keeps it correct as solves accumulate.
+            deps.ctfd_solved = poller.known_solved
+            deps.ctfd_challenges = poller.known_challenges
 
             # Auto-kill swarms for solved challenges, and record the solve.
             for evt in events:

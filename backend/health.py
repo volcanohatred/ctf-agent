@@ -54,8 +54,22 @@ class HealthReport:
 
     @property
     def fatal(self) -> list[ProbeResult]:
-        """Problems that must stop the run (no model reachable at all)."""
-        return [p for p in self.probes if not p.ok and p.kind in ("unreachable", "auth", "timeout")]
+        """Problems that must stop the run.
+
+        Only "nothing is there" (unreachable: refused / DNS failure / TLS) and
+        "your credentials are wrong" (auth) are fatal — both are deterministic
+        and will not improve on their own.
+
+        A timeout is deliberately NOT fatal. Observed live: the local gateway
+        hangs for a few minutes at a time and then answers in ~1s, so treating a
+        slow probe as fatal blocked runs that would have worked. Proceeding is
+        safe because the swarm has its own guard — MAX_INFRA_FAILURES consecutive
+        infrastructure failures retire it within a few rounds with a recorded
+        reason, and ctfd-bench marks the report `usable_run: false`. That bounds
+        the damage without betting the whole run on one probe.
+        """
+        return [p for p in self.probes
+                if not p.ok and p.kind in ("unreachable", "auth")]
 
     @property
     def warnings(self) -> list[ProbeResult]:
@@ -68,13 +82,14 @@ class HealthReport:
     def render(self) -> str:
         # ASCII markers on purpose: this text is printed on startup, and a
         # Windows console on a CJK codepage (cp936) raises UnicodeEncodeError on
-        # ✓/✗ — which would turn a clear "your gateway is down" message into a
-        # crash in the error-reporting path itself.
+        # non-ASCII glyphs — which would turn a clear "your gateway is down"
+        # message into a crash in the error-reporting path itself.
+        fatal = self.fatal
         lines: list[str] = []
         for p in self.probes:
             if p.ok:
                 mark = "[ok]"
-            elif p in self.fatal:
+            elif p in fatal:
                 mark = "[FATAL]"
             else:
                 mark = "[warn]"
@@ -268,15 +283,22 @@ async def check_health(settings: object, probe_model: str = "") -> HealthReport:
 async def ensure_healthy(settings: object, probe_model: str = "") -> HealthReport:
     """Run the startup probe; raise HealthCheckError on a fatal result.
 
-    Warnings are logged but tolerated: a rate-limited or 404'ing gateway may
-    still serve traffic, and the OpenAI endpoint is only a fallback path.
+    Warnings are logged but tolerated. A rate-limited, slow or 404'ing gateway
+    may still serve traffic, and the swarm's own infrastructure accounting
+    retires it with a recorded reason if it does not — which is a better outcome
+    than refusing to start on one ambiguous probe.
     """
     if not getattr(settings, "startup_health_check", True):
         return HealthReport()
 
     report = await check_health(settings, probe_model)
     for w in report.warnings:
-        logger.warning("Health check warning — %s", w)
+        logger.warning(
+            "Health check warning — %s. Proceeding anyway; if it persists the "
+            "swarm will retire itself after %s consecutive infrastructure "
+            "failures and record the reason.",
+            w, getattr(settings, "max_infra_failures", 3),
+        )
     if not report.ok:
         raise HealthCheckError(report)
     logger.info("Gateway health check passed:\n%s", report.render())

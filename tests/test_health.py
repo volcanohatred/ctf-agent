@@ -277,7 +277,61 @@ async def test_retries_exhausted_reports_the_attempt_count(patch_client, monkeyp
     assert anthropic.kind == "timeout"
     assert "after 3 attempts" in anthropic.detail, anthropic.detail
     assert calls["n"] == 3
-    assert report.fatal, "an endpoint that never answers must be fatal"
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_a_warning_not_a_blocker(patch_client, monkeypatch) -> None:
+    """A hung gateway must not veto the whole run.
+
+    Observed live: the local gateway hangs for minutes at a time, then answers in
+    ~1.2s. Treating a slow probe as fatal blocked runs that would have worked.
+    The swarm's own MAX_INFRA_FAILURES guard bounds the damage instead, and it
+    records a reason — so proceeding is safe and strictly more useful.
+    """
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/v1/messages"):
+            raise httpx.ReadTimeout("ReadTimeout")
+        return httpx.Response(200, json={})
+
+    patch_client(handler)
+    report = await check_health(_settings(health_check_retries=3))
+
+    assert report.probes[0].kind == "timeout"
+    assert report.ok, "a timeout must not be fatal"
+    assert not report.fatal
+    assert report.warnings
+
+
+@pytest.mark.asyncio
+async def test_connection_refused_stays_fatal(patch_client, monkeypatch) -> None:
+    """The original incident: nothing listening at all. Must still hard-stop."""
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused")
+
+    patch_client(handler)
+    report = await check_health(_settings(health_check_retries=2))
+
+    assert report.probes[0].kind == "unreachable"
+    assert report.fatal and not report.ok
+
+
+@pytest.mark.asyncio
+async def test_ensure_healthy_proceeds_with_a_warning_on_timeout(patch_client, monkeypatch) -> None:
+    monkeypatch.setattr("backend.health.asyncio.sleep", _instant_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/v1/messages"):
+            raise httpx.ReadTimeout("ReadTimeout")
+        return httpx.Response(200, json={})
+
+    patch_client(handler)
+    report = await ensure_healthy(_settings(health_check_retries=2))
+    assert report.ok
+    assert report.warnings, "the timeout must still be surfaced loudly"
 
 
 @pytest.mark.asyncio

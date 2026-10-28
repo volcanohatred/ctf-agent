@@ -142,6 +142,11 @@ def make_solver(client, cancel_event=None, session_id="sess-0") -> ClaudeSolver:
     s._concluding = False
     s._interrupted = False
     s._externally_cancelled = False
+    # Bypassing __init__ means every instance attribute the real constructor sets
+    # has to be declared here too, or the method under test raises AttributeError
+    # partway through. These two are the Verifier's hooks; empty = stock behaviour.
+    s.role_prompt = ""
+    s.conclude_prompt = ""
     s.cancel_event = cancel_event or asyncio.Event()
     s.loop_detector = LoopDetector()
     s.tracer = SolverTracer("unit-stream", "kimi-k3")

@@ -1,5 +1,6 @@
 # Credentials
 .env
+.env.bak*
 creds.json
 
 # Logs and traces

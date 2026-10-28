@@ -215,6 +215,146 @@ async def test_healthy_run_is_marked_usable(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The trust/stagnation audit trail in the report
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_report_carries_the_trust_audit_per_challenge(tmp_path, monkeypatch) -> None:
+    """A solve rate cannot distinguish "converged on verified facts" from "each
+    model asserted things nobody checked until the clock ran out". These counters
+    can, and a post-mortem that lacks them blames the models for a coordination
+    failure."""
+    # Distinct `name:` per challenge — discovery keys off metadata, not the
+    # directory, so two copies of KEYED would both be "keyed-chal".
+    _write_challenge(tmp_path, "grinder",
+                     'name: grinder\ncategory: web\nvalue: 10\nflag: "flag{real_answer}"\n')
+    _write_challenge(tmp_path, "healthy",
+                     'name: healthy\ncategory: web\nvalue: 10\nflag: "flag{real_answer}"\n')
+
+    async def fake_solve_one(ch, settings, model_specs, cost_tracker, time_limit_s):
+        if ch.name == "grinder":
+            return BenchResult(name=ch.name, category="web", has_answer_key=True,
+                               bumps=24, stale_breaks=5, strategist_pivots=2,
+                               corroborated_facts=1, unverified_claims=40,
+                               retire_reason="round cap reached (12)")
+        return BenchResult(name=ch.name, category="web", solved=True, verified=True,
+                           flag="flag{real_answer}", has_answer_key=True, bumps=2,
+                           corroborated_facts=6, unverified_claims=2)
+
+    monkeypatch.setattr("backend.offline._solve_one", fake_solve_one)
+
+    report = await run_benchmark(
+        settings=_settings(), challenges_root=str(tmp_path), concurrency=1,
+        time_limit_s=60, output_path=str(tmp_path / "r.json"),
+    )
+
+    by_name = {r["name"]: r for r in report["results"]}
+    assert set(by_name) == {"grinder", "healthy"}
+    grinder = by_name["grinder"]
+    assert grinder["stale_breaks"] == 5
+    assert grinder["strategist_pivots"] == 2
+    assert grinder["unverified_claims"] == 40
+    assert grinder["corroborated_facts"] == 1
+    # The healthy run is distinguishable from it on more than just `solved`.
+    assert by_name["healthy"]["stale_breaks"] == 0
+    assert by_name["healthy"]["corroborated_facts"] == 6
+
+
+def test_bench_result_audit_counters_default_to_zero() -> None:
+    """Every field must have a default: `_solve_one` writes them in a `finally`
+    block, so a swarm that crashed before publishing must still yield a row."""
+    r = BenchResult(name="x", category="web")
+    assert (r.stale_breaks, r.strategist_pivots) == (0, 0)
+    assert (r.corroborated_facts, r.unverified_claims) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_solve_one_records_the_audit_even_when_the_swarm_crashes(tmp_path, monkeypatch) -> None:
+    """The `finally` path is the one that matters most: a crashed or timed-out
+    swarm is exactly the run somebody needs to post-mortem."""
+    import asyncio
+
+    import backend.offline as offline
+    from backend.cost_tracker import CostTracker
+
+    _write_challenge(tmp_path, "boom", KEYED)
+    ch = offline.discover_challenges(str(tmp_path))[0]
+
+    class ExplodingSwarm:
+        retire_reason = "round cap reached (12)"
+
+        def __init__(self, *args, **kwargs):
+            self.cancel_event = asyncio.Event()
+            self.winner = None
+            self.winner_spec = ""
+
+        async def run(self):
+            raise RuntimeError("sandbox exploded")
+
+        def kill(self, reason=""):
+            self.cancel_event.set()
+
+        def get_status(self):
+            return {"bumps": 7, "stale_breaks": 3, "strategist_pivots": 1,
+                    "corroborated_facts": 2, "unverified_claims": 9,
+                    "probe_verified": 4, "probe_refuted": 2, "contradictions": 1}
+
+    monkeypatch.setattr("backend.agents.swarm.ChallengeSwarm", ExplodingSwarm)
+
+    result = await offline._solve_one(ch, _settings(), ["m1"], CostTracker(), 0)
+
+    assert "RuntimeError" in result.error
+    assert result.bumps == 7
+    assert result.stale_breaks == 3
+    assert result.strategist_pivots == 1
+    assert result.corroborated_facts == 2
+    assert result.unverified_claims == 9
+    assert result.probe_verified == 4
+    assert result.probe_refuted == 2
+    assert result.contradictions == 1
+    assert result.infra_failure is False, "a round cap is not an infrastructure failure"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_status_snapshot_cannot_mask_the_real_error(tmp_path, monkeypatch) -> None:
+    """The audit read happens in a `finally`, i.e. usually while handling a crash.
+    A KeyError there would replace the real exception and destroy the only
+    diagnostic anybody was going to get — so every counter has to tolerate a
+    swarm that reports none of them."""
+    import asyncio
+
+    import backend.offline as offline
+    from backend.cost_tracker import CostTracker
+
+    _write_challenge(tmp_path, "sparse", KEYED)
+    ch = offline.discover_challenges(str(tmp_path))[0]
+
+    class SparseSwarm:
+        retire_reason = ""
+
+        def __init__(self, *args, **kwargs):
+            self.cancel_event = asyncio.Event()
+            self.winner = None
+            self.winner_spec = ""
+
+        async def run(self):
+            raise RuntimeError("the actual problem")
+
+        def kill(self, reason=""):
+            self.cancel_event.set()
+
+        def get_status(self):
+            return {}          # no counters at all
+
+    monkeypatch.setattr("backend.agents.swarm.ChallengeSwarm", SparseSwarm)
+
+    result = await offline._solve_one(ch, _settings(), ["m1"], CostTracker(), 0)
+
+    assert "the actual problem" in result.error, "the real error must survive"
+    assert (result.bumps, result.probe_refuted, result.contradictions) == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
 # The shipped challenge set
 # ---------------------------------------------------------------------------
 

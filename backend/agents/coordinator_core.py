@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
+from backend.message_bus import KIND_CLAIM, KIND_FACT, KIND_VERIFIED
 from backend.prompts import ChallengeMeta
 from backend.solver_base import FLAG_FOUND
 
@@ -48,6 +49,16 @@ def _archive_swarm(deps: CoordinatorDeps, name: str, swarm) -> None:
             "bumps": getattr(swarm, "_total_bumps", 0),
             "failed_approaches": getattr(swarm, "_failed_approaches", []),
             "retire_reason": getattr(swarm, "retire_reason", ""),
+            # Kept in the archive so a post-mortem on a finished challenge can
+            # still tell "explored widely, never converged" from "grinded one
+            # dead paradigm for hours" — the live counters die with the swarm.
+            "stale_breaks": getattr(swarm, "_stale_breaks", 0),
+            "strategist_pivots": getattr(swarm, "_strategist_pivots", 0),
+            "corroborated_facts": sum(1 for f in feed if f["kind"] == KIND_FACT),
+            "probe_verified": sum(1 for f in feed if f["kind"] == KIND_VERIFIED),
+            "unverified_claims": sum(1 for f in feed if f["kind"] == KIND_CLAIM),
+            "probe_refuted": getattr(swarm, "_probe_refuted", 0),
+            "contradictions": getattr(swarm, "_contradictions", 0),
             "agents": agents_hist,
             "shared_feed": feed,
             "finished_at": time.time(),

@@ -26,6 +26,7 @@ dependencies = [
 ctf-solve = "backend.cli:main"
 ctf-bench = "backend.cli:bench"
 ctf-msg = "backend.cli:msg"
+ctf-ask = "backend.cli:ask"
 
 [build-system]
 requires = ["hatchling"]

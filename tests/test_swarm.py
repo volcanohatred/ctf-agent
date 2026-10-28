@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.agents.swarm import ChallengeSwarm, publishable, split_tagged
-from backend.message_bus import KIND_EXCLUDED, KIND_FACT, ChallengeMessageBus
+from backend.message_bus import KIND_CLAIM, KIND_EXCLUDED, KIND_FACT, ChallengeMessageBus
 from backend.solver_base import (
     CANCELLED,
     ERROR,
@@ -362,10 +362,15 @@ async def test_conclude_harvest_is_published_to_the_blackboard() -> None:
 
     posted = _posted(swarm)
     kinds = {f.kind for f in posted}
-    assert KIND_FACT in kinds and KIND_EXCLUDED in kinds
-    fact = next(f.content for f in posted if f.kind == KIND_FACT)
+    # One solver asserting something is a CLAIM, not a fact. Nothing has checked
+    # it, and every sibling plus every future restart payload is built from this
+    # board — promoting it on assertion alone is how a hallucination becomes the
+    # swarm's ground truth.
+    assert KIND_CLAIM in kinds and KIND_EXCLUDED in kinds
+    assert KIND_FACT not in kinds
+    claim = next(f.content for f in posted if f.kind == KIND_CLAIM)
     excluded = next(f.content for f in posted if f.kind == KIND_EXCLUDED)
-    assert "0xDEADBEEF" in fact
+    assert "0xDEADBEEF" in claim
     assert "brute force" in excluded
 
 

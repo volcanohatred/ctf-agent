@@ -72,6 +72,16 @@ class BenchResult:
     retire_reason: str = ""
     infra_failure: bool = False
     bumps: int = 0
+    # Audit trail for the trust/strategy mechanisms. Without these a run that
+    # spent four hours inside one dead paradigm reports exactly the same shape as
+    # one that explored widely: `solved: false`, a high bump count, no reason.
+    stale_breaks: int = 0          # circuit-breaker trips (rounds adding nothing new)
+    strategist_pivots: int = 0     # PIVOT verdicts broadcast
+    corroborated_facts: int = 0    # findings two solvers independently confirmed
+    probe_verified: int = 0        # findings a Verifier probe confirmed on the target
+    unverified_claims: int = 0     # findings still resting on one solver's word
+    probe_refuted: int = 0         # premises a probe DISPROVED — these were believed
+    contradictions: int = 0        # mutually exclusive statement pairs detected
 
 
 def _write_report(out: str, payload: str) -> None:
@@ -151,7 +161,24 @@ async def _solve_one(
     finally:
         result.retire_reason = swarm.retire_reason
         result.infra_failure = "infrastructure" in swarm.retire_reason
-        result.bumps = swarm._total_bumps  # noqa: SLF001 - same package, read-only
+        # Read through the public status snapshot rather than poking privates: it
+        # carries the audit counters too, and those are what let a post-mortem
+        # tell "ground for hours inside one paradigm" apart from "explored widely
+        # and never got close".
+        #
+        # Every access is a .get() with a default, including the pre-existing
+        # `bumps`. This block runs in a `finally`, i.e. usually while handling a
+        # crash — a KeyError raised here would replace the real error and destroy
+        # the only diagnostic anybody was going to get.
+        status = swarm.get_status()
+        result.bumps = int(status.get("bumps", 0) or 0)
+        result.stale_breaks = int(status.get("stale_breaks", 0) or 0)
+        result.strategist_pivots = int(status.get("strategist_pivots", 0) or 0)
+        result.corroborated_facts = int(status.get("corroborated_facts", 0) or 0)
+        result.probe_verified = int(status.get("probe_verified", 0) or 0)
+        result.unverified_claims = int(status.get("unverified_claims", 0) or 0)
+        result.probe_refuted = int(status.get("probe_refuted", 0) or 0)
+        result.contradictions = int(status.get("contradictions", 0) or 0)
         await ctfd.close()
     return result
 
@@ -293,6 +320,13 @@ async def run_benchmark(
                 "retire_reason": r.retire_reason,
                 "infra_failure": r.infra_failure,
                 "bumps": r.bumps,
+                "stale_breaks": r.stale_breaks,
+                "strategist_pivots": r.strategist_pivots,
+                "corroborated_facts": r.corroborated_facts,
+                "probe_verified": r.probe_verified,
+                "unverified_claims": r.unverified_claims,
+                "probe_refuted": r.probe_refuted,
+                "contradictions": r.contradictions,
             }
             for r in results
         ],

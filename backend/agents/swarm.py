@@ -10,10 +10,19 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.agents.solver import Solver
+from backend.agents.verifier_agent import VerificationRunner
 from backend.approaches import build_approach_queue
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
-from backend.message_bus import KIND_EXCLUDED, KIND_FACT, ChallengeMessageBus
+from backend.dedup import dedup_lines, new_lines, normalize
+from backend.message_bus import (
+    KIND_CLAIM,
+    KIND_EXCLUDED,
+    KIND_FACT,
+    KIND_TAGS,
+    KIND_VERIFIED,
+    ChallengeMessageBus,
+)
 from backend.models import DEFAULT_MODELS, escalation_spec, provider_from_spec
 from backend.prompts import ChallengeMeta, list_distfiles
 from backend.skills import SkillRouter
@@ -28,6 +37,7 @@ from backend.solver_base import (
     SolverResult,
     classify_api_error,
 )
+from backend.verifier import VERDICT_FORCE, ClaimQueue, PendingClaim
 
 if TYPE_CHECKING:
     from backend.config import Settings
@@ -176,6 +186,36 @@ class ChallengeSwarm:
     # Dead-end ledger of *published* excluded lines, normalized, so a restated
     # dead end cannot accumulate independently of what the LLM merge catches.
     _seen_dead_ends: list[str] = field(init=False, default_factory=list)
+    # Authorship ledger for asserted fact lines: normalized line → the specs that
+    # reported it. A line one model asserted is a CLAIM; the first time a
+    # *different* spec reports the same line it becomes a corroborated FACT. This
+    # is the gate that stops one model's hallucination from becoming the swarm's
+    # ground truth — the blackboard is injected into every restart as such.
+    _claim_sources: dict[str, set[str]] = field(init=False, default_factory=dict)
+    # Circuit breaker state. `_last_round_novel` is set by _publish_harvest and
+    # consumed once per bump; `_stale_rounds` counts consecutive rounds in which a
+    # solver added NOTHING new to the team (every dead end it reported was already
+    # recorded, every fact already asserted). That is the signature of a solver
+    # micro-tweaking one payload, which no per-command loop detector can see
+    # because each tweak is a genuinely different command.
+    _last_round_novel: dict[str, bool] = field(init=False, default_factory=dict)
+    _stale_rounds: dict[str, int] = field(init=False, default_factory=dict)
+    _stale_breaks: int = field(init=False, default=0)
+    # Strategist: fires at most once per `strategist_every_bumps` swarm-wide bumps.
+    # The generation counter plus the lock is what keeps four solvers bumping
+    # concurrently from paying for four consultations.
+    _strategist_gen: int = field(init=False, default=0)
+    _strategist_pivots: int = field(init=False, default=0)
+    _strategist_failures: int = field(init=False, default=0)
+    _strategist_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
+    # Active verification. Claims awaiting a probe, the runner that drains them,
+    # and the audit counters. The runner is created lazily and started on the
+    # first queued claim so a challenge solved in 40s never pays for a sandbox.
+    _claim_queue: ClaimQueue = field(init=False, default_factory=ClaimQueue)
+    _verifier: VerificationRunner | None = field(init=False, default=None)
+    _probe_verified: int = field(init=False, default=0)
+    _probe_refuted: int = field(init=False, default=0)
+    _contradictions: int = field(init=False, default=0)
     # Swarm-wide distilled state, recomputed at most once per bump generation and
     # shared by every solver restarting in that generation.
     _team_digest: str = field(init=False, default="")
@@ -266,6 +306,43 @@ class ChallengeSwarm:
         solver.deps.notify_coordinator = self._make_notify_fn(model_spec)
         return solver
 
+    def create_verifier(self, model_spec: str, role_prompt: str):
+        """Build a solver instance wearing the Verifier role.
+
+        Reuses the real solver backends rather than a second implementation, so the
+        verifier gets sandbox redirection, loop detection, tracing, the wall-clock
+        budget and shielded teardown for free. Two things are deliberately NOT
+        wired up: no submit_fn and no message_bus, because a verifier must not be
+        able to end the swarm on a flag it found by accident, and it does not post
+        to the board itself — the swarm publishes its verdicts.
+        """
+        provider = provider_from_spec(model_spec)
+        if provider == "claude-sdk":
+            from backend.agents.claude_solver import ClaudeSolver
+            return ClaudeSolver(
+                model_spec=model_spec,
+                challenge_dir=self.challenge_dir,
+                meta=self.meta,
+                ctfd=self.ctfd,
+                cost_tracker=self.cost_tracker,
+                settings=self.settings,
+                cancel_event=self.cancel_event,
+                no_submit=True,
+                role_prompt=role_prompt,
+                conclude_prompt=VERDICT_FORCE,
+            )
+        return Solver(
+            model_spec=model_spec,
+            challenge_dir=self.challenge_dir,
+            meta=self.meta,
+            ctfd=self.ctfd,
+            cost_tracker=self.cost_tracker,
+            settings=self.settings,
+            cancel_event=self.cancel_event,
+            role_prompt=role_prompt,
+            conclude_prompt=VERDICT_FORCE,
+        )
+
     def _collect_team_reports(self) -> list[str]:
         """Raw material for the team digest: the whole blackboard, grouped.
 
@@ -278,7 +355,7 @@ class ChallengeSwarm:
         for f in self.message_bus.findings:
             if not publishable(f.content):
                 continue
-            tag = {"excluded": "✗", "help": "?"}.get(f.kind, "✓")
+            tag = KIND_TAGS.get(f.kind, KIND_TAGS[KIND_FACT])
             grouped.setdefault(f.model, []).append(f"{tag} {f.content.strip()}")
         return [
             f"[{model}]\n" + "\n".join(items)
@@ -434,6 +511,102 @@ class ChallengeSwarm:
         )
         self._pending_extra.append(spec)
 
+    async def _run_strategist(self, force: bool = False) -> str:
+        """Consult the strategist and broadcast its verdict.
+
+        Fires at most once per `strategist_every_bumps` swarm-wide bumps. `force`
+        (the stale-round circuit breaker) bypasses that interval — a solver that
+        has stopped teaching the team anything is precisely when a step-back is
+        overdue, and waiting for the next tick is what let a swarm grind the same
+        payload for hours.
+
+        Concurrency: several solvers bump at once. The generation check sits
+        inside the lock so only the first one pays for the call; the others see
+        the advanced generation and reuse the verdict already on the board.
+
+        Returns "" when the strategist is disabled or produced nothing worth
+        broadcasting. A failed gateway call is silent by design — an invented
+        PIVOT would yank every solver off a working line of attack, which is
+        strictly worse than no opinion at all.
+        """
+        every = int(getattr(self.settings, "strategist_every_bumps", 0) or 0)
+        if every <= 0:
+            return ""
+
+        async with self._strategist_lock:
+            if self.cancel_event.is_set():
+                return ""
+            gen = self._total_bumps // every
+            if not force and gen <= self._strategist_gen:
+                return ""
+            if not force:
+                self._strategist_gen = gen
+
+            from backend.strategist import consult_strategist
+
+            logger.info(
+                f"[{self.meta.name}] Strategist consult "
+                f"({'FORCED by stale-round breaker' if force else f'bump {self._total_bumps}'})"
+            )
+            try:
+                verdict = await consult_strategist(
+                    name=self.meta.name,
+                    category=self.meta.category,
+                    value=self.meta.value,
+                    tags=self.meta.tags,
+                    connection=self.meta.connection_info,
+                    distfiles=list_distfiles(self.challenge_dir),
+                    description=self.meta.description,
+                    dead_ends=list(self._seen_dead_ends),
+                    failed_approaches=list(self._failed_approaches),
+                    bumps=self._total_bumps,
+                    settings=self.settings,
+                    cost_tracker=self.cost_tracker,
+                    agent_name=f"{self.meta.name}/strategist",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — the strategist is an enhancement
+                logger.warning(f"[{self.meta.name}] strategist failed: {e}")
+                return ""
+
+            if not verdict.available:
+                # A dead strategist and a strategist that said "carry on" must not
+                # look the same. Measured against a live gateway, the original 60s
+                # timeout failed on every single call while logging at debug level,
+                # so the mechanism was silently dead and the operator had no way to
+                # know the strategy was never being reviewed.
+                self._strategist_failures += 1
+                logger.warning(
+                    f"[{self.meta.name}] Strategist produced NO verdict "
+                    f"({verdict.reason}) — failure #{self._strategist_failures}. "
+                    "The strategy was not reviewed this round; if this repeats, check "
+                    "STRATEGIST_TIMEOUT_S / STRATEGIST_MAX_TOKENS / the model name."
+                )
+                return ""
+
+            text = verdict.broadcast_text
+            await self.message_bus.broadcast(text, source="strategist")
+            if verdict.pivot:
+                self._strategist_pivots += 1
+                logger.warning(f"[{self.meta.name}] Strategist PIVOT → {verdict.text[:200]}")
+                if self.coordinator_inbox is not None:
+                    # Best-effort: a coordinator notification must never be able to
+                    # kill the solver round that asked for it.
+                    try:
+                        self.coordinator_inbox.put_nowait(
+                            f"STRATEGIST PIVOT on '{self.meta.name}' after {self._total_bumps} "
+                            f"bumps: {verdict.text[:300]} — broadcast to all solvers. Do not "
+                            "steer them back to the excluded directions."
+                        )
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            f"[{self.meta.name}] coordinator inbox full — pivot notice dropped"
+                        )
+            else:
+                logger.info(f"[{self.meta.name}] Strategist CONTINUE ({verdict.text[:120]})")
+            return text
+
     async def _run_escalated_solver(self, model_spec: str) -> SolverResult | None:
         """Run an escalation solver seeded with the full dead-end ledger."""
         solver = self._create_solver(model_spec)
@@ -556,44 +729,359 @@ class ChallengeSwarm:
                 summary = ""
         await self.message_bus.post(model_spec, content, kind=kind, summary=summary)
 
+    # Bound on the authorship ledger. Keys are short normalized lines, so this is
+    # a few hundred KB at worst; the cap exists so an unlimited-rounds coordinator
+    # run cannot grow it for the lifetime of the process. Oldest keys are evicted,
+    # which can only ever demote a very old corroborated fact back to a claim.
+    MAX_CLAIM_KEYS = 2000
+
+    def _classify_claims(
+        self, model_spec: str, facts: list[str]
+    ) -> tuple[list[str], list[str], bool]:
+        """Split asserted fact lines into corroborated vs single-source.
+
+        Returns `(corroborated, claims, taught_something_new)`.
+
+        A line is corroborated the first time a DIFFERENT spec reports it — two
+        models independently reaching the same conclusion is evidence, one model
+        asserting it is not. Two rules make that hold:
+
+          * the same spec re-asserting its own line (routine after a session wipe)
+            is skipped, not counted — otherwise a model could promote its own
+            hallucination simply by surviving a restart and repeating it;
+          * a line already corroborated by an earlier pair is skipped, so a third
+            agreement does not post the same fact to the board a second time.
+        """
+        corroborate = bool(getattr(self.settings, "corroborate_facts", True))
+        corroborated: list[str] = []
+        claims: list[str] = []
+        novel = False
+
+        for line in dedup_lines(facts):
+            key = normalize(line)
+            if not key:
+                continue
+            sources = self._claim_sources.get(key)
+            first_time = sources is None
+            if first_time:
+                sources = set()
+                self._claim_sources[key] = sources
+                novel = True
+
+            if model_spec in sources:
+                continue
+            if not first_time and len(sources) >= 2:
+                sources.add(model_spec)
+                continue
+
+            if first_time and corroborate:
+                claims.append(line)
+            else:
+                # Either the trust gate is off (post as a fact, as before) or a
+                # different solver has now independently reported this line.
+                corroborated.append(line)
+                if not first_time:
+                    novel = True
+            sources.add(model_spec)
+
+        while len(self._claim_sources) > self.MAX_CLAIM_KEYS:
+            self._claim_sources.pop(next(iter(self._claim_sources)), None)
+        return corroborated, claims, novel
+
     async def _publish_harvest(self, model_spec: str, text: str) -> None:
         """Publish a round's output, routing tagged lines to the right kind.
 
-        Untagged output is published as a neutral FACT. Labeling a whole failed
-        round as an excluded dead end — as an earlier revision did — tells
-        siblings "do NOT retry this" about content that is mostly confirmed
-        observations.
+        Untagged output is published as a CLAIM, never as an excluded dead end
+        (labeling a whole failed round "do NOT retry this" tells siblings that
+        mostly-confirmed observations were ruled out) and never as a corroborated
+        fact either (one model's prose is not ground truth).
 
         Dead ends are additionally de-duplicated structurally, before the LLM
         ever sees them: a restated dead end must not grow the "do not retry"
         list, and the ledger is what steers every subsequent round.
+
+        Records whether the round taught the team anything new — the input to the
+        stale-round circuit breaker in `_run_solver_loop`.
         """
         if not publishable(text):
             return
         excluded, facts = split_tagged(text)
         posted = False
+        novel = False
+        # Everything this round asserts, collected for the contradiction audit.
+        statements: list[str] = []
         if excluded:
-            from backend.dedup import new_lines
-
             fresh = new_lines(excluded, self._seen_dead_ends)
             if fresh:
                 self._seen_dead_ends.extend(fresh)
                 body = "\n".join(f"- {e}" for e in fresh)
                 await self._post_finding(model_spec, body, KIND_EXCLUDED)
+                statements.extend(fresh)
                 posted = True
-            elif excluded:
+                novel = True
+            else:
                 logger.debug(
                     f"[{self.meta.name}/{model_spec}] {len(excluded)} dead end(s) "
                     "already recorded — not republishing"
                 )
         if facts:
-            from backend.dedup import dedup_lines
+            # Untagged prose is classified as ONE unit rather than line by line:
+            # it is a narrative, not a set of discrete assertions, and splitting
+            # it would put a dozen half-sentences on the board as separate claims.
+            # It still goes through the same ledger, so a solver re-reporting the
+            # same summary after a session wipe cannot grow the board with it.
+            tagged = any(_match_tag(line.strip()) for line in text.splitlines())
+            units = facts if tagged else ["\n".join(f.strip() for f in facts if f.strip())]
+            corroborated, claims, fact_novel = self._classify_claims(model_spec, units)
+            novel = novel or fact_novel
+            statements.extend(corroborated)
+            statements.extend(claims)
+            if corroborated:
+                keys = {normalize(line) for line in corroborated}
+                # Promote the ORIGINAL claim too, so the board never carries the
+                # same statement at two trust levels.
+                promoted = await self.message_bus.promote_claims(keys)
+                if promoted:
+                    logger.info(
+                        f"[{self.meta.name}] {promoted} single-source claim(s) "
+                        f"corroborated by {model_spec} → promoted to fact"
+                    )
+                for line in corroborated:
+                    await self._post_finding(model_spec, line, KIND_FACT)
+                posted = True
+            # One finding per claim: promotion flips a whole finding, so a
+            # multi-line blob could never be promoted without dragging its
+            # still-unverified neighbours along with it.
+            for line in claims:
+                await self._post_finding(model_spec, line, KIND_CLAIM)
+                posted = True
+                self._enqueue_for_verification(line, model_spec)
+            if not corroborated and not claims:
+                logger.debug(
+                    f"[{self.meta.name}/{model_spec}] every reported finding was "
+                    "already on the board — nothing to publish"
+                )
+        if not posted and not excluded and not facts:
+            # Publishable but structurally empty. Posting it would put noise on the
+            # board; staying silent is what the "nothing harvestable" path already
+            # does for a failed conclude.
+            logger.debug(f"[{self.meta.name}/{model_spec}] harvest had no content")
+        self._last_round_novel[model_spec] = novel
+        await self._audit_contradictions(model_spec, statements)
 
-            body = "\n".join(f"- {f}" for f in dedup_lines(facts))
-            await self._post_finding(model_spec, body, KIND_FACT)
-            posted = True
-        if not posted:
-            await self._post_finding(model_spec, text, KIND_FACT)
+    async def _audit_contradictions(self, model_spec: str, new_statements: list[str]) -> None:
+        """Check what this round just wrote against what the board already says.
+
+        Two agents holding mutually exclusive beliefs both look productive from the
+        inside; only a comparison across the whole board surfaces it. Detection is
+        worthless unless it triggers a test, so each conflict is broadcast AND both
+        sides are pushed to the front of the verification queue — that is the A/B
+        confrontation, and the probe is what settles it rather than another opinion.
+        """
+        if not new_statements or not bool(getattr(self.settings, "audit_contradictions", True)):
+            return
+        if self.cancel_event.is_set():
+            return
+
+        from backend.audit import find_contradictions
+
+        existing = [
+            (f.kind, f.summary or f.content)
+            for f in self.message_bus.findings
+            if f.kind in (KIND_VERIFIED, KIND_FACT, KIND_CLAIM, KIND_EXCLUDED)
+        ]
+        try:
+            found = await find_contradictions(
+                new_statements=new_statements,
+                existing=existing,
+                settings=self.settings,
+                cost_tracker=self.cost_tracker,
+                agent_name=f"{self.meta.name}/audit",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the audit must never break a round
+            logger.debug(f"[{self.meta.name}] contradiction audit failed: {e}")
+            return
+
+        for conflict in found:
+            self._contradictions += 1
+            logger.warning(
+                f"[{self.meta.name}] CONTRADICTION between {model_spec}'s report and the "
+                f"board: {conflict.a[:80]!r} vs {conflict.b[:80]!r} ({conflict.why[:100]})"
+            )
+            # Queue both sides BEFORE broadcasting. The notice quotes both
+            # statements, so once it is on the board it becomes the longest
+            # containment match for either fragment — resolving the originals first
+            # keeps the probe pointed at what an agent actually said.
+            for side, who in ((conflict.a, model_spec), (conflict.b, "board")):
+                self._queue_contradiction_side(side, who)
+            await self.message_bus.broadcast(conflict.broadcast_text, source="audit")
+            if self.coordinator_inbox is not None:
+                try:
+                    self.coordinator_inbox.put_nowait(
+                        f"CONTRADICTION on '{self.meta.name}': {conflict.a[:150]} "
+                        f"VS {conflict.b[:150]} ({conflict.why[:150]}). Both sides queued "
+                        "for a probe. Do not tell solvers which one is right — nobody "
+                        "knows yet."
+                    )
+                except asyncio.QueueFull:
+                    logger.debug(f"[{self.meta.name}] inbox full — contradiction notice dropped")
+
+    def _queue_contradiction_side(self, statement: str, source: str) -> None:
+        """Push one side of a conflict to the front of the verification queue.
+
+        The auditor's text may be a paraphrase, so it is matched back to the actual
+        board entry first: probing the wording an agent really used is what makes
+        the result recognisable to it, and reuses the existing queue key so the same
+        claim is not probed twice.
+        """
+        if not bool(getattr(self.settings, "verify_claims", True)):
+            return
+        text = self._board_original(statement) or (statement or "").strip()
+        if not text:
+            return
+        key = normalize(text)
+        if not key:
+            return
+        if not self._claim_queue.push(PendingClaim(
+            content=text[:1500], source=source, key=key, priority=10,
+            enqueued_at=time.time(),
+        )):
+            # Already queued — a conflict is the strongest possible reason to test
+            # it now rather than in FIFO order.
+            self._claim_queue.bump_priority(key)
+        self._ensure_verifier()
+
+    def _board_original(self, paraphrase: str) -> str:
+        """Find the board entry an auditor's quote most likely refers to.
+
+        Broadcasts and help requests are excluded from the search: a contradiction
+        notice quotes BOTH sides of the conflict, so once it is on the board it is
+        the longest containment match for either fragment. Matching it would queue
+        the notice's own text for probing instead of the statement that caused it.
+        """
+        needle = normalize(paraphrase or "")
+        if not needle:
+            return ""
+        candidates = [
+            f for f in self.message_bus.findings
+            if f.kind in (KIND_VERIFIED, KIND_FACT, KIND_CLAIM, KIND_EXCLUDED)
+        ]
+        for f in candidates:
+            if normalize(f.content) == needle:
+                return f.content
+        # Containment, longest first: the auditor routinely quotes a fragment of a
+        # longer entry, and the longest match is the most specific one.
+        best = ""
+        for f in candidates:
+            hay = normalize(f.content)
+            if (needle and hay and (needle in hay or hay in needle)
+                    and len(f.content) > len(best)):
+                best = f.content
+        return best
+
+    # ------------------------------------------------------------------
+    # Active verification
+    # ------------------------------------------------------------------
+
+    # Below this a "claim" is too short to be a testable assertion ("422", "no
+    # flag") and a probe would just burn a sandbox round on noise.
+    MIN_TESTABLE_CLAIM_CHARS = 16
+
+    def _enqueue_for_verification(self, claim: str, source: str) -> None:
+        """Queue a single-source claim for an active probe.
+
+        Multi-line untagged prose is skipped: it is a narrative, not one testable
+        assertion, and a verifier handed a paragraph tests whichever sentence it
+        happens to fixate on while appearing to have checked the whole thing.
+        """
+        if not bool(getattr(self.settings, "verify_claims", True)):
+            return
+        if self.cancel_event.is_set():
+            return
+        text = (claim or "").strip()
+        if not text or "\n" in text or len(text) < self.MIN_TESTABLE_CLAIM_CHARS:
+            return
+        budget = int(getattr(self.settings, "verifier_max_probes", 0) or 0)
+        if budget > 0 and self._probe_verified + self._probe_refuted >= budget:
+            return
+        key = normalize(text)
+        if not key:
+            return
+        if self._claim_queue.push(PendingClaim(content=text, source=source, key=key,
+                                              enqueued_at=time.time())):
+            self._ensure_verifier()
+
+    def _ensure_verifier(self) -> None:
+        """Create and start the runner on first queued claim.
+
+        Lazy on purpose: a challenge solved in 40 seconds, or one whose claims are
+        all untestable, never pays for a verifier container.
+        """
+        if self.cancel_event.is_set():
+            return
+        if self._verifier is None:
+            self._verifier = VerificationRunner(self, self._claim_queue, self._on_verdict)
+        self._verifier.ensure_started()
+
+    async def _on_verdict(self, verdict) -> None:
+        """Apply one probe result to the board.
+
+        The refutation path does three things, and all three are needed: move the
+        claim into the dead-end ledger (so it steers every later round), record the
+        evidence (so nobody re-tests it), and broadcast a prune notice (so RUNNING
+        solvers stop within a few tool calls instead of at their next restart —
+        that difference is what turns a wasted hour into a wasted minute).
+        """
+        from backend.verifier import INCONCLUSIVE, VERIFIED
+
+        key = normalize(verdict.claim)
+        if verdict.verdict == INCONCLUSIVE:
+            return
+
+        if verdict.verdict == VERIFIED:
+            self._probe_verified += 1
+            moved = await self.message_bus.verify_claims({key}, note=verdict.evidence)
+            if not moved:
+                # The original claim was trimmed or already reclassified; the
+                # evidence is still worth having on the board.
+                await self._post_finding("verifier", verdict.board_text, KIND_VERIFIED)
+            logger.info(f"[{self.meta.name}] ✅ probe-verified: {verdict.claim[:90]!r}")
+            return
+
+        self._probe_refuted += 1
+        moved = await self.message_bus.refute_claims({key}, note=verdict.evidence)
+        line = verdict.board_text
+        if line not in self._seen_dead_ends:
+            self._seen_dead_ends.append(line)
+        if not moved:
+            await self._post_finding("verifier", line, KIND_EXCLUDED)
+        # Invalidate the team digest: it was computed while this premise was still
+        # believed, and every restarting solver would otherwise be re-seeded with it.
+        self._team_digest_gen = -1
+        self._team_digest = ""
+        await self.message_bus.broadcast(
+            "⛔ **剪枝通知（探针实测，非推测）**：以下前提已被证伪，所有基于它的工作立即停止。\n"
+            f"被证伪的声称：「{verdict.claim}」\n"
+            f"实测证据：{verdict.evidence}\n"
+            "如果你正在基于这个前提构造 payload 或推导链，现在换方向；已经推出来的结论"
+            "一并作废。",
+            source="verifier",
+        )
+        logger.warning(
+            f"[{self.meta.name}] ⛔ REFUTED and pruned: {verdict.claim[:90]!r} "
+            f"({verdict.evidence[:120]})"
+        )
+        if self.coordinator_inbox is not None:
+            try:
+                self.coordinator_inbox.put_nowait(
+                    f"VERIFIER REFUTED a premise on '{self.meta.name}': "
+                    f"{verdict.claim[:200]} — evidence: {verdict.evidence[:200]}. "
+                    "Prune notice broadcast; do not steer solvers back to it."
+                )
+            except asyncio.QueueFull:
+                logger.warning(f"[{self.meta.name}] coordinator inbox full — refutation dropped")
 
     async def _fresh_restart(self, solver, model_spec: str, result: SolverResult,
                              reason: str, bump_count: int) -> None:
@@ -810,6 +1298,13 @@ class ChallengeSwarm:
         await solver.start()
 
         while not self.cancel_event.is_set():
+            # Per-round breaker state, reset up front so a round that never
+            # reaches _publish_harvest cannot inherit the previous round's
+            # verdict and so the `stale`/`stale_break` reads below are always
+            # bound on the first iteration.
+            self._last_round_novel[model_spec] = False
+            stale = 0
+            stale_break = False
             try:
                 # The budget is enforced INSIDE the solver so the turn can be
                 # interrupted through the SDK (session preserved, phase 2
@@ -919,6 +1414,33 @@ class ChallengeSwarm:
 
             self._maybe_escalate()
 
+            # ---- stale-round circuit breaker + periodic strategist ----
+            # Consumed here rather than in _publish_harvest so a round that
+            # published nothing at all still counts as teaching the team nothing.
+            # Infra failures and empty spins are excluded: those belong to the
+            # infra guard, and tripping the breaker on a flaky gateway would
+            # redirect a solver that never got to try anything.
+            if result.is_infra_failure or not result.did_work or overflowed:
+                self._last_round_novel.pop(model_spec, None)
+            else:
+                limit = int(getattr(self.settings, "stale_round_limit", 0) or 0)
+                stale = (
+                    0 if self._last_round_novel.pop(model_spec, False)
+                    else self._stale_rounds.get(model_spec, 0) + 1
+                )
+                self._stale_rounds[model_spec] = stale
+                if limit > 0 and stale >= limit:
+                    self._stale_rounds[model_spec] = 0
+                    self._stale_breaks += 1
+                    stale_break = True
+                    logger.warning(
+                        f"[{self.meta.name}/{model_spec}] STALE-ROUND BREAKER: {stale} "
+                        "consecutive rounds added nothing new to the team (every dead "
+                        "end already recorded, every fact already asserted) — forcing "
+                        "a strategist consult and a hard redirect"
+                    )
+            await self._run_strategist(force=stale_break)
+
             # Cooldown between bumps — check cancellation during wait
             if not await self._sleep_or_cancel(self._bump_cooldown(bump_count)):
                 break  # cancelled during cooldown
@@ -939,6 +1461,22 @@ class ChallengeSwarm:
                 )
             else:
                 reason = "Your previous attempt did not find the flag."
+
+            if stale_break:
+                # Folded into `reason` rather than passed as a new argument: both
+                # bump paths already surface it under 【上一轮为何结束】, which is
+                # exactly where a solver looks for "what do I do differently now".
+                reason += (
+                    f"\n\n⛔ **熔断触发**：你连续 {stale} 轮没有为团队贡献任何新信息——"
+                    "你报告的每个死路都已被记录过，每条结论都已有人断言过。这说明你在"
+                    "微调同一个方向，而不是在探索。\n"
+                    "**本轮硬性要求**：\n"
+                    "1. 禁止再改动当前 payload 的字段名/编码/嵌套层数——这类微调已被证明无效。\n"
+                    "2. 重读题面描述原文，逐句问：哪个细节至今没有被我解释过？\n"
+                    "3. 选一个与【已排除的死路】**正交**的攻击面。若战略家刚刚广播了 PIVOT，"
+                    "优先按它走。\n"
+                    "4. 如果确证所有面都已排除，就用 `request_help` 说明你不懂的具体技术点。"
+                )
 
             # An overflow already wiped the history, so the continue-session bump
             # would be talking to an empty session with no state carried over —
@@ -1065,6 +1603,23 @@ class ChallengeSwarm:
             self.cancel_event.set()
             await self._wind_down(tasks)
             return None
+        finally:
+            # The verifier owns a sandbox that nothing else tracks. Every exit path
+            # — win, retire, external cancel, crash — has to tear it down or it
+            # leaks a container and a workspace per challenge, which is the exact
+            # failure `_wind_down` exists to prevent for solvers.
+            await self._stop_verifier()
+
+    async def _stop_verifier(self) -> None:
+        verifier, self._verifier = self._verifier, None
+        if verifier is None:
+            return
+        try:
+            await verifier.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — teardown must not mask the real outcome
+            logger.warning(f"[{self.meta.name}] verifier stop failed: {e}")
 
     def kill(self, reason: str = "") -> None:
         """Cancel all agents for this challenge.
@@ -1094,10 +1649,29 @@ class ChallengeSwarm:
             "bumps": self._total_bumps,
             "retire_reason": self._retire_reason,
             "infra_failures": self._infra_failures,
+            # Audit trail for the two anti-hallucination mechanisms. Without these
+            # a run that ground for hours looks identical in the report to one
+            # that was making progress the whole time.
+            "stale_breaks": self._stale_breaks,
+            "strategist_pivots": self._strategist_pivots,
+            "strategist_failures": self._strategist_failures,
+            "corroborated_facts": sum(
+                1 for f in self.message_bus.findings if f.kind == KIND_FACT
+            ),
+            "probe_verified": sum(
+                1 for f in self.message_bus.findings if f.kind == KIND_VERIFIED
+            ),
+            "unverified_claims": sum(
+                1 for f in self.message_bus.findings if f.kind == KIND_CLAIM
+            ),
+            "probe_refuted": self._probe_refuted,
+            "contradictions": self._contradictions,
+            "claims_queued": len(self._claim_queue),
             "agents": {
                 spec: {
                     "findings": self.findings.get(spec, ""),
                     "tool_calls": getattr(self.solvers.get(spec), "_tool_calls", 0),
+                    "stale_rounds": self._stale_rounds.get(spec, 0),
                     "status": (
                         "won" if (self.winner and self.winner_spec == spec)
                         else "running" if (spec in self.solvers and not self.cancel_event.is_set())

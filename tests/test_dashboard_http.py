@@ -86,6 +86,7 @@ async def test_every_route_rejects_an_unauthenticated_client() -> None:
                 ("POST", "/api/advise", {"challenge": "chal", "model_spec": "m", "advice": "x"}),
                 ("POST", "/api/bump", {"challenge": "chal", "model_spec": "m"}),
                 ("POST", "/api/broadcast", {"challenge": "chal", "message": "x"}),
+                ("POST", "/api/ask", {"challenge": "chal", "question": "progress?"}),
                 ("POST", "/api/spawn", {"challenge": "chal"}),
                 ("GET", "/", None),
             ]:

@@ -266,6 +266,30 @@ def context_window(spec: str) -> int:
     return CONTEXT_WINDOWS.get(model_id_from_spec(spec), 200_000)
 
 
+# Judgement calls — the Strategist's PIVOT/CONTINUE and the contradiction audit —
+# are reasoning tasks, not summarization. Measured against a live gateway on the
+# same input, the flash summarizer model answered "NONE" to a plain contradiction
+# (finish_reason=stop, so not a truncation: it genuinely could not see it) while a
+# reasoning model found it in 8.7s with a correct explanation. Routing these
+# through SUMMARIZER_MODEL made both mechanisms decorative, and both fail SILENTLY,
+# so nothing downstream looked wrong.
+DEFAULT_REASONING_MODEL = "qwen3.8-max"
+
+
+def resolve_reasoning_model(settings: object, override: str = "") -> str:
+    """Model for judgement calls, as opposed to `summarizer_model` for condensing.
+
+    Resolution: an explicit per-call override → REASONING_MODEL →
+    COORDINATOR_MODEL → the built-in default. Never the summarizer: see above.
+    """
+    return (
+        (override or "").strip()
+        or str(getattr(settings, "reasoning_model", "") or "").strip()
+        or str(getattr(settings, "coordinator_model", "") or "").strip()
+        or DEFAULT_REASONING_MODEL
+    )
+
+
 # Preference order for the escalation ladder: strongest/most-capable first.
 # Only used for entries not already in the running lineup.
 ESCALATION_CANDIDATES: tuple[str, ...] = (

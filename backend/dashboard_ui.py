@@ -112,6 +112,14 @@ const openTraces = new Set();   // trace panels to keep open across refreshes
 let gTextContent = '';          // guidance textarea content — survives refreshes
 let gTextFocused = false;       // whether the operator is actively typing
 let gTextCaret = 0;             // caret position to restore after re-render
+// Command-centre chat, per challenge. The panel re-renders on every poll, so the
+// conversation has to live outside the DOM or asking a follow-up would wipe the
+// answer you are still reading.
+const CHAT = {};                // challenge -> [{role, content, meta}]
+let askText = '';               // question being typed — survives refreshes
+let askFocused = false;
+let askCaret = 0;
+let askBusy = false;            // one request at a time; the dossier is not cheap
 
 // HTML-escape INCLUDING quotes. `textContent → innerHTML` only escapes & < >,
 // which is not enough for values interpolated into attributes or inline
@@ -212,6 +220,7 @@ async function renderDetail() {
       <span class="kv">类别 <b>${esc(s.category)}</b></span>
       <span class="kv">分值 <b>${s.value}</b></span>
       <span class="kv">bump <b>${s.bumps || 0}</b> 次</span>
+      <span class="kv" title="探针实测确认 / 双模型独立证实 / 仅单一模型声称未证实">✅ <b>${s.probe_verified || 0}</b> · ✓ <b>${s.corroborated_facts || 0}</b> · ⚠ <b>${s.unverified_claims || 0}</b></span>
       <span class="kv">本题成本 <b>$${cost.toFixed(3)}</b></span>
       <span class="kv">状态 <b>${statusTxt}</b></span>
     </div>
@@ -226,6 +235,16 @@ async function renderDetail() {
     html += `<div class="ledger" style="margin-top:8px">⏹ swarm 自行退役：<b>${esc(s.retire_reason)}</b></div>`;
   if (s.infra_failures)
     html += `<div class="ledger" style="margin-top:4px">⚠ 连续基础设施失败 ${esc(s.infra_failures)} 次（网关/网络问题，不是解题方向问题）</div>`;
+  if (s.probe_refuted)
+    html += `<div class="ledger" style="margin-top:4px">⛔ Verifier 实测证伪 <b>${esc(s.probe_refuted)}</b> 个前提（已移入死路账本并广播剪枝）</div>`;
+  if (s.contradictions)
+    html += `<div class="ledger" style="margin-top:4px">⚡ 检测到 <b>${esc(s.contradictions)}</b> 处自相矛盾（两侧都已送探针对质）</div>`;
+  if (s.claims_queued)
+    html += `<div class="ledger" style="margin-top:4px">🔬 待检验声称：${esc(s.claims_queued)} 条</div>`;
+  if (s.stale_breaks)
+    html += `<div class="ledger" style="margin-top:4px">⛔ 熔断触发 ${esc(s.stale_breaks)} 次：有 solver 连续多轮没有贡献任何新信息（在微调同一个方向）</div>`;
+  if (s.strategist_pivots)
+    html += `<div class="ledger" style="margin-top:4px">🧭 战略家判定需要更换攻击面 ${esc(s.strategist_pivots)} 次（PIVOT 已广播到黑板）</div>`;
   if (s.failed_approaches && s.failed_approaches.length)
     html += `<div class="ledger" style="margin-top:8px">🚫 已排除方向：${esc(s.failed_approaches.join('、'))}</div>`;
   html += `</div>`;
@@ -305,16 +324,36 @@ async function renderDetail() {
 
   // shared-experience feed (blackboard): facts + dead-ends + broadcasts
   if (s.shared_feed && s.shared_feed.length) {
-    html += `<div class="panel"><div style="color:var(--blue);font-weight:600;margin-bottom:6px">📋 共享经验与踩坑记录（模型间的黑板）</div><div style="max-height:240px;overflow-y:auto">`;
+     html += `<div class="panel"><div style="color:var(--blue);font-weight:600;margin-bottom:6px">📋 共享经验与踩坑记录（模型间的黑板）</div>
+     <div class="muted" style="font-size:11px;margin-bottom:6px">✅ 探针实测确认 &nbsp;·&nbsp; ✓ 双模型独立证实 &nbsp;·&nbsp; ⚠ 仅单一模型声称（未证实） &nbsp;·&nbsp; ✗ 已排除死路/被证伪 &nbsp;·&nbsp; 📢 协调者/战略家指示</div>
+     <div style="max-height:240px;overflow-y:auto">`;
     for (const f of [...s.shared_feed].reverse()) {
       const ts = new Date(f.ts * 1000).toLocaleTimeString();
       const mdl = (f.model || '').replace('claude-sdk/', '');
       if (f.kind === 'excluded') html += `<div style="color:var(--red);font-size:12px;margin:3px 0">✗ [${ts}] <b>${esc(mdl)}</b> 排除: ${esc(f.content)}</div>`;
-      else if (f.kind === 'broadcast') html += `<div style="color:var(--amber);font-size:12px;margin:3px 0">📢 [${ts}] <b>${esc(mdl)}</b>: ${esc(f.content)}</div>`;
+      else if (f.kind === 'claim') html += `<div style="color:var(--amber);font-size:12px;margin:3px 0">⚠ [${ts}] <b>${esc(mdl)}</b> <i>未证实声称</i>: ${esc(f.content)}</div>`;
+      else if (f.kind === 'verified') html += `<div style="color:var(--teal);font-size:12px;margin:3px 0">✅ [${ts}] <b>${esc(mdl)}</b> <i>探针实证</i>: ${esc(f.content)}</div>`;
+      else if (f.kind === 'broadcast') html += `<div style="color:var(--purple);font-size:12px;margin:3px 0">📢 [${ts}] <b>${esc(mdl)}</b>: ${esc(f.content)}</div>`;
       else html += `<div style="color:var(--green);font-size:12px;margin:3px 0">✓ [${ts}] <b>${esc(mdl)}</b>: ${esc(f.content)}</div>`;
     }
     html += `</div></div>`;
   }
+
+  // command-centre chat — ask about this challenge, then act on the answer below
+  html += `<div class="panel" style="border-left:3px solid var(--teal)">
+      <div style="color:var(--teal);font-weight:600;margin-bottom:6px">🎙 指挥台问答（把这题的全部进度+黑板喂给大模型，给你做总结）</div>
+      <div class="muted" style="margin-bottom:6px">每次提问都会<b>重新抓取当前实时状态</b>（不复用旧快照）。回答会保留 ✅/✓/⚠/✗ 信任等级——
+        ⚠ 只是某个模型单方面声称、<b>没有验证过</b>，别照它下指令。</div>
+      <div id="chatlog" style="max-height:420px;overflow-y:auto;margin-bottom:8px">${renderChat(SEL)}</div>
+      <textarea id="askBox" oninput="askText=this.value;askCaret=this.selectionStart"
+        onfocus="askFocused=true" onblur="askFocused=false"
+        onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();sendAsk();}"
+        placeholder="例如：这题现在什么进展？／ 队伍卡在哪个范式上？／ 有哪些说法还没被验证？／ 我该给哪个 solver 发什么指令？"></textarea>
+      <button id="askBtn" onclick="sendAsk()">🎙 问参谋（Ctrl+Enter）</button>
+      <button class="ghost" onclick="clearChat()">🗑 清空对话</button>
+      <span class="muted" id="askMeta" style="margin-left:8px"></span>
+      <div class="muted" style="margin-top:6px">回答末尾的【建议指令】可一键填入下方指导信箱。</div>
+    </div>`;
 
   // guidance panel
   html += `<div class="panel guide">
@@ -337,6 +376,145 @@ async function renderDetail() {
       try { gt.setSelectionRange(gTextCaret, gTextCaret); } catch (e) {}
     }
   }
+  // Same for the question box: a poll landing mid-sentence must not eat it.
+  const at = document.getElementById('askBox');
+  if (at && askText) {
+    at.value = askText;
+    if (askFocused) {
+      at.focus();
+      try { at.setSelectionRange(askCaret, askCaret); } catch (e) {}
+    }
+  }
+  if (askBusy) setAskBusy(true);
+  const log = document.getElementById('chatlog');
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Command-centre chat
+// ---------------------------------------------------------------------------
+
+function chatFor(name) {
+  if (!CHAT[name]) CHAT[name] = [];
+  return CHAT[name];
+}
+
+function renderChat(name) {
+  const msgs = chatFor(name);
+  if (!msgs.length) {
+    return `<div class="muted" style="padding:6px 0">还没有提问。这道题的完整状态档案（黑板按信任等级分组、
+      死路账本、各 solver 实时 trace、审计计数）会随每次提问一起发给模型。</div>`;
+  }
+  let out = '';
+  for (const m of msgs) {
+    if (m.role === 'user') {
+      out += `<div style="margin:8px 0 4px;text-align:right"><span style="display:inline-block;background:var(--blue);color:#fff;
+        padding:6px 10px;border-radius:8px;max-width:85%;text-align:left;white-space:pre-wrap">${esc(m.content)}</span></div>`;
+    } else if (m.role === 'error') {
+      out += `<div style="color:var(--red);font-size:12px;margin:4px 0">⚠ ${esc(m.content)}</div>`;
+    } else {
+      out += `<div style="margin:4px 0 10px"><div style="background:var(--card);border:1px solid var(--border);
+        border-radius:8px;padding:8px 10px;white-space:pre-wrap;font-size:13px;line-height:1.55">${esc(m.content)}</div>`;
+      if (m.meta) out += `<div class="muted" style="font-size:11px;margin-top:3px">${esc(m.meta)}</div>`;
+      // Pull the 【建议指令】 block out so it can be sent without retyping it.
+      const sug = extractSuggestions(m.content);
+      if (sug.length) {
+        out += `<div style="margin-top:5px">`;
+        for (const s of sug) {
+          out += `<button class="ghost" style="font-size:11px;margin:2px 4px 2px 0"
+            onclick="useSuggestion(this)" data-s="${esc(s)}">↘ 填入指导信箱：${esc(s.slice(0, 42))}${s.length > 42 ? '…' : ''}</button>`;
+        }
+        out += `</div>`;
+      }
+      out += `</div>`;
+    }
+  }
+  return out;
+}
+
+function extractSuggestions(text) {
+  const out = [];
+  const block = String(text || '').split('【建议指令】')[1];
+  if (!block) return out;
+  for (const raw of block.split('\n')) {
+    const line = raw.replace(/^\s*[-*•]\s*/, '').trim();
+    if (line.length >= 6) out.push(line);
+  }
+  return out.slice(0, 4);
+}
+
+function useSuggestion(btn) {
+  const text = btn.getAttribute('data-s') || '';
+  gTextContent = text;
+  const gt = document.getElementById('gText');
+  if (gt) {
+    gt.value = text;
+    gt.focus();
+    gt.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  toast('已填入指导信箱——选好目标 solver 后发送');
+}
+
+function setAskBusy(busy) {
+  askBusy = busy;
+  const btn = document.getElementById('askBtn');
+  if (btn) { btn.disabled = busy; btn.textContent = busy ? '⏳ 参谋思考中…' : '🎙 问参谋（Ctrl+Enter）'; }
+}
+
+function clearChat() {
+  if (SEL) CHAT[SEL] = [];
+  const log = document.getElementById('chatlog');
+  if (log) log.innerHTML = renderChat(SEL);
+}
+
+async function sendAsk() {
+  const box = document.getElementById('askBox');
+  const question = (box ? box.value : askText).trim();
+  if (!SEL) { toast('先选一道题'); return; }
+  if (!question) { toast('先写问题'); return; }
+  if (askBusy) { toast('上一个问题还在处理'); return; }
+
+  const msgs = chatFor(SEL);
+  // Only real Q&A pairs go back as history — errors would teach the model its own
+  // failure text as if it had said it.
+  const history = msgs.filter(m => m.role !== 'error')
+                      .map(m => ({ role: m.role, content: m.content })).slice(-8);
+  msgs.push({ role: 'user', content: question });
+  askText = '';
+  if (box) box.value = '';
+  setAskBusy(true);
+  const log = document.getElementById('chatlog');
+  if (log) { log.innerHTML = renderChat(SEL); log.scrollTop = log.scrollHeight; }
+
+  let res;
+  try {
+    res = await api('/api/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challenge: SEL, question, history })
+    });
+  } catch (e) {
+    msgs.push({ role: 'error', content: '请求失败：' + (e && e.message ? e.message : e) });
+    setAskBusy(false);
+    if (log) log.innerHTML = renderChat(SEL);
+    return;
+  }
+  setAskBusy(false);
+
+  if (res && res.answer) {
+    const bits = [];
+    if (res.model) bits.push(res.model);
+    if (res.seconds) bits.push(res.seconds + 's');
+    if (res.dossier_chars) bits.push('档案 ' + Math.round(res.dossier_chars / 1000) + 'k 字符');
+    if (res.trimmed && res.trimmed.length) bits.push('已截断 ' + res.trimmed.length + ' 处');
+    msgs.push({ role: 'assistant', content: res.answer, meta: bits.join(' · ') });
+    if (res.error) msgs.push({ role: 'error', content: res.error });
+  } else {
+    msgs.push({ role: 'error', content: (res && res.error) || '没有拿到回答' });
+  }
+  const log2 = document.getElementById('chatlog');
+  if (log2) { log2.innerHTML = renderChat(SEL); log2.scrollTop = log2.scrollHeight; }
+  const meta = document.getElementById('askMeta');
+  if (meta) meta.textContent = '';
 }
 
 function prepAdvise(spec) { SELSPEC = spec; const t = document.getElementById('gTarget'); if (t) t.textContent = spec; toast('已选定 ' + spec + '，写内容后点发送'); }

@@ -208,6 +208,94 @@ class Settings(BaseSettings):
     sibling_digest_refresh_bumps: int = 1
     # Model used for blackboard summarization (fast/cheap gateway model).
     summarizer_model: str = "deepseek-v4-flash"
+    # Fact trust gate. A finding one solver asserts is posted as an UNVERIFIED
+    # CLAIM; it is promoted to a corroborated FACT only when a DIFFERENT solver
+    # independently reports the same thing. This is what stops one model's
+    # hallucination from becoming the swarm's ground truth — every restart payload
+    # is built from the board, and siblings previously had no way to tell a
+    # three-model consensus from a single model's say-so. Turn off to restore the
+    # old "everything a solver reports is a fact" behaviour.
+    corroborate_facts: bool = True
+    # Active verification. Corroboration can only WITHHOLD trust — it can never
+    # refute a false premise (which stays on the board, still readable, still
+    # tempting) and it can never confirm a true one that is hard to rediscover
+    # (which stays ⚠ forever and gets under-weighted). Both holes close the same
+    # way: somebody actually runs a test. The Verifier owns one sandbox per swarm,
+    # reused across claims, and runs concurrently with the solvers so it costs no
+    # wall-clock. REFUTED claims move into the dead-end ledger and broadcast a
+    # prune notice that reaches running solvers within a few tool calls.
+    verify_claims: bool = True
+    # Model spec for the Verifier. Empty = the first solver in the lineup.
+    # Verification is judgement-heavy: a weak model returns INCONCLUSIVE for
+    # everything, which is safe but useless.
+    verifier_model: str = ""
+    # Wall-clock budget for ONE probe. Kept well below SOLVER_TIME_BUDGET_S — a
+    # verification that needs 25 minutes is not a minimal test.
+    verifier_budget_s: int = 300
+    # Pre-filter each claim with one cheap call: is it testable by a probe, and
+    # would its falsity invalidate other agents' work? Claims that are neither get
+    # skipped. This is not a cost control, it is a wall-clock control: a probe that
+    # cannot falsify anything still occupies the verifier for a whole round.
+    verifier_triage: bool = True
+    # Hard cap on decisive probes per challenge. 0 = unlimited (the claim queue is
+    # bounded regardless). Raise it if you want an exhaustive audit and do not care
+    # how long it takes.
+    verifier_max_probes: int = 0
+    # Consult the Strategist every N swarm-wide bumps. It sees ONLY the challenge
+    # metadata and the dead-end ledger — never the tactical findings that drown
+    # the signal — and must answer CONTINUE or PIVOT with a new attack surface.
+    # The verdict is broadcast as a strategist message, kept visually distinct
+    # from a corroborated fact. 0 disables.
+    strategist_every_bumps: int = 4
+    # Model for the Strategist. Empty = COORDINATOR_MODEL, else a strong built-in
+    # default. Deliberately NOT SUMMARIZER_MODEL: this is deep semantic reasoning
+    # over the challenge text, and a flash model just rubber-stamps CONTINUE.
+    strategist_model: str = ""
+    # Model for judgement calls generally (Strategist + contradiction audit) —
+    # reasoning, not summarization. Both fall back to COORDINATOR_MODEL then a
+    # built-in default. SUMMARIZER_MODEL is never used for these: measured against a
+    # live gateway, the flash summarizer answered "no contradiction" to an
+    # unambiguous conflicting pair (finish_reason=stop, so not truncation — it
+    # genuinely could not see it), and both mechanisms fail silently, so a weak model
+    # here does not degrade them, it deletes them.
+    reasoning_model: str = ""
+    # Wall clock for ONE strategist consultation. Measured 100-150s on a reasoning
+    # model, which spends ~3000 tokens thinking before it answers. The original 60s
+    # default failed on every call and was logged at debug level, so the mechanism
+    # was silently dead in production while looking configured and healthy.
+    strategist_timeout_s: float = 300.0
+    # Completion budget for the strategist. At 1200 a reasoning model came back
+    # finish_reason="length" having used 6743 tokens, so the verdict line was never
+    # emitted and the truncated tail read as CONTINUE — the opposite of what the
+    # model had concluded.
+    strategist_max_tokens: int = 8000
+    # Contradiction audit overrides. Empty/0 = use REASONING_MODEL and the
+    # module defaults.
+    audit_model: str = ""
+    audit_timeout_s: float = 120.0
+    audit_max_tokens: int = 4000
+    # Command-centre chat ("what is the progress on X?"). Summarises a challenge's
+    # entire live state — blackboard, per-solver traces, dead ends, audit counters —
+    # for an operator who cannot read four hours of logs. Also a reasoning task: it
+    # must not upgrade a ⚠ claim into a fact while summarising, or the operator
+    # steers the swarm on a hallucination.
+    briefing_model: str = ""
+    briefing_timeout_s: float = 300.0
+    briefing_max_tokens: int = 8000
+    # Stale-round circuit breaker. After N consecutive rounds in which a solver
+    # added NOTHING new to the team (every dead end it reported was already
+    # recorded, every fact already asserted by someone), force a strategist
+    # consult and hand that solver a hard redirect forbidding further micro-tweaks
+    # of the same payload. Catches the failure mode a per-command loop detector
+    # cannot see, because each tweak is a genuinely different command. 0 disables.
+    stale_round_limit: int = 3
+    # Contradiction audit. Each round's new statements are compared against the
+    # whole board, and a pair that cannot both be true is broadcast plus pushed to
+    # the front of the verification queue. The Verifier tests a claim against the
+    # TARGET; this tests claims against EACH OTHER, which catches the case where
+    # two agents hold mutually exclusive beliefs and both look productive. Costs one
+    # summarizer-class call per published round.
+    audit_contradictions: bool = True
     # Operator web dashboard (live swarm view + guidance mailbox UI).
     # 0 disables. Default 8080.
     dashboard_port: int = 8080
@@ -294,6 +382,17 @@ def validate_tuning(settings: Settings) -> list[str]:
             "team digest cannot call a summarizer. The journal falls back to raw "
             "(bounded) entries and sibling context to clipped raw findings — the "
             "mechanism still works, just without merging or de-duplication by model."
+        )
+
+    strategist = int(getattr(settings, "strategist_every_bumps", 0) or 0)
+    if (strategist > 0
+            and not (getattr(settings, "gateway_base_url", "")
+                     and getattr(settings, "gateway_api_key", ""))):
+        warnings.append(
+            f"STRATEGIST_EVERY_BUMPS={strategist} is set but GATEWAY_BASE_URL/"
+            "GATEWAY_API_KEY are unset, so the Strategist can never be consulted. "
+            "The stale-round circuit breaker still fires and still hands solvers a "
+            "hard redirect, but no PIVOT verdict will ever be produced."
         )
 
     return warnings

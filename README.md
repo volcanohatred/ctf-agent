@@ -15,6 +15,12 @@ Forked from Veria Labs' ctf-agent (52/52, 1st place at BSidesSF 2026 CTF), exten
 | Knowledge | none | **Skill library** mounted at `/skills` — model works alone first, escalating hints are injected when stuck |
 | Long runs | context grows unbounded | **Context compaction** (Pydantic backend) + **wall-clock budget** with Cairn-style conclude→bump |
 | Findings | plain text bus | **Structured blackboard** (fact / excluded dead-ends / coordinator) |
+| Trust | every report is a fact | **Four tiers** — ✅ probe-verified > ✓ corroborated by 2+ solvers > ⚠ single-source claim > ✗ excluded/refuted |
+| False premises | undetectable | **Verifier agent** runs a real probe per claim and can REFUTE it, pruning every dependent line of attack |
+| Internal inconsistency | invisible | **Contradiction audit** — mutually exclusive board entries are surfaced and both sides sent to a probe |
+| Strategy | solvers rotate tactics only | **Strategist** — periodic step-back that reads the题面 + dead-ends and can force a PIVOT |
+| Stagnation | per-command loop detector | **+ stale-round circuit breaker** — catches repeated *outcomes*, not repeated commands |
+| WEB measurements | re-derived per round, then lost | **`ctf_probe`** telemetry log in the workspace + `ctf-probe` query CLI |
 | Deployment | run on host | **Agent runs in Docker** (docker-outside-of-docker), or still locally |
 | Evaluation | none | **`ctf-bench`** offline benchmark with local answer-key verification |
 
@@ -117,6 +123,167 @@ that executed **zero tool calls** is treated the same way, and `ctf-bench`
 reports `usable_run: false` when infrastructure rather than the models decided
 the outcome.
 
+## Not believing yourselves: trust, strategy, stagnation
+
+Three mechanisms were added after a long WEB/Java run exposed a failure mode the
+rest of the architecture could not see. Every solver ground away tactically for
+hours — fuzzing payload variants, enumerating class names, collecting hundreds of
+422 responses — while one model's unverified claim ("the uploaded JAR does get
+loaded") sat on the blackboard indistinguishable from a fact three models had
+established, and every restart inherited it as ground truth. Nothing in the
+system ever re-read the challenge description.
+
+**Corroboration gate** (`CORROBORATE_FACTS`, default on). A finding one solver
+asserts is published as an **unverified claim** (⚠) and is promoted to a
+**corroborated fact** (✓) only when a *different* solver independently reports the
+same thing. Two details make it hold:
+
+- a solver re-asserting its own line after a session wipe does **not** count —
+  that is exactly how a hallucination survives a restart, and counting it would
+  let a model promote its own invention by repeating it;
+- matching is structural (`backend/dedup.py`), so an ASLR slide or a fresh offset
+  does not defeat it. Two models observing the same thing report different
+  addresses; requiring literal equality would mean corroboration only ever fired
+  on copy-paste, which is the one case that proves nothing.
+
+It costs no LLM calls. Claims and facts are separate sections in the sibling
+prompt, and the claim section names the failure mode rather than just labelling
+it — a flat "unverified" reads as noise and gets ignored. The markers survive
+into the team digest (`_SIBLING_PROMPT` is explicitly forbidden from upgrading
+them), because a gate defeated one step downstream is not a gate. Dead ends need
+no corroboration: they are negative knowledge, and holding one back until a
+second model wastes a round rediscovering it would defeat the ledger.
+
+Corroboration has two holes, and both cost solve rate, which is why it is the
+floor and not the ceiling:
+
+- **It can never refute anything.** A false premise is not labelled trusted, but
+  it stays on the board, still readable, still tempting.
+- **It can never confirm anything either.** A true finding that is hard to
+  rediscover stays ⚠ forever and gets under-weighted — a false negative on the
+  one thing the swarm most needs.
+
+**The Verifier** (`VERIFY_CLAIMS`, default on) closes both by doing what
+agreement cannot: running a test. It is a real agent with a real sandbox — one
+per swarm, reused across claims, created lazily on the first testable claim, and
+running concurrently with the solvers so it costs no wall-clock. It is built on
+the existing solver backends through a `role_prompt` override, so it inherits
+sandbox redirection, loop detection, tracing, the wall-clock budget and shielded
+teardown rather than being a second implementation.
+
+Its verdict has three values and the asymmetry is the design:
+
+| Verdict | Effect on the board |
+|---|---|
+| `VERIFIED` | claim → ✅ probe-verified, the strongest tier, evidence appended in place |
+| `REFUTED` | claim → ✗ excluded, added to the dead-end ledger, **prune notice broadcast**, team digest invalidated, coordinator told |
+| `INCONCLUSIVE` | nothing changes |
+
+Anything ambiguous resolves to INCONCLUSIVE: an unparsable reply, a crashed probe,
+a timeout, a verdict with no observable evidence, or a verdict returned after
+zero tool calls. INCONCLUSIVE is free. A wrong VERIFIED makes four agents build
+on sand; a wrong REFUTED kills the one line of attack that might have worked.
+
+The refutation path is the one that saves hours, and it does three things because
+all three are needed: moving the claim out of circulation (a log line alone leaves
+it readable), recording the evidence (so nobody re-tests it), and broadcasting a
+prune notice — which running solvers pick up within ~5 tool calls via the existing
+mid-turn hook, instead of at their next restart up to a whole time budget later.
+The team digest is also invalidated, since it was computed while the premise was
+still believed and would otherwise re-seed every restarting solver with it.
+
+The role prompt is written against the specific ways verification fails: it
+demands a **discriminator** (two cases that must differ if the claim is true) over
+a direct test, forbids reporting anything but observed output, and states plainly
+that **absence of an error is not confirmation** — a missing `ClassNotFoundException`
+may mean the class loaded, or that the path never ran, or that the exception was
+swallowed. That last rule is the FatJar failure written down as an instruction.
+
+A cheap triage call filters claims before any sandbox time is spent: is it
+testable by a probe at all, and would its falsity invalidate other agents' work?
+This is a wall-clock control, not a cost control. If the triage call itself fails
+the claim is verified anyway — an optimisation must not be able to silently
+disable the only mechanism that can catch a false premise.
+
+**Contradiction audit** (`AUDIT_CONTRADICTIONS`, default on). The Verifier tests a
+claim against the *target*; this tests claims against *each other*. Each round's
+new statements are compared against the whole board, and a pair that cannot both
+be true is broadcast plus pushed to the front of the verification queue — both
+sides, which is the A/B confrontation, settled by a probe rather than by another
+opinion. The broadcast deliberately does **not** say which side is wrong: the
+audit has no evidence for that, and picking one would be a new unverified claim
+wearing an authoritative label.
+
+This catches what the board itself hides, because two mutually exclusive
+statements each look fine in isolation. It is also the cheapest of the mechanisms:
+one summarizer-class call per published round, no sandbox.
+
+**Strategist** (`STRATEGIST_EVERY_BUMPS`, default 4). One model call, not a fifth
+swarm member — it owns no sandbox, runs no tools and cannot submit a flag, so it
+cannot contribute a dead end of its own. It is shown the challenge metadata and
+the dead-end ledger and **deliberately nothing else**: the pile of tactical
+findings is precisely what drowned the宏观 clues. It must answer `CONTINUE` or
+`PIVOT: <new attack surface>`; the verdict is broadcast as a 📢 strategist
+message, kept visually distinct from a ✓ fact, and a pivot is worded as defeasible
+— solvers are told to check it against their own confirmed evidence rather than
+obey it. It runs on a strong model (`STRATEGIST_MODEL` → `COORDINATOR_MODEL` →
+built-in default), never `SUMMARIZER_MODEL`: a flash model answers CONTINUE to
+everything, which makes the whole mechanism decorative. Four solvers bumping at
+once cost one call.
+
+**Stale-round circuit breaker** (`STALE_ROUND_LIMIT`, default 3). After N
+consecutive rounds in which a solver added *nothing new* to the team — every dead
+end it reported was already recorded, every fact already asserted by someone —
+it forces a Strategist consult and hands that solver a hard redirect forbidding
+further micro-tweaks of the same payload. This catches what `loop_detect.py`
+structurally cannot: each payload tweak is a genuinely different command with a
+different signature, so no per-command detector ever fires. What repeats is the
+*outcome*. Infrastructure failures, zero-tool-call rounds and context overflows
+are excluded — those belong to `MAX_INFRA_FAILURES`, and tripping the breaker on
+a flaky gateway would redirect a solver that never got to try anything. The
+counter resets after firing, so a stuck solver gets a full N rounds of fresh
+stagnation before being interrupted again rather than spending its budget reading
+redirects.
+
+Every mechanism above is auditable. `check_swarm_status`, the operator dashboard,
+the Markdown/JSON export and the benchmark report all carry `probe_verified`,
+`corroborated_facts`, `unverified_claims`, `probe_refuted`, `contradictions`,
+`stale_breaks` and `strategist_pivots`, so a run that ground for hours is
+distinguishable in the report from one that was making progress the whole time.
+`ctf-bench` prints a **Trust audit** block and warns on the two shapes that look
+like a model-capability problem and are not: far more claims than confirmations
+(solvers exploring disjoint surfaces, never cross-checking), and contradictions
+detected but never settled by a probe (both statements still on the board).
+
+The export renders ✅ / ✓ / ⚠ / ✗ / 📢 with the same markers the solvers see, and
+flags a run where most of what the team "knew" was never tested. A writeup built
+from an export that rendered a ⚠ claim like a ✓ fact would re-launder the
+hallucination into the permanent record.
+
+**The coordinator is constrained to match.** It may not launder a claim into a
+fact, and it steers by direction rather than by payload — it cannot test an
+exploit string, and a wrong one dictated with authority is adopted verbatim by
+every solver that reads the board. A `STRATEGIST PIVOT` outranks its own read of
+the tactics. A `VERIFIER REFUTED` notice is final: the probe ran against the real
+target, so a solver's insistence is not counter-evidence. And on a contradiction
+notice it is forbidden from picking a side — nobody knows yet which is wrong, and
+guessing is how a coordinator launders its own hunch into a fact.
+
+**Sandbox telemetry** (`sandbox/ctf_probe.py`, preinstalled in the image). WEB
+solvers used to re-derive the same timing code every round and then lose the
+measurement, because the next bash call is a fresh process. `ctf_probe` records
+every request's status/elapsed/body to a JSONL log inside the workspace, so a
+later command can *query* the sweep instead of re-running it
+(`ctf-probe --min-ms 1000`). It reports the **median** of a repeat set and records
+the spread, because bridge-network jitter is routinely larger than the signal
+being measured and a solver that cannot see the spread cannot tell an oracle from
+noise. It is generic and optional — it knows nothing about any challenge's
+endpoints, and plain `curl` is still the right tool for a one-off request.
+`sandbox/AGENTS.md` also tells solvers to `ls /challenge/workspace/` and extend an
+existing script rather than adding `r7.py` beside it, and the Verifier writes its
+probes to `/challenge/workspace/verify/` so solvers reuse them instead of
+re-deriving the same measurement.
+
 ## Quick Start (Docker — recommended)
 
 ```bash
@@ -147,6 +314,10 @@ docker compose run --rm agent ctf-bench --challenges-dir challenges --concurrenc
 
 # Operator hint to the running coordinator (second terminal)
 docker compose exec agent uv run --no-sync ctf-msg "the JWT uses an enum kid — try SQLi there"
+
+# Ask the command centre what is actually going on with a challenge that has been
+# grinding for hours (sends its whole live state to a reasoning model)
+docker compose exec agent uv run --no-sync ctf-ask "FatJar Relic" "这题现在什么进展？还该继续吗？"
 ```
 
 ## Quick Start (local, no agent container)
@@ -288,7 +459,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 337 tests, no Docker / no LLM / no network
+uv run pytest -q             # 587 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports
@@ -317,7 +488,7 @@ drift apart.
 | **Crypto** | SageMath, RsaCtfTool, z3, gmpy2, cado-nfs, flatter |
 | **Forensics** | volatility3, sleuthkit, foremost, exiftool |
 | **Stego** | steghide, stegseek, zsteg, ImageMagick, tesseract |
-| **Web** | curl, nmap, requests, flask |
+| **Web** | curl, nmap, requests, flask, **`ctf_probe`** (request/timing telemetry log + `ctf-probe` query CLI) |
 | **Misc** | ffmpeg, sox, Pillow, PyTorch, podman |
 
 ## Configuration
@@ -337,6 +508,21 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `SIBLING_DIGEST_MIN_REPORTS` | `2` | Distinct reports needed before spending a model call on the team digest |
 | `SIBLING_DIGEST_REFRESH_BUMPS` | `1` | Recompute the team digest at most once every N bumps (shared by all solvers) |
 | `SUMMARIZER_MODEL` | `deepseek-v4-flash` | Model for journal distillation, merges and the team digest — all cost-tracked |
+| `CORROBORATE_FACTS` | `true` | One solver's assertion is an unverified claim until a second solver independently reports it |
+| `VERIFY_CLAIMS` | `true` | Verifier agent runs a real probe per testable claim; can REFUTE it and broadcast a prune notice |
+| `VERIFIER_MODEL` | `` | Model spec for the Verifier. Empty = first solver in the lineup |
+| `VERIFIER_BUDGET_S` | `300` | Wall clock for ONE probe — a "minimal test" needing 25 min is not minimal |
+| `VERIFIER_TRIAGE` | `true` | Cheap pre-filter: testable AND load-bearing, else skip. Wall-clock control, not cost control |
+| `VERIFIER_MAX_PROBES` | `0` | Hard cap on decisive probes per challenge. 0 = unlimited |
+| `AUDIT_CONTRADICTIONS` | `true` | Compare each round's statements against the board; conflicting pairs go to a probe |
+| `STRATEGIST_EVERY_BUMPS` | `4` | Consult the Strategist (题面 + dead-ends only) every N swarm-wide bumps. 0 disables |
+| `STRATEGIST_MODEL` | `` | Strong model for the Strategist; falls back to `COORDINATOR_MODEL`, never to the summarizer |
+| `STRATEGIST_TIMEOUT_S` | `300` | Measured 100–150s per consult. **Do not lower without measuring** — at 60s every call timed out and the mechanism was silently dead |
+| `STRATEGIST_MAX_TOKENS` | `8000` | Reasoning models burn most of it thinking; at 1200 the verdict line never appeared and the tail read as CONTINUE |
+| `REASONING_MODEL` | `` | Model for judgement calls (Strategist + audit). Never `SUMMARIZER_MODEL` — measured: flash answered "no contradiction" to an unambiguous conflict |
+| `AUDIT_MODEL` / `AUDIT_TIMEOUT_S` / `AUDIT_MAX_TOKENS` | `` / `120` / `4000` | Contradiction-audit overrides; empty = `REASONING_MODEL` |
+| `BRIEFING_MODEL` / `BRIEFING_TIMEOUT_S` / `BRIEFING_MAX_TOKENS` | `` / `300` / `8000` | Command-centre chat; ~70s measured on a full dossier |
+| `STALE_ROUND_LIMIT` | `3` | Rounds adding nothing new before the circuit breaker forces a pivot + hard redirect. 0 disables |
 | `SANDBOX_COMMAND_TIMEOUT_S` | `900` | Per-command `timeout -k 5` inside the sandbox — no orphaned processes |
 | `COORDINATOR_TURN_TIMEOUT_S` | `300` | Cap on one coordinator turn; a stalling gateway would otherwise freeze the whole event loop |
 | `CONTAINER_MEMORY_LIMIT` | `16g` | Per-sandbox memory |
@@ -363,6 +549,47 @@ port cannot be forwarded) and compose publishes them as `127.0.0.1:8080:8080`, s
 neither the LAN nor a sandbox container can reach them via
 `host.docker.internal`. Bind to `0.0.0.0` on the host only behind a reverse proxy
 that adds its own auth.
+
+### Command-centre chat (`/api/ask`, `ctf-ask`)
+
+Four hours into a hard challenge there is more state than a human can read: four
+solvers, dozens of bumps, a blackboard of findings and dead ends, per-solver traces,
+audit counters. Ask instead of reading — in the dashboard's 🎙 panel, or:
+
+```bash
+uv run ctf-ask "FatJar Relic" "这题现在什么进展？我们还该继续吗？"
+uv run ctf-ask "FatJar Relic" "有哪些说法还没被验证？" --token <dashboard-token>
+```
+
+Every question assembles that challenge's **entire live state** and sends it to a
+reasoning model: the blackboard *grouped by trust tier*, the dead-end ledger, the
+failed handbooks, per-solver trace health (spinning / looping / last reasoning
+text), and every audit counter. The dossier is rebuilt per request rather than
+cached, because the swarm is live and an answer about "the current state" built on
+a ten-minute-old snapshot is confidently wrong in exactly the way that gets an
+operator to issue a stale instruction. It works for archived swarms too — "what
+happened on the one we lost four hours on?" is asked most often after the fact.
+
+The design constraint is the same one the rest of the trust system enforces, and it
+is **more** important here, not less: the briefing must never upgrade a ⚠
+single-source claim into a fact. An operator told "the team has established that the
+JAR gets loaded" will type "go with the JAR-loading approach" into the advice box —
+and operator advice outranks anything an agent says to itself. Laundering a
+hallucination through a summary does not dilute it, it *authorises* it. So the
+dossier arrives with its ✅/✓/⚠/✗/📢 markers intact, the system prompt forbids
+collapsing them and explains why, and the answer must lead with what is DEAD before
+what is live (the most expensive thing an operator can do is suggest something
+already disproved), must say "档案中没有这项" rather than speculate, and must
+distinguish an infrastructure failure from a strategy failure.
+
+It ends with 1–3 paste-ready 【建议指令】; in the dashboard each one is a button that
+fills the guidance mailbox. Over-budget dossiers trim the ⚠ claim pile first and
+never the verified or refuted material, and say out loud what was cut — silently
+dropping the refuted premises is the one truncation that would make a briefing
+actively dangerous.
+
+Runs on `BRIEFING_MODEL` → `REASONING_MODEL` → `COORDINATOR_MODEL` → built-in
+default. Measured ~70s on a full dossier, hence the 300s default timeout.
 
 ## Requirements
 

@@ -149,4 +149,25 @@ def test_multiple_problems_are_all_reported() -> None:
         max_attempts_per_challenge=3, fresh_restart_rounds=5,
         gateway_base_url="", gateway_api_key="",
     ))
-    assert len(warns) == 2, warns
+    # Three independent defects in one config: the journal is never merged, the
+    # summarizer cannot be reached, and neither can the strategist.
+    assert len(warns) == 3, warns
+    assert any("never merged" in w for w in warns)
+    assert any("cannot call a summarizer" in w for w in warns)
+    assert any("Strategist can never be consulted" in w for w in warns)
+
+
+def test_no_strategist_warning_when_it_is_disabled() -> None:
+    """strategist_every_bumps=0 means no call is ever attempted, so a missing
+    gateway defeats nothing."""
+    warns = validate_tuning(_settings(strategist_every_bumps=0,
+                                      fresh_restart_rounds=0, gateway_base_url=""))
+    assert not any("Strategist" in w for w in warns)
+
+
+def test_a_short_cap_does_not_warn_about_the_strategist() -> None:
+    """Benchmarks deliberately run tiny caps. A cap below the strategist interval
+    is a tuning choice, not a silently defeated mechanism, so it must stay quiet
+    while the genuine cap/fresh-restart coupling is still reported."""
+    warns = validate_tuning(_settings(max_attempts_per_challenge=2, fresh_restart_rounds=0))
+    assert not any("STRATEGIST_EVERY_BUMPS" in w for w in warns)

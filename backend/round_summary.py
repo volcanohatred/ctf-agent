@@ -46,12 +46,22 @@ _META_PROMPT = (
 _SIBLING_PROMPT = (
     "你是 CTF 团队协作助手。下面是同一道题上**其他模型**已经报告的发现。"
     "把它们合并成一份给队友看的集体状态，必须去重、必须保留所有硬信息"
-    "（文件路径、地址、偏移、密钥、凭据、payload、已排除的方向）。"
-    "不超过 12 行，格式固定为：\n"
-    "【队友已确认】…\n"
+    "（文件路径、地址、偏移、密钥、凭据、payload、已排除的方向）。\n\n"
+    "**每行开头的标记是信任等级，必须严格保留，绝对不许升级或降级：**\n"
+    "✅ = 已被 Verifier 在真实目标上跑探针实测确认（最强证据）\n"
+    "✓ = 已被两个以上模型独立报告（是共识，但没人实测过）\n"
+    "⚠ = **仅单一模型声称、未经证实**——不许写进【已确认】\n"
+    "✗ = 已排除的死路（含被探针证伪的前提）\n"
+    "📢 = 协调者/战略家的指示，不是事实\n\n"
+    "这条规则是本系统的核心：把 ⚠ 混进已确认区，会让整支队伍基于一句幻觉"
+    "连续工作数小时。宁可少写，也不许改动信任等级。\n\n"
+    "不超过 16 行，格式固定为：\n"
+    "【已实测确认】…（只允许 ✅ 的内容）\n"
+    "【队友已确认】…（只允许 ✓ 的内容）\n"
+    "【未经证实的声称】…（⚠ 的内容，注明是谁声称的；用它之前先自己复验）\n"
     "【队友已排除】…（不要再试这些）\n"
     "【值得接力】…（队友做到一半、最有希望接着做的点）\n"
-    "直接输出这三段，不要解释。\n\n【其他模型的报告】\n{text}"
+    "直接输出这五段，没有内容的段落写「无」。不要解释。\n\n【其他模型的报告】\n{text}"
 )
 
 
@@ -77,8 +87,18 @@ async def _call_gateway(
     timeout_s: float = 25.0,
     cost_tracker: object | None = None,
     agent_name: str = "",
+    max_tokens: int = 900,
 ) -> str:
-    """One OpenAI-compatible chat completion. Returns "" on any failure."""
+    """One OpenAI-compatible chat completion. Returns "" on any failure.
+
+    A reply truncated by `max_tokens` also returns "". That is not the same as a
+    transport failure but it must be handled the same way, because the callers ask
+    for a strict trailing marker (PIVOT:, CONTRADICTION:, TESTABLE:) and a model cut
+    off mid-reasoning never emits it. Returning the truncated tail instead would let
+    `parse_verdict` read deliberation as a conclusion — observed live as a strategist
+    reply that was heading for PIVOT being reported as CONTINUE, which is worse than
+    no answer because the swarm then keeps doing the thing that was failing.
+    """
     base_url = getattr(settings, "gateway_base_url", "") or ""
     api_key = getattr(settings, "gateway_api_key", "") or ""
     if not base_url or not api_key:
@@ -90,14 +110,33 @@ async def _call_gateway(
                 f"{base_url.rstrip('/')}/chat/completions",
                 json={"model": model,
                       "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": 900, "temperature": 0.2},
+                      "max_tokens": max_tokens, "temperature": 0.2},
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             resp.raise_for_status()
             data = resp.json()
             _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
-            return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                    or "").strip()
+            choice = (data.get("choices") or [{}])[0]
+            if str(choice.get("finish_reason", "") or "") == "length":
+                logger.warning(
+                    "%s truncated at max_tokens=%s on %s — discarding the reply rather "
+                    "than parsing a partial one (raise the budget for this call)",
+                    agent_name or "gateway call", max_tokens, model,
+                )
+                return ""
+            return (choice.get("message", {}).get("content", "") or "").strip()
+    except (TimeoutError, httpx.TimeoutException):
+        # httpx.TimeoutException is not a subclass of the builtin TimeoutError, so
+        # catching only the latter let real read timeouts fall into the generic
+        # branch below and be logged at debug level — the strategist measured
+        # 100-150s per call against a live gateway, i.e. it timed out on every
+        # single request while looking configured and healthy.
+        logger.warning(
+            "%s timed out after %.0fs on %s — no answer obtained (raise the timeout "
+            "for this call if it keeps happening)",
+            agent_name or "gateway call", timeout_s, model,
+        )
+        return ""
     except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
         logger.debug("round_summary gateway call failed: %s", e)
         return ""

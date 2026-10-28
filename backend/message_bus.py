@@ -3,9 +3,18 @@
 Findings carry a `kind` so solvers can tell confirmed facts apart from
 excluded dead-ends (Cairn-style negative knowledge) and coordinator
 broadcasts. Kinds:
-  - "fact"      : confirmed discovery (default)
+  - "fact"      : a discovery CORROBORATED by two independent solvers
+  - "claim"     : one solver's unverified assertion — not yet ground truth
   - "excluded"  : a direction was tried and ruled out — do NOT retry it
-  - "broadcast" : message from the coordinator / operator
+  - "broadcast" : message from the coordinator / strategist / operator
+  - "help"      : a solver's request for human help (knowledge gap)
+
+The fact/claim split exists because the blackboard is the swarm's only shared
+memory and every restarting solver is told to trust it. A lone model asserting
+"the uploaded JAR does get loaded" used to land on the board looking exactly
+like a fact three models had established, and siblings then built hours of work
+on it. A claim is promoted to a fact only when a DIFFERENT solver independently
+reports the same thing — see `promote_claims`.
 """
 
 from __future__ import annotations
@@ -14,10 +23,34 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
+from backend.dedup import normalize
+
 KIND_FACT = "fact"
+KIND_VERIFIED = "verified"
+KIND_CLAIM = "claim"
 KIND_EXCLUDED = "excluded"
 KIND_BROADCAST = "broadcast"
 KIND_HELP = "help"  # a solver's explicit request for human help (knowledge gap)
+
+# Marker used when a finding is folded into the team digest. A broadcast is NOT
+# a confirmed fact — it used to fall through to the default "✓" and arrive in
+# every restart payload labelled as one, which is how a coordinator's hunch
+# became ground truth for the whole swarm.
+KIND_TAGS = {
+    KIND_VERIFIED: "✅",
+    KIND_FACT: "✓",
+    KIND_CLAIM: "⚠",
+    KIND_EXCLUDED: "✗",
+    KIND_BROADCAST: "📢",
+    KIND_HELP: "?",
+}
+
+# Ordered strongest → weakest, for rendering. Agreement between two models is
+# real evidence but it is still agreement: on a hard challenge the whole swarm
+# can be inside the same wrong paradigm and corroborate each other's premise. A
+# probe that actually ran against the target is a different kind of thing, so it
+# gets its own tier rather than sharing ✓.
+TRUST_ORDER = [KIND_VERIFIED, KIND_FACT, KIND_CLAIM]
 
 
 @dataclass
@@ -77,6 +110,66 @@ class ChallengeMessageBus:
         """Coordinator broadcasts a message to all solvers."""
         await self.post(source, content, kind=KIND_BROADCAST)
 
+    async def promote_claims(self, keys: set[str]) -> int:
+        """Flip already-posted single-source claims to corroborated facts.
+
+        `keys` are `dedup.normalize`d line keys. Called when a second, DIFFERENT
+        solver independently reports something that is on the board only as one
+        model's claim — that is the moment it becomes evidence rather than
+        assertion. Returns how many findings were promoted.
+
+        The earlier claim is promoted in place rather than left stale so the
+        board never shows the same statement twice at two different trust levels.
+        """
+        return await self._reclassify_claims(keys, KIND_FACT)
+
+    async def verify_claims(self, keys: set[str], note: str = "") -> int:
+        """Flip claims a probe actually confirmed to the strongest tier.
+
+        `note` carries the observable evidence and is appended to the finding, so
+        the board holds ONE entry that says both what is known and how it was
+        established. Posting a second "verified" finding instead would duplicate
+        every probe result into the team digest.
+        """
+        return await self._reclassify_claims(keys, KIND_VERIFIED, note)
+
+    async def refute_claims(self, keys: set[str], note: str = "") -> int:
+        """Flip claims a probe DISPROVED into excluded dead ends.
+
+        This is the capability corroboration structurally cannot provide. Withholding
+        promotion only stops a false premise from being *labelled* trusted; it stays
+        on the board, still readable, still tempting. Refutation moves it into the
+        "do NOT retry" section, which is what actually stops four solvers from each
+        spending an hour on it.
+
+        The finding is reclassified rather than deleted so the audit trail shows
+        what was believed, by whom, and what disproved it.
+        """
+        return await self._reclassify_claims(keys, KIND_EXCLUDED, note)
+
+    async def _reclassify_claims(self, keys: set[str], new_kind: str, note: str = "") -> int:
+        """Move matching claims to `new_kind`, optionally annotating them.
+
+        Returns how many moved, so the caller can tell "updated the board" from
+        "the claim had already been trimmed or superseded" and post a fresh entry
+        only in the second case.
+        """
+        if not keys:
+            return 0
+        note = (note or "").strip()
+        async with self._lock:
+            moved = 0
+            for f in self.findings:
+                # Only claims move. A line already corroborated by two solvers or
+                # confirmed by a probe is stronger evidence than one verifier's
+                # opinion, and silently downgrading it would throw away work.
+                if f.kind == KIND_CLAIM and normalize(f.content) in keys:
+                    f.kind = new_kind
+                    if note:
+                        f.content = f"{f.content.rstrip()}\n  ↳ {note}"
+                    moved += 1
+            return moved
+
     async def post_help(self, model: str, question: str) -> None:
         """A solver raises a knowledge-gap help request for the human operator."""
         await self.post(model, question, kind=KIND_HELP)
@@ -116,7 +209,9 @@ class ChallengeMessageBus:
             return f"- [{f.model}] {body}"
 
         excluded = [f for f in findings if f.kind == KIND_EXCLUDED]
+        verified = [f for f in findings if f.kind == KIND_VERIFIED]
         facts = [f for f in findings if f.kind == KIND_FACT]
+        claims = [f for f in findings if f.kind == KIND_CLAIM]
         broadcasts = [f for f in findings if f.kind == KIND_BROADCAST]
         # Help requests used to be consumed by the cursor and then dropped by
         # every branch below — silently discarding the fact that a peer is
@@ -125,14 +220,32 @@ class ChallengeMessageBus:
 
         parts: list[str] = ["**Findings from other agents:**"]
         if broadcasts:
-            parts.append("\nCoordinator messages:")
+            parts.append("\nCoordinator / strategist messages:")
             parts.extend(render(f) for f in broadcasts)
         if excluded:
             parts.append("\nDead ends already ruled out — do NOT retry these:")
             parts.extend(render(f) for f in excluded)
+        if verified:
+            parts.append(
+                "\nProbe-VERIFIED facts (an agent ran a test against the target and "
+                "observed this — strongest evidence available, build on it freely):"
+            )
+            parts.extend(render(f) for f in verified)
         if facts:
-            parts.append("\nConfirmed facts:")
+            parts.append("\nCorroborated facts (independently reported by 2+ agents):")
             parts.extend(render(f) for f in facts)
+        if claims:
+            # The wording matters more than the section header. A flat "unverified"
+            # label reads as noise and gets ignored; naming the concrete failure
+            # mode (building a long chain on one model's say-so) is what actually
+            # changes behaviour.
+            parts.append(
+                "\nUNVERIFIED single-agent claims — NOT confirmed, and nobody has "
+                "tested them. Re-check the ones you intend to build on with your own "
+                "minimal probe before deriving anything from them; a claim that turns "
+                "out false invalidates every step stacked on top of it:"
+            )
+            parts.extend(render(f) for f in claims)
         if helps:
             parts.append("\nTeammates currently blocked on a knowledge gap "
                          "(a human may answer soon — don't duplicate their work):")

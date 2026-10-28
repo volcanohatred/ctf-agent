@@ -1,8 +1,9 @@
 """Per-challenge report export — everything we know about how a challenge went.
 
 Aggregates metadata, outcome, per-model attempts/findings/cost, the shared
-blackboard feed (facts + excluded dead-ends + broadcasts), the failed-approach
-ledger, and trace highlights. Rendered as JSON (machine) or Markdown (human /
+blackboard feed (corroborated facts + unverified claims + excluded dead-ends +
+broadcasts), the failed-approach ledger, the trust/stagnation audit counters,
+and trace highlights. Rendered as JSON (machine) or Markdown (human /
 writeup-friendly).
 """
 
@@ -12,6 +13,8 @@ import json
 import logging
 import time
 from typing import Any
+
+from backend.message_bus import KIND_CLAIM, KIND_FACT, KIND_TAGS, KIND_VERIFIED
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,13 @@ def collect_challenge_data(
             "bumps": getattr(swarm, "_total_bumps", 0),
             "failed_approaches": list(getattr(swarm, "_failed_approaches", [])),
             "retire_reason": getattr(swarm, "retire_reason", ""),
+            "stale_breaks": getattr(swarm, "_stale_breaks", 0),
+            "strategist_pivots": getattr(swarm, "_strategist_pivots", 0),
+            "corroborated_facts": sum(1 for f in feed if f["kind"] == KIND_FACT),
+            "probe_verified": sum(1 for f in feed if f["kind"] == KIND_VERIFIED),
+            "unverified_claims": sum(1 for f in feed if f["kind"] == KIND_CLAIM),
+            "probe_refuted": getattr(swarm, "_probe_refuted", 0),
+            "contradictions": getattr(swarm, "_contradictions", 0),
             "agents": agents,
             "shared_feed": feed,
             "archived": False,
@@ -92,6 +102,13 @@ def collect_challenge_data(
         "bumps": archived.get("bumps", 0),
         "failed_approaches": archived.get("failed_approaches", []),
         "retire_reason": archived.get("retire_reason", ""),
+        "stale_breaks": archived.get("stale_breaks", 0),
+        "strategist_pivots": archived.get("strategist_pivots", 0),
+        "corroborated_facts": archived.get("corroborated_facts", 0),
+        "probe_verified": archived.get("probe_verified", 0),
+        "unverified_claims": archived.get("unverified_claims", 0),
+        "probe_refuted": archived.get("probe_refuted", 0),
+        "contradictions": archived.get("contradictions", 0),
         "agents": archived.get("agents", {}),
         "shared_feed": archived.get("shared_feed", []),
         "archived": True,
@@ -121,6 +138,30 @@ def render_markdown(report: dict[str, Any]) -> str:
     add(f"- **bump 次数**: {report.get('bumps', 0)}　**导出于**: {report.get('exported_at_human', '')}")
     if report.get("retire_reason"):
         add(f"- **swarm 退役原因**: `{report['retire_reason']}`")
+    # A solve rate cannot tell "converged on verified facts" from "each model
+    # asserted things nobody checked until the clock ran out". These can.
+    facts_n = report.get("corroborated_facts", 0)
+    verified_n = report.get("probe_verified", 0)
+    claims_n = report.get("unverified_claims", 0)
+    if facts_n or verified_n or claims_n or report.get("stale_breaks") or report.get("strategist_pivots"):
+        add(
+            f"- **信任审计**: ✅ 探针实证 {verified_n} 条　✓ 双模型证实 {facts_n} 条　"
+            f"⚠ 仅单一模型声称 {claims_n} 条　⛔ 被证伪 {report.get('probe_refuted', 0)} 条"
+            f"　⚡ 自相矛盾 {report.get('contradictions', 0)} 处"
+            f"　⛔ 熔断 {report.get('stale_breaks', 0)} 次"
+            f"　🧭 战略家 PIVOT {report.get('strategist_pivots', 0)} 次"
+        )
+        if claims_n > (facts_n + verified_n) * 3 and claims_n >= 6:
+            add(
+                "- ⚠ **本题大部分\"已知信息\"从未被第二个模型证实、也从未被探针实测**。"
+                "下面的复盘结论若建立在 ⚠ 条目上，请先自行复验再采信。"
+            )
+        if report.get("probe_refuted"):
+            add(
+                f"- ⛔ **有 {report['probe_refuted']} 个前提被实测证伪**。复盘时注意："
+                "这些前提曾经出现在黑板上并被当作事实使用过，任何基于它们推导出的"
+                "中间结论同样作废。"
+            )
     add("")
 
     desc = (report.get("description") or "").strip()
@@ -140,11 +181,18 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     feed = report.get("shared_feed") or []
     if feed:
-        add("## 📋 模型间共享黑板（事实 / 排除 / 广播）")
+        add("## 📋 模型间共享黑板（实证 / 证实 / 未证实声称 / 排除 / 广播）")
+        add("")
+        add("> ✅ = Verifier 在真实目标上跑探针实测确认　✓ = 被两个以上模型独立证实"
+             "　⚠ = **仅单一模型声称、未经证实**　✗ = 已排除死路（含被证伪的前提）"
+             "　📢 = 协调者/战略家指示")
         add("")
         for f in feed:
             ts = time.strftime("%H:%M:%S", time.localtime(f.get("ts", 0)))
-            mark = {"fact": "✓", "excluded": "✗", "broadcast": "📢"}.get(f.get("kind"), "•")
+            # Shared with the live blackboard on purpose: a post-mortem that
+            # renders an unverified claim with the same bullet as a corroborated
+            # fact reproduces the exact mistake the trust gate exists to prevent.
+            mark = KIND_TAGS.get(f.get("kind", ""), "•")
             add(f"- `{ts}` {mark} **[{f.get('model', '?')}]** {f.get('content', '')}")
         add("")
 

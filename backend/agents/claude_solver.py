@@ -97,6 +97,8 @@ class ClaudeSolver:
         submit_fn=None,
         message_bus=None,
         notify_coordinator=None,
+        role_prompt: str = "",
+        conclude_prompt: str = "",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -110,6 +112,19 @@ class ClaudeSolver:
         self.submit_fn = submit_fn
         self.message_bus = message_bus
         self.notify_coordinator = notify_coordinator
+        # Replaces the generated solver system prompt entirely. This is what lets
+        # the Verifier reuse every piece of hard-won machinery below — sandbox
+        # redirect, loop detection, tracing, budget interruption, cost accounting,
+        # shielded teardown — while doing a completely different job. Without it a
+        # verifier would either have to be a second solver implementation or run
+        # under "find the flag" instructions it is not trying to follow.
+        self.role_prompt = (role_prompt or "").strip()
+        # Replaces CONCLUDE_PROMPT for the tools-denied phase-2 harvest. The
+        # Verifier needs this: its phase 2 must demand a VERDICT line, not a
+        # [excluded]/[fact] state card, and phase 2 is the only reliable way to get
+        # an answer at all — it denies every tool, so a model that would otherwise
+        # keep exploring cannot.
+        self.conclude_prompt = (conclude_prompt or "").strip()
 
         self.sandbox = sandbox_from_settings(challenge_dir, settings)
         # Cleared by detach_sandbox() when the quota fallback hands this
@@ -219,11 +234,21 @@ class ClaudeSolver:
             "Use bash for everything: cat/head to read files, tee/echo> to write, find/grep to search. "
             "submit_flag 'FLAG' to submit. notify_coordinator 'MSG' to message the coordinator.\n\n"
         )
-        system_prompt = sandbox_preamble + build_prompt(
-            self.meta, distfile_names, container_arch=container_arch,
-            has_named_tools=False,
-            skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
-        )
+        if self.role_prompt:
+            # A role prompt (the Verifier) still gets the challenge context and the
+            # sandbox preamble — it has to know the target and where it is running —
+            # but not the "find the flag" instructions, which are not its job.
+            system_prompt = sandbox_preamble + build_prompt(
+                self.meta, distfile_names, container_arch=container_arch,
+                has_named_tools=False,
+                skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
+            ) + "\n\n" + self.role_prompt
+        else:
+            system_prompt = sandbox_preamble + build_prompt(
+                self.meta, distfile_names, container_arch=container_arch,
+                has_named_tools=False,
+                skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
+            )
 
         self._client = ClaudeSDKClient(
             options=self._build_options(system_prompt, ["Bash", "WebFetch", "WebSearch"])
@@ -309,12 +334,14 @@ class ClaudeSolver:
         call_id = str(tool_use_id or input_data.get("tool_use_id") or "")
 
         # Phase 2 (conclude) is text-only by construction: deny every tool so a
-        # model that ignores the prompt still cannot start new work.
+        # model that ignores the prompt still cannot start new work. The wording
+        # points at whatever this instance was asked to produce, because the
+        # Verifier concludes with a VERDICT line rather than a solver state card.
         if self._concluding:
             return self._deny(
                 tool_name,
-                "Conclude phase — no tool calls are allowed. Reply with the "
-                "[excluded]/[fact]/[artifacts]/[next] summary as plain text.",
+                "Conclude phase — no tool calls are allowed. Reply with the exact "
+                "plain-text answer your last instruction asked for, and nothing else.",
             )
 
         self._step_count += 1
@@ -798,7 +825,7 @@ class ClaudeSolver:
         sink: list[str] = []
         self.tracer.event("conclude_start", budget_s=budget_s, session=self._session_id)
         try:
-            await self._client.query(CONCLUDE_PROMPT)
+            await self._client.query(self.conclude_prompt or CONCLUDE_PROMPT)
             deadline = asyncio.get_running_loop().time() + budget_s
             message = await self._consume_stream(deadline, "conclude", sink)
             if message is None:

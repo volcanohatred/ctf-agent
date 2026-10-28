@@ -179,10 +179,17 @@ check("query token authorizes (needed for <a href>)", srv2._authorized(q) is Tru
 
 index_routes = inspect.getsource(srv2.start)
 for route in ("/api/state", "/api/trace", "/api/export", "/api/advise", "/api/bump",
-              "/api/broadcast", "/api/spawn"):
+              "/api/broadcast", "/api/ask", "/api/spawn"):
     handler = route.split("/")[-1]
     body = inspect.getsource(getattr(type(srv2), f"_{handler}"))
     check(f"{route} is authenticated", "_authorized" in body)
+
+# The briefing endpoint hands an LLM the whole challenge dossier and returns text
+# that an operator will act on. Two things must not silently regress: the route has
+# to be registered at all, and it must be a POST (a GET would put the question in the
+# URL, landing it in proxies and access logs).
+check("/api/ask is registered", '"/api/ask"' in index_routes)
+check("/api/ask is POST", 'web.post("/api/ask"' in index_routes)
 
 # --- output schema allows an honest "not yet" ----------------------------------
 from backend.output_types import FlagFound, StillWorking, solver_output_json_schema

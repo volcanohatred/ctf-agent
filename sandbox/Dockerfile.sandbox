@@ -269,4 +269,14 @@ exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
 COPY sandbox/sandbox-tools.txt /tools.txt
 COPY sandbox/AGENTS.md /challenge/AGENTS.md
 
+# ── Optional WEB telemetry helper ─────────────────────────────────────────────
+# Generic and challenge-agnostic: it records request timing/status/body to a
+# JSONL log inside the workspace so a measurement survives the next bash call and
+# "which of my requests were slow?" becomes a query instead of a re-run. Not a
+# framework and not required — solvers may keep using curl/requests directly.
+COPY sandbox/ctf_probe.py /opt/ctf-tools/ctf_probe.py
+ENV PYTHONPATH=/opt/ctf-tools
+RUN printf '#!/bin/sh\nexec python3 -m ctf_probe "$@"\n' > /usr/local/bin/ctf-probe \
+    && chmod +x /usr/local/bin/ctf-probe
+
 WORKDIR /challenge

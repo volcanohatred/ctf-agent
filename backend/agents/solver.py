@@ -165,6 +165,8 @@ class Solver:
         cancel_event: asyncio.Event | None = None,
         sandbox: DockerSandbox | None = None,
         owns_sandbox: bool | None = None,
+        role_prompt: str = "",
+        conclude_prompt: str = "",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -175,6 +177,11 @@ class Solver:
         self.settings = settings
         self.cancel_event = cancel_event or asyncio.Event()
         self._owns_sandbox = owns_sandbox if owns_sandbox is not None else (sandbox is None)
+        # Appended to the generated system prompt; see ClaudeSolver.role_prompt.
+        self.role_prompt = (role_prompt or "").strip()
+        # Replaces CONCLUDE_PROMPT for the tools-denied phase-2 harvest; see
+        # ClaudeSolver.conclude_prompt.
+        self.conclude_prompt = (conclude_prompt or "").strip()
 
         self.sandbox = sandbox or sandbox_from_settings(challenge_dir, settings)
         self.use_vision = supports_vision(model_spec)
@@ -252,6 +259,8 @@ class Solver:
             container_arch=container_arch,
             skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
         )
+        if self.role_prompt:
+            system_prompt = f"{system_prompt}\n\n{self.role_prompt}"
 
         model = resolve_model(self.model_spec, self.settings)
         model_settings = resolve_model_settings(self.model_spec)
@@ -551,7 +560,7 @@ class Solver:
         self.tracer.event("conclude_start", budget_s=budget_s, phase="conclude")
         try:
             result = await self._get_conclude_agent().run(
-                CONCLUDE_PROMPT,
+                self.conclude_prompt or CONCLUDE_PROMPT,
                 deps=self.deps,
                 message_history=self._messages or None,
                 timeout=float(budget_s),

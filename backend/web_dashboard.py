@@ -21,10 +21,13 @@ import logging
 import secrets
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from aiohttp import web
 
+from backend.briefing import Turn, ask
+from backend.message_bus import KIND_CLAIM, KIND_FACT, KIND_VERIFIED
 from backend.trace_read import last_model_text, trace_activity
 
 logger = logging.getLogger(__name__)
@@ -191,6 +194,7 @@ class DashboardServer:
             web.post("/api/advise", self._advise),
             web.post("/api/bump", self._bump),
             web.post("/api/broadcast", self._broadcast),
+            web.post("/api/ask", self._ask),
             web.post("/api/spawn", self._spawn),
             web.get("/healthz", self._healthz),
         ])
@@ -317,6 +321,23 @@ class DashboardServer:
             "failed_approaches": list(getattr(swarm, "_failed_approaches", [])),
             "retire_reason": getattr(swarm, "retire_reason", ""),
             "infra_failures": getattr(swarm, "_infra_failures", 0),
+            # Live audit trail: how much of what the board "knows" was ever
+            # confirmed by a second solver, and how often the swarm had to be
+            # broken out of a direction that was producing nothing new.
+            "stale_breaks": getattr(swarm, "_stale_breaks", 0),
+            "strategist_pivots": getattr(swarm, "_strategist_pivots", 0),
+            "corroborated_facts": sum(
+                1 for f in swarm.message_bus.findings if f.kind == KIND_FACT
+            ),
+            "probe_verified": sum(
+                1 for f in swarm.message_bus.findings if f.kind == KIND_VERIFIED
+            ),
+            "unverified_claims": sum(
+                1 for f in swarm.message_bus.findings if f.kind == KIND_CLAIM
+            ),
+            "probe_refuted": getattr(swarm, "_probe_refuted", 0),
+            "contradictions": getattr(swarm, "_contradictions", 0),
+            "claims_queued": len(getattr(swarm, "_claim_queue", []) or []),
             "agents": agents,
             "findings": {k: _clip(v, self.feed_chars) for k, v in dict(swarm.findings).items()},
             "shared_feed": feed,
@@ -472,6 +493,144 @@ class DashboardServer:
         await swarm.message_bus.broadcast(f"[operator] {message}")
         logger.info("Operator broadcast to %s (%d chars)", name, len(message))
         return web.json_response({"ok": True})
+
+    async def _ask(self, req: web.Request) -> web.Response:
+        """Command-centre chat: answer an operator question about one challenge.
+
+        Works for a LIVE swarm and for an archived one — "what happened on that
+        challenge we lost four hours on?" is asked most often after the swarm is
+        gone, and the archive is the only record left.
+
+        The dossier is rebuilt on every request rather than cached: the swarm is
+        live, and an answer about the current state built on a ten-minute-old
+        snapshot is confidently wrong in exactly the way that gets an operator to
+        issue a stale instruction.
+        """
+        if not self._authorized(req):
+            return self._unauthorized()
+        body = await self._json_body(req)
+        if body is None:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = str(body.get("challenge", "")).strip()
+        question = str(body.get("question", "")).strip()
+        if not name:
+            return web.json_response({"error": "challenge is required"}, status=400)
+        if not question:
+            return web.json_response({"error": "question is empty"}, status=400)
+        if len(question) > 4000:
+            return web.json_response({"error": "question too long (max 4000 chars)"}, status=400)
+
+        swarm = self.deps.swarms.get(name)
+        archived = (getattr(self.deps, "swarms_history", {}) or {}).get(name)
+        if swarm is None and not archived:
+            return web.json_response(
+                {"error": f"no live or archived swarm for '{name}'"}, status=404)
+
+        history = [
+            Turn(role=str(t.get("role", "")), content=str(t.get("content", "")))
+            for t in (body.get("history") or [])
+            if isinstance(t, dict) and str(t.get("role", "")) in ("user", "assistant")
+        ][-8:]
+
+        try:
+            # Trace reads are blocking file I/O over potentially large JSONL; keep
+            # them off the event loop so the poller and patrol keep running.
+            summary = (await self._swarm_summary(name, swarm)) if swarm is not None else None
+            dossier, trimmed = await asyncio.to_thread(
+                self._build_dossier, name, summary, archived, swarm)
+            result = await ask(
+                question=question,
+                dossier=dossier,
+                history=history,
+                settings=self.deps.settings,
+                cost_tracker=self.deps.cost_tracker,
+                agent_name=f"{name}/briefing",
+            )
+        except Exception as e:  # noqa: BLE001 — the operator must see why, not a 500
+            logger.warning("briefing for %s failed: %s", name, e)
+            return web.json_response({"error": f"briefing failed: {type(e).__name__}: {e}"},
+                                     status=502)
+
+        logger.info("Operator asked %s (%d chars) → %s in %.1fs",
+                    name, len(question), result.model, result.seconds)
+        return web.json_response({
+            "ok": result.ok,
+            "answer": result.answer,
+            "error": result.error,
+            "model": result.model,
+            "seconds": round(result.seconds, 1),
+            "dossier_chars": result.dossier_chars,
+            "trimmed": trimmed,
+            "challenge": name,
+        })
+
+    def _build_dossier(self, name: str, summary: dict | None,
+                       archived: dict | None, swarm: Any = None) -> tuple[str, list[str]]:
+        """Assemble the briefing dossier. Synchronous — runs in a worker thread.
+
+        Reuses `_swarm_summary` for the counters and blackboard instead of
+        re-reading the swarm here: that method is already defensive about missing
+        attributes, so a second reader would be a second place for the two views to
+        drift. The live trace detail is added on top, because "is this solver
+        spinning with zero tool calls?" changes the answer to "what is the progress"
+        more than any counter does.
+        """
+        from backend.briefing import build_dossier, format_solver_notes
+
+        if summary is not None:
+            meta = (getattr(self.deps, "challenge_metas", {}) or {}).get(name)
+            if meta is None:
+                meta = SimpleNamespace(
+                    category=summary.get("category", ""), value=summary.get("value", 0),
+                    tags=[], description="", connection_info="",
+                )
+            notes = format_solver_notes(swarm) if swarm is not None else []
+            if not notes:
+                notes = [
+                    f"### {spec}\n- 状态：{a.get('status', '?')}　工具调用：{a.get('tool_calls', 0)}"
+                    for spec, a in (summary.get("agents", {}) or {}).items()
+                ]
+            return build_dossier(
+                name=name, status=summary, meta=meta,
+                feed=summary.get("shared_feed", []) or [],
+                failed_approaches=summary.get("failed_approaches", []) or [],
+                solver_notes=notes,
+            )
+
+        archived = archived or {}
+        status = {
+            "winner": archived.get("winner"),
+            "winner_spec": archived.get("winner_spec", ""),
+            "bumps": archived.get("bumps", 0),
+            "cancelled": True,
+            "retire_reason": archived.get("retire_reason", ""),
+            "infra_failures": archived.get("infra_failures", 0),
+            "probe_verified": archived.get("probe_verified", 0),
+            "corroborated_facts": archived.get("corroborated_facts", 0),
+            "unverified_claims": archived.get("unverified_claims", 0),
+            "probe_refuted": archived.get("probe_refuted", 0),
+            "contradictions": archived.get("contradictions", 0),
+            "stale_breaks": archived.get("stale_breaks", 0),
+            "strategist_pivots": archived.get("strategist_pivots", 0),
+            "strategist_failures": archived.get("strategist_failures", 0),
+        }
+        meta = SimpleNamespace(category=archived.get("category", ""),
+                               value=archived.get("value", 0),
+                               tags=archived.get("tags", []),
+                               description=archived.get("description", ""),
+                               connection_info="")
+        agents = archived.get("agents", {}) or {}
+        notes = [
+            f"### {spec}\n- 状态：{a.get('status', '?')}　工具调用：{a.get('tool_calls', 0)}\n"
+            f"- 它的发现：\n{str(a.get('findings', ''))[:2000]}"
+            for spec, a in agents.items()
+        ]
+        return build_dossier(
+            name=name, status=status, meta=meta,
+            feed=archived.get("shared_feed", []) or [],
+            failed_approaches=archived.get("failed_approaches", []) or [],
+            solver_notes=notes,
+        )
 
     async def _spawn(self, req: web.Request) -> web.Response:
         if not self._authorized(req):

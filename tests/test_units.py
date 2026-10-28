@@ -117,7 +117,7 @@ def test_bus_grouping() -> None:
         unread = await bus.check("model-b")
         assert len(unread) == 3  # model-b sees everything from model-a + broadcast
         text = bus.format_unread(unread)
-        assert "Dead ends" in text and "Confirmed facts" in text and "Coordinator" in text
+        assert "Dead ends" in text and "Corroborated facts" in text and "Coordinator" in text
         # cursor advanced
         assert await bus.check("model-b") == []
         # model-a does not see its own posts, only the broadcast

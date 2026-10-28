@@ -37,7 +37,13 @@ decoded content, service behaviour (one per line)
 
 If you have nothing confirmed for a section, write "none" for it. Do not \
 speculate and do not invent findings — an empty section is far better than a \
-guess, because your teammates will treat [fact] lines as ground truth.
+guess, because your teammates build on what you report.
+
+A [fact] only YOU have reported is published to them as an UNVERIFIED CLAIM, \
+not as ground truth, and stays that way until a teammate independently \
+confirms it. So state only what you actually observed, and keep the observable \
+evidence in the line (the exact status code, offset, or error text) so a \
+teammate can re-check it cheaply instead of having to trust you.
 """
 
 

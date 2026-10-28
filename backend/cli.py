@@ -295,6 +295,62 @@ async def _run_coordinator(
     console.print(f"\n[bold]Total cost: ${results.get('total_cost_usd', 0):.2f}[/bold]")
 
 
+def _print_trust_audit(results: list[dict]) -> None:
+    """Summarise whether the swarm ever established shared ground truth.
+
+    A solve rate cannot distinguish two very different runs: one where the models
+    converged on verified facts, and one where they each asserted things nobody
+    checked while the clock ran out. These counters can, and a post-mortem that
+    skips them will diagnose the second run as "the models are not good enough".
+    """
+    claims = sum(r.get("unverified_claims", 0) for r in results)
+    facts = sum(r.get("corroborated_facts", 0) for r in results)
+    verified = sum(r.get("probe_verified", 0) for r in results)
+    refuted = sum(r.get("probe_refuted", 0) for r in results)
+    contradictions = sum(r.get("contradictions", 0) for r in results)
+    breaks = sum(r.get("stale_breaks", 0) for r in results)
+    pivots = sum(r.get("strategist_pivots", 0) for r in results)
+    if not (claims or facts or verified or refuted or contradictions or breaks or pivots):
+        return
+
+    console.print(
+        f"\n[bold]Trust audit:[/bold] {verified} probe-verified, {facts} corroborated, "
+        f"{claims} unverified claim(s), [red]{refuted} refuted[/red], "
+        f"{contradictions} contradiction(s), {breaks} stale-round break(s), "
+        f"{pivots} strategist pivot(s)"
+    )
+    if refuted:
+        console.print(
+            f"[bold red]{refuted} premise(s) were disproved by a probe.[/bold red] These were "
+            "on the blackboard looking like findings, and every solver inherited them. "
+            "Read the ⛔ entries in the export before trusting any intermediate "
+            "conclusion from this run — anything derived from a refuted premise is "
+            "also invalid."
+        )
+    if claims > (facts + verified) * 3 and claims >= 6:
+        console.print(
+            "[yellow]The swarm asserted far more than it ever confirmed.[/yellow] Most of "
+            "what it 'knew' rested on a single model's word and was never tested. On a "
+            "multi-model run that usually means the solvers were exploring disjoint "
+            "surfaces and never cross-checking. Check VERIFY_CLAIMS is on and that the "
+            "verifier had a reachable target."
+        )
+    if breaks and not pivots:
+        console.print(
+            "[yellow]The circuit breaker fired but no strategist pivot followed.[/yellow] "
+            "Either STRATEGIST_EVERY_BUMPS=0, the gateway was unreachable for the "
+            "strategist call, or every verdict was CONTINUE. Solvers got a hard "
+            "redirect but no new attack surface to redirect to."
+        )
+    if contradictions and not verified and not refuted:
+        console.print(
+            "[yellow]Contradictions were detected but no probe settled them.[/yellow] The "
+            "conflicting statements are both still on the board. Either the verifier "
+            "could not reach the target or every probe came back INCONCLUSIVE — check "
+            "the trace before believing either side."
+        )
+
+
 @click.command()
 @click.option("--challenges-dir", default="challenges", help="Directory with challenge subdirs")
 @click.option("--models", multiple=True, help="Model specs (default: all configured)")
@@ -367,11 +423,30 @@ def bench(
         note = f" ({r['error']})" if r.get("error") else ""
         console.print(f"  {mark} {r['name']} ({r['category']}) — {r['duration_s']:.0f}s, "
                       f"${r['cost_usd']:.2f} {r['winner_model']}{note}")
+        # Only printed when something actually happened: on a healthy run these
+        # are all zero and the line stays clean.
+        audit = []
+        if r.get("stale_breaks"):
+            audit.append(f"[yellow]{r['stale_breaks']} stale-round break[/yellow]")
+        if r.get("strategist_pivots"):
+            audit.append(f"[magenta]{r['strategist_pivots']} strategist pivot[/magenta]")
+        if r.get("probe_refuted"):
+            audit.append(f"[red]{r['probe_refuted']} premise refuted[/red]")
+        if r.get("contradictions"):
+            audit.append(f"[yellow]{r['contradictions']} contradiction[/yellow]")
+        claims = r.get("unverified_claims", 0)
+        facts = r.get("corroborated_facts", 0) + r.get("probe_verified", 0)
+        if claims or facts:
+            colour = "yellow" if claims > facts else "dim"
+            audit.append(f"[{colour}]{facts} confirmed / {claims} unverified[/{colour}]")
+        if audit:
+            console.print(f"        {' · '.join(audit)}")
     console.print(
         f"\n[bold]{summary['solved']}/{summary['total_challenges']} solved "
         f"({summary['solve_rate']:.0%})[/bold] | "
         f"wall {summary['total_wall_time_s']:.0f}s | ${summary['total_cost_usd']:.2f}"
     )
+    _print_trust_audit(report["results"])
     if summary.get("unscoreable_no_answer_key"):
         console.print(
             f"[bold yellow]{summary['unscoreable_no_answer_key']} challenge(s) had NO answer "
@@ -429,6 +504,84 @@ def msg(message: str, port: int | None, host: str) -> None:
         console.print(f"[red]Failed:[/red] {e}")
         console.print(f"Is the coordinator running and listening on {host}:{port}?")
         raise SystemExit(1) from None
+
+
+@click.command()
+@click.argument("challenge")
+@click.argument("question")
+@click.option("--host", default=None, help="Dashboard host (default: DASHBOARD_HOST)")
+@click.option("--port", default=None, type=int, help="Dashboard port (default: DASHBOARD_PORT)")
+@click.option("--token", default=None, help="Dashboard bearer token (default: DASHBOARD_TOKEN)")
+def ask(challenge: str, question: str, host: str | None, port: int | None,
+        token: str | None) -> None:
+    """Ask the command-centre strategist about one challenge.
+
+    Sends that challenge's ENTIRE live state — blackboard grouped by trust tier,
+    dead-end ledger, per-solver traces, audit counters — to a reasoning model and
+    prints the briefing. Use it when a challenge has been grinding for hours and
+    there is more state than you can read.
+
+    Talks to the running coordinator's dashboard, so DASHBOARD_TOKEN must match
+    (it is printed once at startup when unset).
+    """
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    settings = Settings()
+    host = host or (settings.dashboard_host or "127.0.0.1")
+    # A dashboard bound to 0.0.0.0 is not something a client can dial.
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    port = port or int(settings.dashboard_port or 8080)
+    token = token or (settings.dashboard_token or "")
+    if not token:
+        console.print(
+            "[red]No dashboard token.[/red] DASHBOARD_TOKEN is unset, so the running "
+            "coordinator generated a random one and printed it at startup — look for "
+            "'Dashboard access token' in its log, then pass --token."
+        )
+        raise SystemExit(1)
+
+    body = json.dumps({"challenge": challenge, "question": question}).encode()
+    req = urllib.request.Request(
+        f"http://{host}:{port}/api/ask?token={urllib.parse.quote(token)}",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    console.print(f"[dim]Asking about [bold]{challenge}[/bold] …[/dim]")
+    try:
+        # Long timeout: the dossier is big and this runs on a reasoning model.
+        with urllib.request.urlopen(req, timeout=600) as resp:  # noqa: S310 - loopback only
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:400]
+        console.print(f"[red]HTTP {e.code}:[/red] {detail}")
+        raise SystemExit(1) from None
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Failed:[/red] {e}")
+        console.print(f"Is the coordinator running with its dashboard on {host}:{port}?")
+        raise SystemExit(1) from None
+
+    if data.get("error"):
+        console.print(f"[yellow]{data['error']}[/yellow]")
+    answer = (data.get("answer") or "").strip()
+    if not answer:
+        console.print("[red]No answer returned.[/red]")
+        raise SystemExit(1)
+    meta = " · ".join(x for x in [
+        data.get("model"), f"{data.get('seconds')}s" if data.get("seconds") else "",
+        (f"dossier {int(data['dossier_chars']) // 1000}k chars"
+         if data.get("dossier_chars") else ""),
+    ] if x)
+    console.print()
+    console.print(answer)
+    if meta:
+        console.print(f"\n[dim]{meta}[/dim]")
+    for note in data.get("trimmed") or []:
+        console.print(f"[dim]trimmed: {note}[/dim]")
 
 
 if __name__ == "__main__":

@@ -109,6 +109,56 @@ def test_long_text_with_a_transport_word_is_treated_as_prose() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The TARGET's status codes are findings, not outages
+# ---------------------------------------------------------------------------
+
+TARGET_STATUS_FINDINGS = [
+    # The central observation of an entire challenge family. Classifying this as
+    # an infrastructure failure sent it through publishable(), which deleted it
+    # from the blackboard — the team lost its own best evidence.
+    "[fact] the endpoint returns HTTP 422 for every blocked class name",
+    "HTTP 422 with body 'legacy extension not permitted'",
+    "[fact] that input makes the migrator return HTTP 500",
+    "status: 403 on /admin but 200 on /migrate — the filter is path-scoped",
+    "[fact] the upload succeeded, response was HTTP 201 with a draft id",
+    "probed 40 variants: 38 gave HTTP 422, 2 gave HTTP 200 and took 3s longer",
+    "[fact] the service answered HTTP 200 and set a session cookie",
+]
+
+
+def test_the_targets_status_codes_are_not_infrastructure_failures() -> None:
+    """A solver reporting what the CHALLENGE returned must never be mistaken for a
+    report that the GATEWAY failed. These two are indistinguishable to a regex that
+    only looks for a status code, and getting it wrong deletes real findings."""
+    for text in TARGET_STATUS_FINDINGS:
+        assert classify_api_error(text) is None, text[:70]
+
+
+def test_those_findings_survive_the_blackboard_gate() -> None:
+    """The consequence, asserted where it actually bites: publishable() is what
+    decides whether a round's harvest reaches the rest of the swarm."""
+    from backend.agents.swarm import publishable
+
+    for text in TARGET_STATUS_FINDINGS:
+        assert publishable(text), text[:70]
+
+
+def test_a_gateway_error_still_wins_when_it_is_prefixed() -> None:
+    """The fix must not blind the classifier to real outages — the ECONNREFUSED run
+    that motivated this whole module still has to be caught."""
+    assert classify_api_error("API Error: HTTP 503 from the gateway") == INFRA_ERROR
+    assert classify_api_error("API Error: HTTP 429") == QUOTA_ERROR
+    assert classify_api_error("Request failed with status code 500") == INFRA_ERROR
+
+
+def test_a_short_bare_gateway_status_is_still_caught() -> None:
+    """No prefix, but the shape is unmistakably a transport error rather than a
+    finding about a target."""
+    assert classify_api_error("502 Bad Gateway") == INFRA_ERROR
+    assert classify_api_error("500 Internal Server Error") == INFRA_ERROR
+
+
+# ---------------------------------------------------------------------------
 # Status codes
 # ---------------------------------------------------------------------------
 

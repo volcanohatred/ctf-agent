@@ -68,7 +68,19 @@ def classify_api_error(text: str) -> str | None:
     looks_like_api_error = bool(_API_ERROR_RE.match(stripped))
     status = None
     m = _STATUS_RE.search(stripped[:400])
-    if m:
+    # An HTTP status counts as an infrastructure signal ONLY when the message is
+    # also shaped like a CLI/gateway error. On its own it proves nothing about the
+    # gateway, because solvers report the TARGET's statuses constantly — and both
+    # of the interesting cases are findings, not outages:
+    #   "[fact] the endpoint returns HTTP 422 for blocked classes" is the central
+    #     observation of an entire challenge family;
+    #   "[fact] that input makes it return HTTP 500" is an exploit primitive.
+    # Classifying those as INFRA_ERROR routed them through `publishable()`, which
+    # silently deleted them from the blackboard — the team lost its own best
+    # evidence and the round was counted as a dead gateway. Success statuses fell
+    # through every branch below and hit the trailing `return INFRA_ERROR` too, so
+    # "HTTP 200" was deleted exactly like "HTTP 503".
+    if m and looks_like_api_error:
         status = int(m.group(1) or m.group(2))
 
     # No explicit API-error prefix and no HTTP status: accept a bare transport

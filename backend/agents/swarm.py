@@ -245,6 +245,12 @@ class ChallengeSwarm:
     _strategist_pivots: int = field(init=False, default=0)
     _strategist_failures: int = field(init=False, default=0)
     _strategist_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
+    # True only while a consultation is actually in flight. The lock is held just
+    # long enough to check-and-claim, never across the gateway call: holding it for
+    # the measured 100-150s (up to the 300s timeout) serialised every solver's bump
+    # path behind one in-flight consult.
+    _strategist_running: bool = field(init=False, default=False)
+    _last_strategist_ts: float = field(init=False, default=0.0)
     # Active verification. Claims awaiting a probe, the runner that drains them,
     # and the audit counters. The runner is created lazily and started on the
     # first queued claim so a challenge solved in 40s never pays for a sandbox.
@@ -708,15 +714,21 @@ class ChallengeSwarm:
         (the stale-round circuit breaker) bypasses that interval — a solver that
         has stopped teaching the team anything is precisely when a step-back is
         overdue, and waiting for the next tick is what let a swarm grind the same
-        payload for hours.
+        payload for hours — but it is still rate-limited by
+        `strategist_min_interval_s`, because with four stuck solvers each tripping
+        the breaker the forced path alone could run unbounded strong-model calls.
 
-        Concurrency: several solvers bump at once. The generation check sits
-        inside the lock so only the first one pays for the call; the others see
-        the advanced generation and reuse the verdict already on the board.
+        Concurrency: the lock covers only the check-and-claim, NOT the gateway call.
+        Holding it across a call that measures 100-150s (and can take the full 300s
+        timeout) serialised every solver's bump path behind one in-flight
+        consultation — the swarm that most needed unsticking was the one that stalled
+        hardest, and `_wind_down`'s grace period could not interrupt it. Late arrivals
+        now see `_strategist_running` and proceed without waiting; the verdict reaches
+        them through the broadcast anyway.
 
-        Returns "" when the strategist is disabled or produced nothing worth
-        broadcasting. A failed gateway call is silent by design — an invented
-        PIVOT would yank every solver off a working line of attack, which is
+        Returns "" when the strategist is disabled, already running, or produced
+        nothing worth broadcasting. A failed gateway call is silent by design — an
+        invented PIVOT would yank every solver off a working line of attack, which is
         strictly worse than no opinion at all.
         """
         every = int_setting(self.settings, "strategist_every_bumps")
@@ -724,78 +736,100 @@ class ChallengeSwarm:
             return ""
 
         async with self._strategist_lock:
-            if self.cancel_event.is_set():
+            if self.cancel_event.is_set() or self._strategist_running:
                 return ""
             gen = self._total_bumps // every
             if not force and gen <= self._strategist_gen:
                 return ""
+            min_interval = float_setting(self.settings, "strategist_min_interval_s")
+            now = time.monotonic()
+            if min_interval > 0 and (now - self._last_strategist_ts) < min_interval:
+                logger.debug(
+                    f"[{self.meta.name}] strategist consult skipped — one ran "
+                    f"{now - self._last_strategist_ts:.0f}s ago (min interval {min_interval:.0f}s)"
+                )
+                return ""
+            # Claim the slot under the lock, then release it before the network call.
+            self._strategist_running = True
+            self._last_strategist_ts = now
             if not force:
                 self._strategist_gen = gen
 
-            from backend.strategist import consult_strategist
+        try:
+            return await self._consult_and_broadcast_strategist(force)
+        finally:
+            self._strategist_running = False
 
-            logger.info(
-                f"[{self.meta.name}] Strategist consult "
-                f"({'FORCED by stale-round breaker' if force else f'bump {self._total_bumps}'})"
+    async def _consult_and_broadcast_strategist(self, force: bool) -> str:
+        """The network call and its consequences. Runs WITHOUT the strategist lock."""
+        from backend.strategist import consult_strategist
+
+        logger.info(
+            f"[{self.meta.name}] Strategist consult "
+            f"({'FORCED by stale-round breaker' if force else f'bump {self._total_bumps}'})"
+        )
+        try:
+            verdict = await consult_strategist(
+                name=self.meta.name,
+                category=self.meta.category,
+                value=self.meta.value,
+                tags=self.meta.tags,
+                connection=self.meta.connection_info,
+                distfiles=list_distfiles(self.challenge_dir),
+                description=self.meta.description,
+                dead_ends=list(self._seen_dead_ends),
+                failed_approaches=list(self._failed_approaches),
+                bumps=self._total_bumps,
+                settings=self.settings,
+                cost_tracker=self.cost_tracker,
+                agent_name=f"{self.meta.name}/strategist",
             )
-            try:
-                verdict = await consult_strategist(
-                    name=self.meta.name,
-                    category=self.meta.category,
-                    value=self.meta.value,
-                    tags=self.meta.tags,
-                    connection=self.meta.connection_info,
-                    distfiles=list_distfiles(self.challenge_dir),
-                    description=self.meta.description,
-                    dead_ends=list(self._seen_dead_ends),
-                    failed_approaches=list(self._failed_approaches),
-                    bumps=self._total_bumps,
-                    settings=self.settings,
-                    cost_tracker=self.cost_tracker,
-                    agent_name=f"{self.meta.name}/strategist",
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 — the strategist is an enhancement
-                logger.warning(f"[{self.meta.name}] strategist failed: {e}")
-                return ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the strategist is an enhancement
+            self._strategist_failures += 1
+            logger.warning(
+                f"[{self.meta.name}] strategist raised ({type(e).__name__}: {e}) — "
+                f"failure #{self._strategist_failures}, the strategy was NOT reviewed"
+            )
+            return ""
 
-            if not verdict.available:
-                # A dead strategist and a strategist that said "carry on" must not
-                # look the same. Measured against a live gateway, the original 60s
-                # timeout failed on every single call while logging at debug level,
-                # so the mechanism was silently dead and the operator had no way to
-                # know the strategy was never being reviewed.
-                self._strategist_failures += 1
-                logger.warning(
-                    f"[{self.meta.name}] Strategist produced NO verdict "
-                    f"({verdict.reason}) — failure #{self._strategist_failures}. "
-                    "The strategy was not reviewed this round; if this repeats, check "
-                    "STRATEGIST_TIMEOUT_S / STRATEGIST_MAX_TOKENS / the model name."
-                )
-                return ""
+        if not verdict.available:
+            # A dead strategist and a strategist that said "carry on" must not
+            # look the same. Measured against a live gateway, the original 60s
+            # timeout failed on every single call while logging at debug level,
+            # so the mechanism was silently dead and the operator had no way to
+            # know the strategy was never being reviewed.
+            self._strategist_failures += 1
+            logger.warning(
+                f"[{self.meta.name}] Strategist produced NO verdict "
+                f"({verdict.reason}) — failure #{self._strategist_failures}. "
+                "The strategy was not reviewed this round; if this repeats, check "
+                "STRATEGIST_TIMEOUT_S / STRATEGIST_MAX_TOKENS / the model name."
+            )
+            return ""
 
-            text = verdict.broadcast_text
-            await self.message_bus.broadcast(text, source="strategist")
-            if verdict.pivot:
-                self._strategist_pivots += 1
-                logger.warning(f"[{self.meta.name}] Strategist PIVOT → {verdict.text[:200]}")
-                if self.coordinator_inbox is not None:
-                    # Best-effort: a coordinator notification must never be able to
-                    # kill the solver round that asked for it.
-                    try:
-                        self.coordinator_inbox.put_nowait(
-                            f"STRATEGIST PIVOT on '{self.meta.name}' after {self._total_bumps} "
-                            f"bumps: {verdict.text[:300]} — broadcast to all solvers. Do not "
-                            "steer them back to the excluded directions."
-                        )
-                    except asyncio.QueueFull:
-                        logger.warning(
-                            f"[{self.meta.name}] coordinator inbox full — pivot notice dropped"
-                        )
-            else:
-                logger.info(f"[{self.meta.name}] Strategist CONTINUE ({verdict.text[:120]})")
-            return text
+        text = verdict.broadcast_text
+        await self.message_bus.broadcast(text, source="strategist")
+        if verdict.pivot:
+            self._strategist_pivots += 1
+            logger.warning(f"[{self.meta.name}] Strategist PIVOT → {verdict.text[:200]}")
+            if self.coordinator_inbox is not None:
+                # Best-effort: a coordinator notification must never be able to
+                # kill the solver round that asked for it.
+                try:
+                    self.coordinator_inbox.put_nowait(
+                        f"STRATEGIST PIVOT on '{self.meta.name}' after {self._total_bumps} "
+                        f"bumps: {verdict.text[:300]} — broadcast to all solvers. Do not "
+                        "steer them back to the excluded directions."
+                    )
+                except asyncio.QueueFull:
+                    logger.warning(
+                        f"[{self.meta.name}] coordinator inbox full — pivot notice dropped"
+                    )
+        else:
+            logger.info(f"[{self.meta.name}] Strategist CONTINUE ({verdict.text[:120]})")
+        return text
 
     async def _run_escalated_solver(self, model_spec: str) -> SolverResult | None:
         """Run an escalation solver seeded with the full dead-end ledger."""
@@ -1077,7 +1111,16 @@ class ChallengeSwarm:
                     await self._post_finding(model_spec, line, KIND_CLAIM,
                                              summary=summaries.get(line, ""))
                     posted = True
-                    self._enqueue_for_verification(line, model_spec)
+                    if tagged:
+                        self._enqueue_for_verification(line, model_spec)
+                    else:
+                        # The board keeps the blob (readable, one entry), but the
+                        # queue gets atomic sentences — a multi-line blob is rejected
+                        # by _enqueue_for_verification, so without this a solver that
+                        # skipped the [fact] tags contributed findings that were never
+                        # probed at all.
+                        for candidate in self._prose_candidates(line):
+                            self._enqueue_for_verification(candidate, model_spec)
             if not corroborated and not claims:
                 logger.debug(
                     f"[{self.meta.name}/{model_spec}] every reported finding was "
@@ -1232,6 +1275,46 @@ class ChallengeSwarm:
     # Below this a "claim" is too short to be a testable assertion ("422", "no
     # flag") and a probe would just burn a sandbox round on noise.
     MIN_TESTABLE_CLAIM_CHARS = 16
+    # Cap on candidate claims extracted from one round of untagged prose. A verbose
+    # solver would otherwise flood the queue and starve the tagged claims, which are
+    # the ones the model deliberately asserted.
+    MAX_PROSE_CANDIDATES = 3
+
+    # Split after CJK terminators with NO following whitespace (Chinese does not put
+    # a space after 。), but after an ASCII period only when whitespace follows —
+    # otherwise "0.5" and "e.g." would each become a "sentence".
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。；;！!？?])|(?<=\.)\s+|\n+")
+
+    def _prose_candidates(self, text: str) -> list[str]:
+        """Split untagged prose into atomic, probe-shaped candidate claims.
+
+        Untagged output is published to the board as ONE blob — splitting it there
+        would put a dozen half-sentences up as separate findings — but a blob can
+        never be verified: `_enqueue_for_verification` rejects multi-line text, and
+        `normalize` keys the whole blob, so two solvers would have to emit
+        byte-identical prose to corroborate it. Measured consequence: a solver that
+        ignored the `[fact]` tagging instruction contributed findings that were never
+        probed at all, which is exactly the population a weak or quantized model
+        belongs to.
+
+        So the blob stays on the board and the sentences go to the queue. Triage
+        decides which are worth a sandbox round; this only has to produce candidates
+        that are atomic enough to test.
+        """
+        out: list[str] = []
+        for raw in self._SENTENCE_SPLIT_RE.split(text or ""):
+            sentence = " ".join(raw.split())
+            if len(sentence) < self.MIN_TESTABLE_CLAIM_CHARS:
+                continue
+            if len(sentence) > 400:
+                # A "sentence" this long is a paragraph the splitter missed; probing
+                # it would reproduce the original problem.
+                continue
+            if sentence not in out:
+                out.append(sentence)
+            if len(out) >= self.MAX_PROSE_CANDIDATES:
+                break
+        return out
 
     def _probe_budget_exhausted(self) -> bool:
         """True when VERIFIER_MAX_PROBES has been reached.

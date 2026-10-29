@@ -385,12 +385,76 @@ async def test_trivia_is_not_queued(claim: str) -> None:
     assert len(swarm._claim_queue) == 0
 
 
-async def test_multiline_prose_is_not_queued() -> None:
+async def test_multiline_prose_is_queued_as_atomic_sentences_not_as_a_blob() -> None:
     """A verifier handed a paragraph tests whichever sentence it fixates on while
-    appearing to have checked the whole thing."""
+    appearing to have checked the whole thing — so the blob itself must never be
+    queued. But refusing to queue anything meant a solver that skipped the `[fact]`
+    tags contributed findings that were never probed at all, which is exactly the
+    population a weak or quantized model belongs to. The board keeps the blob as one
+    readable entry; the queue gets testable sentences.
+    """
     swarm = _swarm()
-    await swarm._publish_harvest("m1", "I think the sink is reachable\nand the filter is weak")
-    assert len(swarm._claim_queue) == 0
+    await swarm._publish_harvest(
+        "m1",
+        "The migrate endpoint returns 422 for blocked names.\n"
+        "The uploaded JAR does get loaded by the worker.\n"
+        "Short.\n",
+    )
+
+    assert len(swarm.message_bus.findings) == 1, "the board still holds ONE blob entry"
+    queued = []
+    while len(swarm._claim_queue):
+        item = await swarm._claim_queue.pop(timeout=0.05)
+        if item is None:
+            break
+        queued.append(item.content)
+
+    assert len(queued) == 2, queued
+    assert all("\n" not in q for q in queued), "no multi-line blob may reach a probe"
+    # Too-short fragments are dropped rather than probed.
+    assert all(len(q) >= swarm.MIN_TESTABLE_CLAIM_CHARS for q in queued)
+
+
+async def test_prose_extraction_is_capped_so_a_verbose_round_cannot_flood_the_queue() -> None:
+    """Tagged claims are deliberate assertions; prose sentences are candidates. An
+    uncapped extraction would let one chatty round starve them."""
+    swarm = _swarm()
+    verbose = "\n".join(
+        f"Sentence number {i} makes a distinct claim about the target endpoint."
+        for i in range(20)
+    )
+
+    await swarm._publish_harvest("m1", verbose)
+
+    assert len(swarm._claim_queue) == swarm.MAX_PROSE_CANDIDATES
+
+
+def test_prose_candidate_extraction_shape() -> None:
+    swarm = _swarm()
+
+    assert swarm._prose_candidates("") == []
+    assert swarm._prose_candidates("too short") == []
+    # Sentence terminators in both scripts split. Chinese puts no space after 。, so
+    # the CJK alternative must be zero-width while the ASCII period requires
+    # following whitespace — otherwise "0.5" and "e.g." become "sentences".
+    assert swarm._prose_candidates(
+        "First claim about the target endpoint behaviour. "
+        "第二个关于目标端点行为的声称内容。"
+        "Third distinct claim about the same endpoint."
+    ) == [
+        "First claim about the target endpoint behaviour.",
+        "第二个关于目标端点行为的声称内容。",
+        "Third distinct claim about the same endpoint.",
+    ]
+    # An ASCII period NOT followed by whitespace does not split.
+    assert swarm._prose_candidates(
+        "the ratio is 0.5 and the offset is 1.25 in this build") == [
+        "the ratio is 0.5 and the offset is 1.25 in this build"]
+    # A paragraph the splitter missed is skipped rather than probed whole.
+    assert swarm._prose_candidates("x" * 900) == []
+    # Duplicates within one round are not queued twice.
+    dupe = "The migrate endpoint returns 422 for blocked names. " * 3
+    assert len(swarm._prose_candidates(dupe)) == 1
 
 
 async def test_corroborated_facts_are_not_requeued() -> None:

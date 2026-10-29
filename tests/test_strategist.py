@@ -442,6 +442,9 @@ def _settings(**over) -> SimpleNamespace:
         summarizer_model="", gateway_base_url="", gateway_api_key="",
         corroborate_facts=True, strategist_every_bumps=0, strategist_model="",
         coordinator_model="", stale_round_limit=0,
+        # 0 so the generation-interval tests below measure the generation gate and
+        # not the wall-clock rate limit, which has its own dedicated test.
+        strategist_min_interval_s=0.0,
         bump_cooldown_base_s=0, bump_cooldown_step_s=0, bump_cooldown_max_s=0,
         quota_backoff_base_s=0, quota_backoff_max_s=0,
     )
@@ -594,6 +597,98 @@ async def test_the_next_interval_consults_again(fake_strategist) -> None:
     await swarm._run_strategist()
 
     assert len(fake_strategist.calls) == 2
+
+
+async def test_a_forced_consult_is_still_rate_limited(fake_strategist) -> None:
+    """`force` bypasses the bump-generation gate on purpose — a stuck solver should
+    not wait for the next tick. But it must not bypass the wall-clock interval, or
+    four solvers each tripping the stale-round breaker produce four strong-model
+    calls per cycle with no ceiling on an unlimited-rounds run.
+    """
+    swarm = _swarm(strategist_every_bumps=4, strategist_min_interval_s=600.0)
+    swarm._total_bumps = 4
+
+    assert await swarm._run_strategist(force=True) != ""
+    assert len(fake_strategist.calls) == 1
+
+    # A second forced call immediately after is refused by the interval, not by the
+    # generation gate (forced calls never consult it).
+    swarm._total_bumps = 8
+    assert await swarm._run_strategist(force=True) == ""
+    assert len(fake_strategist.calls) == 1, "the interval must hold for forced calls too"
+
+
+async def test_a_zero_interval_disables_the_rate_limit(fake_strategist) -> None:
+    swarm = _swarm(strategist_every_bumps=4, strategist_min_interval_s=0.0)
+
+    for bumps in (4, 8):
+        swarm._total_bumps = bumps
+        await swarm._run_strategist(force=True)
+
+    assert len(fake_strategist.calls) == 2
+
+
+async def test_a_second_solver_does_not_wait_on_an_in_flight_consult(fake_strategist) -> None:
+    """The lock covers check-and-claim only, never the gateway call. Holding it
+    across a call that measures 100-150s (and can take the full 300s timeout)
+    serialised every solver's bump path behind one in-flight consultation — the swarm
+    that most needed unsticking stalled hardest, and `_wind_down`'s grace period
+    could not interrupt it.
+    """
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(**kwargs):
+        del kwargs
+        started.set()
+        await release.wait()
+        return fake_strategist.verdict
+
+    import backend.strategist as strategist_mod
+
+    original = strategist_mod.consult_strategist
+    strategist_mod.consult_strategist = _slow
+    try:
+        swarm = _swarm(strategist_every_bumps=4, strategist_min_interval_s=0.0)
+        swarm._total_bumps = 4
+
+        first = asyncio.create_task(swarm._run_strategist())
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        # A second solver bumps while the first consult is still in flight. It must
+        # return promptly rather than blocking on the lock until the call finishes.
+        second = asyncio.create_task(swarm._run_strategist(force=True))
+        await asyncio.wait_for(second, timeout=2)
+        assert second.result() == "", "a late arrival proceeds without the verdict"
+
+        release.set()
+        await asyncio.wait_for(first, timeout=2)
+    finally:
+        strategist_mod.consult_strategist = original
+        release.set()
+
+    assert swarm._strategist_running is False, "the in-flight flag must be cleared"
+
+
+async def test_the_in_flight_flag_is_cleared_even_when_the_call_raises(
+        fake_strategist, monkeypatch) -> None:
+    """A stuck flag would disable the strategist for the rest of the run — the same
+    silent-death shape this module has already shipped twice."""
+    import backend.strategist as strategist_mod
+
+    async def _boom(**kwargs):
+        del kwargs
+        raise RuntimeError("gateway exploded")
+
+    monkeypatch.setattr(strategist_mod, "consult_strategist", _boom)
+    swarm = _swarm(strategist_every_bumps=4, strategist_min_interval_s=0.0)
+    swarm._total_bumps = 4
+
+    assert await swarm._run_strategist() == ""
+    assert swarm._strategist_running is False
+    assert swarm._strategist_failures == 1
 
 
 async def test_the_strategist_is_not_shown_the_tactical_board(fake_strategist) -> None:

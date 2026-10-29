@@ -307,6 +307,13 @@ class Settings(BaseSettings):
     # emitted and the truncated tail read as CONTINUE — the opposite of what the
     # model had concluded.
     strategist_max_tokens: int = 8000
+    # Minimum seconds between ANY two strategist consultations, including the ones
+    # the stale-round breaker forces. The periodic path is already rate-limited by
+    # generation, but a forced call bypassed that entirely, so four stuck solvers
+    # each tripping the breaker produced four strong-model calls per breaker cycle
+    # with no ceiling — on an unlimited-rounds coordinator run, unbounded spend on
+    # the mechanism meant to save the run. 0 disables the interval.
+    strategist_min_interval_s: float = 120.0
     # Contradiction audit overrides. Empty/0 = use REASONING_MODEL and the
     # module defaults.
     audit_model: str = ""

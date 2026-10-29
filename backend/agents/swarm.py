@@ -251,6 +251,22 @@ class ChallengeSwarm:
         self._all_specs = list(self.model_specs)
         self.skill_router = SkillRouter(skills_dir=getattr(self.settings, "skills_dir", "") or "")
         self._skill_pack_ids = []
+        # Master switch. Gating here rather than in _skill_hint means triage never
+        # runs and the rotation queue is never built, so both injection and rotation
+        # are off from a single flag.
+        #
+        # This deliberately does NOT stop solvers being told that /skills exists —
+        # that comes from settings.skills_dir in the solver's own prompt builder and
+        # describes the passive mount, which is the one mechanism with no plausible
+        # downside. Turning off the push without turning off the availability is
+        # exactly the configuration worth measuring.
+        if not bool(getattr(self.settings, "skill_hints", True)):
+            logger.info(
+                f"[{self.meta.name}] SKILL_HINTS=false — no triage, no hint injection, "
+                "no approach rotation (the library stays mounted for solvers to read "
+                "on their own)"
+            )
+            return
         if self.skill_router.enabled:
             try:
                 self._skill_pack_ids = self.skill_router.triage(
@@ -451,6 +467,11 @@ class ChallengeSwarm:
 
     def _skill_hint(self, bump_count: int) -> str:
         """Escalating knowledge-base hint, activated after repeated failures."""
+        # Checked explicitly rather than relying on __post_init__ having left
+        # _skill_pack_ids empty: the switch that measures this mechanism has to hold
+        # even if pack ids are populated from somewhere else later.
+        if not bool(getattr(self.settings, "skill_hints", True)):
+            return ""
         threshold = getattr(self.settings, "skill_after_bumps", 1)
         if not self._skill_pack_ids or bump_count < threshold:
             return ""
@@ -480,6 +501,14 @@ class ChallengeSwarm:
         Returns None when rotation is disabled or the queue is exhausted; callers
         then emit no direction and the solver keeps its own.
         """
+        # Both switches are checked here, not only at construction. __post_init__
+        # already skips building the queue when SKILL_HINTS is false, but relying on
+        # construction order for a safety property is how it gets undone later by
+        # someone who populates the queue from elsewhere. The imperative
+        # "本轮专攻新方向…先读再做" is the single most suspected source of harm for
+        # weak models, so the switch that measures it must hold unconditionally.
+        if not bool(getattr(self.settings, "skill_hints", True)):
+            return None
         if not bool(getattr(self.settings, "skill_rotate_approaches", True)):
             return None
 

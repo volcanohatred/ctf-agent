@@ -175,6 +175,17 @@ class Settings(BaseSettings):
     # 1 = hints join from the first retry. Matches README / .env.example /
     # docker-compose.
     skill_after_bumps: int = 1
+    # Master switch for the agent-side skill machinery: triage, escalating hint
+    # injection, and the technique-rotation queue. False leaves the library MOUNTED
+    # at /skills (that is SKILLS_HOST_DIR's job) so solvers can still read it on
+    # their own initiative — it only stops the swarm from pushing it at them.
+    #
+    # This exists because SKILLS_DIR cannot serve as the switch: docker-compose pins
+    # it to the in-container mount point and compose `environment:` overrides
+    # `env_file:`, so under Docker there was no way to turn injection off at all.
+    # That made "does the skill library help this model lineup?" unanswerable in the
+    # mode people actually deploy.
+    skill_hints: bool = True
     # Rotate the assigned skill handbook on each retry. This is a SEPARATE mechanism
     # from the hint injection above, and it used to have no switch of its own —
     # SKILLS_DIR="" turned off both at once, so there was no way to A/B them and no

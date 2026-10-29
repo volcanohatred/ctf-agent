@@ -48,7 +48,8 @@ def _settings(**over) -> SimpleNamespace:
         sandbox_image="ctf-sandbox", container_memory_limit="1g", container_cpu_limit=1.0,
         sandbox_command_timeout_s=60, solver_time_budget_s=0, conclude_timeout_s=5,
         max_attempts_per_challenge=12, max_infra_failures=0, skill_after_bumps=1,
-        skill_rotate_approaches=True, escalate_after_bumps=0, fresh_restart_rounds=0,
+        skill_hints=True, skill_rotate_approaches=True,
+        escalate_after_bumps=0, fresh_restart_rounds=0,
         summarize_threshold_chars=900, summarizer_model="", gateway_base_url="",
         gateway_api_key="", corroborate_facts=True, strategist_every_bumps=0,
         stale_round_limit=0, verify_claims=False, audit_contradictions=False,
@@ -266,6 +267,45 @@ def test_disabled_rotation_leaves_hints_alone() -> None:
     assert swarm._next_approach("m1", APPROACH_FAILED) is None
     # _skill_hint only needs pack ids; it does not consult the queue.
     assert isinstance(swarm._skill_hint(1), str)
+
+
+def test_the_master_switch_disables_triage_so_nothing_is_injected() -> None:
+    """SKILL_HINTS=false has to stop the machinery at the source. Gating only
+    _skill_hint would still run triage and still build the rotation queue, leaving
+    the imperative "本轮专攻新方向" in every bump — the half most suspected of hurting
+    weak models would survive the switch meant to measure it."""
+    swarm = ChallengeSwarm(
+        challenge_dir=".",
+        meta=SimpleNamespace(name="chal", category="pwn", value=100, description="heap tcache",
+                             tags=["heap"], connection_info="", hints=[]),
+        ctfd=SimpleNamespace(),
+        cost_tracker=SimpleNamespace(by_agent={}, total_cost_usd=0.0,
+                                     record_tokens=lambda *a, **k: None),
+        settings=_settings(skill_hints=False),
+        model_specs=["m1"],
+        no_submit=True,
+    )
+
+    assert swarm._skill_pack_ids == [], "triage must not run"
+    assert swarm._approach_queue == [], "the rotation queue must not be built"
+    assert swarm._skill_hint(3) == ""
+    assert swarm._next_approach("m1", APPROACH_FAILED) is None
+
+
+def test_the_master_switch_defaults_to_on() -> None:
+    """Off-by-default would silently change every existing deployment's behaviour
+    and make the A/B baseline meaningless."""
+    swarm = _swarm()
+    assert getattr(swarm.settings, "skill_hints", True) is True
+
+
+@pytest.mark.asyncio
+async def test_no_direction_is_emitted_when_the_master_switch_is_off() -> None:
+    swarm = _swarm(skill_hints=False)
+
+    payload = await swarm._build_bump_payload("m1", "no flag", 3, APPROACH_FAILED)
+
+    assert payload == "no flag", "nothing skill-related may be injected"
 
 
 def test_an_empty_queue_assigns_nothing() -> None:

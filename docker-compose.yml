@@ -48,9 +48,16 @@ services:
       #
       # DooD: sandbox binds must use HOST paths
       HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?Set HOST_PROJECT_DIR in .env (absolute project path on the docker host)}
-      # Skills: BOTH are required. SKILLS_DIR is what the agent itself reads
-      # (triage / index rendering / the technique-rotation queue);
+      # Skills: BOTH are required for the library to be used. SKILLS_DIR is what
+      # the AGENT reads (triage / index rendering / the technique-rotation queue);
       # SKILLS_HOST_DIR is what gets bind-mounted into each sandbox.
+      #
+      # SKILLS_DIR stays pinned to the in-container mount point and is NOT the
+      # on/off switch — compose `environment:` overrides `env_file:`, so blanking it
+      # from .env would not work anyway. To disable the agent-side skill machinery
+      # while keeping the library mounted for solvers to read on their own, set
+      # SKILL_HINTS=false in .env (it passes through env_file: normally). Rotation
+      # has its own switch, SKILL_ROTATE_APPROACHES, so the two can be A/B'd apart.
       SKILLS_DIR: /skills
       SKILLS_HOST_DIR: ${SKILLS_HOST_DIR:-}
       # Inside the container these two MUST be 0.0.0.0 or Docker cannot forward

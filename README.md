@@ -441,17 +441,25 @@ round reading a file that does not apply.
 | # | Mechanism | Switch | Risk |
 |---|---|---|---|
 | 1 | Library **mounted** at `/skills` — solver reads only if it chooses | `SKILLS_HOST_DIR` | none; purely opt-in from the model's side |
-| 2 | **Hint injection** — escalating L1 pointer → L2 index excerpt + full file list → L3 similar writeups | `SKILLS_DIR` + `SKILL_AFTER_BUMPS` | context crowding: from L2 every restart payload carries up to ~2.6k chars × 2 packs plus a full file listing, competing with the distilled journal and team digest |
+| 2 | **Hint injection** — escalating L1 pointer → L2 index excerpt + full file list → L3 similar writeups | `SKILL_HINTS` + `SKILL_AFTER_BUMPS` | context crowding: from L2 every restart payload carries up to ~2.6k chars × 2 packs plus a full file listing, competing with the distilled journal and team digest |
 | 3 | **Approach rotation** — assign the next handbook each retry | `SKILL_ROTATE_APPROACHES` | highest: imperative redirection away from the solver's own line of attack |
 
-Note `SKILL_AFTER_BUMPS=0` does **not** disable hints — the level formula is
-`1 + (bump - N)`, so 0 injects from bump 0. To turn injection off, unset
-`SKILLS_DIR`; the mount (1) is controlled separately by `SKILLS_HOST_DIR`.
+`SKILL_HINTS=false` turns off (2) and (3) together — triage never runs, so the
+rotation queue is never built — while leaving (1) mounted. `SKILL_ROTATE_APPROACHES`
+then separates (3) from (2). Both switches are checked in `_next_approach` and
+`_skill_hint` themselves, not only at construction, so the invariant holds even if
+something populates the queue later.
 
-Note also that `docker-compose.yml` sets `SKILLS_DIR: /skills`, and compose's
-`environment:` overrides `env_file:`. So (2) and (3) are **active under Docker even
-when `.env` leaves `SKILLS_DIR` empty**, and inactive in host-local mode. If you are
-comparing runs across the two modes, you are not comparing the same configuration.
+Note `SKILL_AFTER_BUMPS=0` does **not** disable hints — the level formula is
+`1 + (bump - N)`, so 0 injects from bump 0.
+
+Note also that `SKILLS_DIR` cannot serve as the off switch: `docker-compose.yml`
+pins it to `/skills` (the in-container mount point) and compose's `environment:`
+overrides `env_file:`. Under Docker, injection and rotation are therefore active
+regardless of what `.env` says about `SKILLS_DIR`, and in host-local mode with
+`SKILLS_DIR` empty they are off entirely — **two runs across those modes are not the
+same configuration.** `SKILL_HINTS` passes through `env_file:` normally, which is
+why it exists.
 
 ### Rotation only records a real failure
 
@@ -478,25 +486,35 @@ Outcome is now classified three ways, and only the first is recorded:
 
 ### A/B recipe
 
-Everything else equal, one variable per arm — `ctf-bench` reports `usable_run`, so
-check that before reading any solve rate:
+One variable per arm, everything else identical. `ctf-bench` reports `usable_run` —
+check it before reading any solve rate, since a run decided by infrastructure
+measures nothing. All four arms are settable from `.env` alone, including under
+Docker:
 
 ```bash
-# arm 1: all active                      (current Docker default)
-SKILLS_DIR=/skills SKILL_ROTATE_APPROACHES=true  ctf-bench --challenges-dir challenges
-# arm 2: hints only, solver keeps its own line of attack
-SKILLS_DIR=/skills SKILL_ROTATE_APPROACHES=false ctf-bench --challenges-dir challenges
-# arm 3: passive library — mounted, never injected
-SKILLS_DIR=        SKILLS_HOST_DIR=/host/path    ctf-bench --challenges-dir challenges
-# arm 4: no library at all               (baseline)
-SKILLS_DIR=        SKILLS_HOST_DIR=              ctf-bench --challenges-dir challenges
+# arm 1: all active                        (current default)
+SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=true   SKILLS_HOST_DIR=/host/path
+# arm 2: injection only — solver keeps its own line of attack
+SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=false  SKILLS_HOST_DIR=/host/path
+# arm 3: passive library — mounted, never pushed
+SKILL_HINTS=false                                SKILLS_HOST_DIR=/host/path
+# arm 4: no library at all                   (baseline)
+SKILL_HINTS=false                                SKILLS_HOST_DIR=
+
+ctf-bench --challenges-dir challenges --concurrency 2 --time-limit 1800 \
+          --models <same list every arm> --output logs/ab-arm1.json
 ```
 
-Arm 1 vs 2 isolates rotation; 2 vs 3 isolates injection; 3 vs 4 asks whether a
-library the model may read on its own initiative is worth anything at all. Use the
-same `--models`, `--time-limit` and challenge set across arms, and run each arm more
-than once if you can — per-challenge variance on a 10-challenge set is large enough
-that a single run's difference is often noise.
+arm1-vs-2 isolates rotation, 2-vs-3 isolates injection, 3-vs-4 asks whether a library
+the model may read unprompted is worth anything at all.
+
+Two cautions. Per-challenge variance on a 10-challenge set is large enough that a
+single run's difference is often noise — repeat arms if you can afford it, and read
+the per-challenge rows rather than only the aggregate. And the report's audit counters
+help explain a loss even when the solve rate does not move: `stale_breaks` rising
+means solvers were being pushed off their own direction, and a high
+`unverified_claims` count with near-zero `probe_verified` means the run never
+established ground truth either way.
 
 ## Offline Challenge Format & Benchmark
 
@@ -527,7 +545,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 619 tests, no Docker / no LLM / no network
+uv run pytest -q             # 622 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports
@@ -570,8 +588,9 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `CONCLUDE_TIMEOUT_S` | `90` | Independent budget for the phase-2 conclude harvest |
 | `MAX_ATTEMPTS_PER_CHALLENGE` | `12` | Hard cap on retry rounds per solver. 0 = unlimited. Must be ≥ `2×FRESH_RESTART_ROUNDS+1` for two merge cycles |
 | `MAX_INFRA_FAILURES` | `3` | Consecutive infra failures before a swarm retires itself |
-| `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts. **0 does not disable** (level = 1+bump−N); unset `SKILLS_DIR` for that |
-| `SKILL_ROTATE_APPROACHES` | `true` | Assign the next handbook each retry. Separate switch from hint injection so the two can be A/B'd — see *Skill Library* |
+| `SKILL_HINTS` | `true` | Master switch for triage + hint injection + rotation. `false` leaves `/skills` mounted but stops pushing it. Works under Docker, unlike `SKILLS_DIR` |
+| `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts. **0 does not disable** (level = 1+bump−N) |
+| `SKILL_ROTATE_APPROACHES` | `true` | Assign the next handbook each retry. Separate switch from injection so the two can be A/B'd — see *Skill Library* |
 | `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
 | `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |
 | `SIBLING_DIGEST_MIN_REPORTS` | `2` | Distinct reports needed before spending a model call on the team digest |

@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 # Type for the deduped submit callback: (flag) -> (display, is_confirmed)
 SubmitFn = Callable[[str], Coroutine[Any, Any, tuple[str, bool]]]
 
+# Cap on the coordinator and operator inboxes. See CoordinatorDeps for why they are
+# bounded at all.
+INBOX_MAXSIZE = 1000
+
 
 @dataclass
 class SolverDeps:
@@ -51,8 +55,18 @@ class CoordinatorDeps:
     msg_host: str = "127.0.0.1"
 
     # Runtime state
-    coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
-    operator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Bounded on purpose. Both were plain `asyncio.Queue()`, i.e. unbounded, which
+    # made every `except asyncio.QueueFull` in the codebase dead code and let a
+    # stalled coordinator grow memory without limit: the turn timeout is 300s with a
+    # 60s backoff, so a stalling gateway means nothing drains while ten swarms keep
+    # posting patrol alerts, help requests, pivots and refutations. The bound makes
+    # those guards live and turns "silently allocate until the process dies" into a
+    # logged drop. 1000 is far above any legitimate backlog — hitting it means the
+    # coordinator is not reading, which is the thing worth knowing.
+    coordinator_inbox: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=INBOX_MAXSIZE))
+    operator_inbox: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=INBOX_MAXSIZE))
     swarms: dict[str, Any] = field(default_factory=dict)
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)

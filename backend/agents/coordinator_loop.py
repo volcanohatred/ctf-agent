@@ -626,7 +626,23 @@ async def _start_msg_server(inbox: asyncio.Queue, port: int = 0,
             if method == "POST" and 0 < content_length <= 65536:
                 body = await asyncio.wait_for(reader.read(content_length), timeout=5)
                 message = _decode_message(body)
-                inbox.put_nowait(message)
+                # The inbox is bounded, so this can legitimately fail. Handled here
+                # rather than left to the generic `except` below, which logs at debug
+                # and closes the connection WITHOUT a response — `ctf-msg` would see
+                # a dropped socket and no idea its hint was discarded.
+                try:
+                    inbox.put_nowait(message)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "operator message dropped: the coordinator inbox is full and "
+                        "not being drained (message was %r)", message[:120],
+                    )
+                    await _respond(writer, 503, {
+                        "error": "coordinator inbox full — the coordinator is not "
+                                 "draining it (check for a stalling gateway); message "
+                                 "was NOT delivered",
+                    })
+                    return
                 await _respond(writer, 200, {"ok": True, "queued": message[:200]})
             elif method == "POST":
                 await _respond(writer, 413, {"error": "body must be 1..65536 bytes"})
@@ -669,7 +685,8 @@ def _decode_message(body: bytes) -> str:
 
 async def _respond(writer: asyncio.StreamWriter, status: int, payload: dict) -> None:
     body = json.dumps(payload).encode()
-    reason = {200: "OK", 400: "Bad Request", 413: "Payload Too Large"}.get(status, "OK")
+    reason = {200: "OK", 400: "Bad Request", 413: "Payload Too Large",
+              503: "Service Unavailable"}.get(status, "OK")
     writer.write(
         f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body

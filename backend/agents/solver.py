@@ -39,6 +39,7 @@ from backend.solver_base import (
     FLAG_FOUND,
     GAVE_UP,
     SolverResult,
+    classify_api_error,
     classify_exception,
     is_context_overflow,
 )
@@ -728,6 +729,19 @@ class Solver:
             text = result.output.strip() if isinstance(result.output, str) else ""
             if not text:
                 self.tracer.event("conclude_empty")
+                return ""
+            # A gateway that returns error prose inside a 200 body produces a
+            # "successful" conclude whose output is the error text. Published, that
+            # becomes a state card on the blackboard which every sibling and every
+            # restart treats as ground truth — the same failure the Claude backend
+            # already guards against, and worse here because the text looks like a
+            # harvest rather than a failure.
+            if classify_api_error(text):
+                self.tracer.event("conclude_api_error", detail=text[:200])
+                logger.warning(
+                    f"[{self.agent_name}] conclude returned an API error as its output "
+                    "— discarding rather than publishing it as a state card"
+                )
                 return ""
             # The conclude turn's messages are deliberately NOT merged back into
             # _messages: the round is over, and the swarm decides whether the

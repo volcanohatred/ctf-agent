@@ -27,6 +27,7 @@ from backend.solver_base import (
     INFRA_ERROR,
     SolverResult,
 )
+from backend.verifier import REFUTED, Verdict
 
 # Every test swarm gets a hard round cap so an exhausted script cannot spin.
 DEFAULT_CAP = 12
@@ -379,6 +380,94 @@ async def test_track_child_keeps_a_strong_reference() -> None:
 async def test_wind_down_with_no_children_is_a_noop() -> None:
     swarm = _swarm({})
     await swarm._wind_down()        # must not raise on an empty registry
+
+
+# ---------------------------------------------------------------------------
+# The coordinator inbox is bounded, so the drop paths are real
+# ---------------------------------------------------------------------------
+
+def test_the_inboxes_are_bounded() -> None:
+    """They were plain `asyncio.Queue()`, i.e. unbounded, which made every
+    `except asyncio.QueueFull` in the codebase dead code and let a stalled
+    coordinator grow memory without limit: the turn timeout is 300s with a 60s
+    backoff, so a stalling gateway means nothing drains while ten swarms keep
+    posting alerts, help requests, pivots and refutations."""
+    from backend.deps import INBOX_MAXSIZE, CoordinatorDeps
+
+    deps = CoordinatorDeps(ctfd=SimpleNamespace(), cost_tracker=SimpleNamespace(),
+                           settings=SimpleNamespace())
+    assert deps.coordinator_inbox.maxsize == INBOX_MAXSIZE > 0
+    assert deps.operator_inbox.maxsize == INBOX_MAXSIZE > 0
+
+
+@pytest.mark.asyncio
+async def test_a_full_inbox_does_not_break_a_solver_notification() -> None:
+    """`_make_notify_fn` had no handler, so once the inbox became bounded a full one
+    would have raised QueueFull out of a solver's tool call — turning "the
+    coordinator is behind" into a failed command in the middle of a solve."""
+    inbox: asyncio.Queue = asyncio.Queue(maxsize=1)
+    inbox.put_nowait("already full")
+    swarm = _swarm({})
+    swarm.coordinator_inbox = inbox
+
+    notify = swarm._make_notify_fn("m1")
+    await notify("a strategic discovery")        # must not raise
+
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait() == "already full", "the queued message must not be corrupted"
+
+
+@pytest.mark.asyncio
+async def test_a_full_inbox_does_not_break_a_refutation_broadcast() -> None:
+    """Same hazard on the highest-value notification there is: a refutation the
+    coordinator should stop steering solvers back toward."""
+    inbox: asyncio.Queue = asyncio.Queue(maxsize=1)
+    inbox.put_nowait("already full")
+    swarm = _swarm({})
+    swarm.coordinator_inbox = inbox
+    await swarm._publish_harvest("m1", "[fact] the uploaded JAR gets loaded by the worker")
+
+    await swarm._on_verdict(Verdict(REFUTED, "ClassNotFoundException on both runs",
+                                    "the uploaded JAR gets loaded by the worker", "m1"))
+
+    # The board was still updated — only the coordinator notification was dropped.
+    # Note the reclassified entry carries the original claim plus the appended
+    # evidence, not `board_text`: the "已证伪" wording only appears on the separate
+    # entry posted when there was no claim left to reclassify.
+    excluded = [f for f in swarm.message_bus.findings if f.kind == KIND_EXCLUDED]
+    assert excluded, "the refuted claim must have moved to the dead ends"
+    assert any("the uploaded JAR gets loaded" in f.content
+               and "ClassNotFoundException" in f.content for f in excluded)
+
+
+@pytest.mark.asyncio
+async def test_a_full_inbox_does_not_break_a_strategist_pivot(monkeypatch) -> None:
+    """Same hazard on the pivot path, driven through the real code rather than a
+    hand-rolled broadcast — the guard is only worth testing where it actually lives."""
+    import backend.strategist as strategist_mod
+    from backend.message_bus import KIND_BROADCAST
+    from backend.strategist import StrategyVerdict
+
+    inbox: asyncio.Queue = asyncio.Queue(maxsize=1)
+    inbox.put_nowait("already full")
+
+    async def _pivot(**kwargs):
+        del kwargs
+        return StrategyVerdict(pivot=True, text="attack the FD retention mechanism")
+
+    monkeypatch.setattr(strategist_mod, "consult_strategist", _pivot)
+    swarm = _swarm({}, strategist_every_bumps=4)
+    swarm.coordinator_inbox = inbox
+    swarm._total_bumps = 4
+
+    text = await swarm._run_strategist()
+
+    assert text, "the pivot must still be produced"
+    assert swarm._strategist_pivots == 1
+    # It reached the board even though the coordinator could not be told.
+    assert any(f.kind == KIND_BROADCAST and "FD retention" in f.content
+               for f in swarm.message_bus.findings)
+    assert inbox.qsize() == 1, "the full inbox was left alone, not corrupted"
 
 
 # ---------------------------------------------------------------------------

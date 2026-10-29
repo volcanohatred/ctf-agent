@@ -382,9 +382,19 @@ class ChallengeSwarm:
     def _make_notify_fn(self, model_spec: str):
         """Create a callback that pushes solver messages to the coordinator inbox."""
         async def _notify(message: str) -> None:
-            if self.coordinator_inbox:
+            if not self.coordinator_inbox:
+                return
+            # Guarded because the inbox is now bounded. This one had no handler, so a
+            # full inbox would have raised QueueFull out of a solver's tool call —
+            # turning "the coordinator is behind" into a failed command mid-solve.
+            try:
                 self.coordinator_inbox.put_nowait(
                     f"[{self.meta.name}/{model_spec}] {message}"
+                )
+            except asyncio.QueueFull:
+                logger.warning(
+                    f"[{self.meta.name}/{model_spec}] coordinator inbox full — "
+                    "dropping a solver notification; the coordinator is not draining it"
                 )
         return _notify
 

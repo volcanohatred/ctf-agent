@@ -625,3 +625,89 @@ async def test_triage_uses_the_configured_budget(monkeypatch) -> None:
         settings=_gw_settings(verifier_triage_max_tokens=4000))
     assert cap.bodies[0]["max_tokens"] == 4000, "the hardcoded 1500 is back"
     assert cap.client_kwargs[0]["timeout"] == 60.0, "the hardcoded 25s is back"
+
+
+class _ScriptedCapture:
+    """MockTransport that returns a DIFFERENT reply per attempt, so a retry can
+    be distinguished from a first-try success."""
+
+    def __init__(self, monkeypatch, replies: list[dict]):
+        self.bodies: list[dict] = []
+        self.timeouts: list[float] = []
+        self.replies = replies
+        outer = self
+
+        def handler(request):
+            import json as _json
+            outer.bodies.append(_json.loads(request.content))
+            i = min(len(outer.bodies) - 1, len(outer.replies) - 1)
+            return httpx.Response(200, json=outer.replies[i])
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.AsyncClient
+
+        class PatchedClient(real):  # type: ignore[misc,valid-type]
+            def __init__(self, *args, **kwargs):
+                outer.timeouts.append(kwargs.get("timeout"))
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", PatchedClient)
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_reply_is_retried_with_a_grown_budget(monkeypatch) -> None:
+    """No fixed cap is provably enough for the two prompts that demand every
+    technical detail survive, so the budget grows instead of the reply being lost."""
+    cap = _ScriptedCapture(monkeypatch, [
+        _reply("cut off mid-", finish="length"),
+        _reply("the complete distillation"),
+    ])
+    out = await _call_gateway("p", _gw_settings(summarizer_max_tokens=2500), "m")
+    assert out == "the complete distillation"
+    assert [b["max_tokens"] for b in cap.bodies] == [2500, 2500 * rs.TRUNCATION_GROWTH]
+
+
+@pytest.mark.asyncio
+async def test_the_retry_scales_the_timeout_too(monkeypatch) -> None:
+    """Retrying at the original timeout would just convert truncation into timeout."""
+    cap = _ScriptedCapture(monkeypatch, [
+        _reply("x", finish="length"), _reply("y"),
+    ])
+    await _call_gateway("p", _gw_settings(summarizer_timeout_s=60.0), "m")
+    assert cap.timeouts == [60.0, 60.0 * rs.TRUNCATION_GROWTH]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_retries_discard_the_reply_rather_than_parse_a_fragment(monkeypatch) -> None:
+    cap = _ScriptedCapture(monkeypatch, [_reply("never finishes", finish="length")])
+    out = await _call_gateway("p", _gw_settings(summarizer_truncation_retries=1), "m")
+    assert out == ""
+    assert len(cap.bodies) == 2, "one attempt plus one retry"
+
+
+@pytest.mark.asyncio
+async def test_retries_can_be_switched_off(monkeypatch) -> None:
+    cap = _ScriptedCapture(monkeypatch, [_reply("never finishes", finish="length")])
+    assert await _call_gateway("p", _gw_settings(summarizer_truncation_retries=0), "m") == ""
+    assert len(cap.bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_growth_is_capped_so_an_unsatisfiable_prompt_cannot_run_away(monkeypatch) -> None:
+    cap = _ScriptedCapture(monkeypatch, [_reply("x", finish="length")])
+    await _call_gateway("p", _gw_settings(
+        summarizer_max_tokens=rs.TRUNCATION_CEILING, summarizer_truncation_retries=3), "m")
+    assert len(cap.bodies) == 1, "no headroom to grow into, so no point retrying"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_finding_summary_retries_before_falling_back(monkeypatch) -> None:
+    """`summarize_for_siblings` delegates now, so it inherits the retry instead of
+    keeping a second copy of the request that can drift from the first."""
+    cap = _ScriptedCapture(monkeypatch, [
+        _reply("half a finding", finish="length"), _reply("still half", finish="length"),
+    ])
+    text = "a long finding " * 200
+    assert await summarize_mod.summarize_for_siblings(text, _gw_settings()) == text.strip()
+    assert len(cap.bodies) == 2, "it must retry before giving up and keeping the full text"

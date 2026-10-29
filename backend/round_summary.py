@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SUMMARIZER_MODEL = "deepseek-v4-flash"
 
+# Truncation retry: how much to grow max_tokens, and where to stop. The ceiling
+# exists because growth is multiplicative and a prompt that cannot be satisfied
+# must not end up requesting an absurd completion.
+TRUNCATION_GROWTH = 4
+TRUNCATION_CEILING = 32_000
+TRUNCATION_TIMEOUT_CEILING = 600.0
+
 _ROUND_PROMPT = (
     "你是 CTF 复盘助手。把一个 solver 本轮的产出蒸馏成给「下一轮干净会话」用的状态卡，"
     "用中文要点列出，必须保留所有关键技术细节：\n"
@@ -111,47 +118,70 @@ async def _call_gateway(
         max_tokens = int_setting(settings, "summarizer_max_tokens")
     if timeout_s is None:
         timeout_s = float_setting(settings, "summarizer_timeout_s")
+    retries = int_setting(settings, "summarizer_truncation_retries")
     base_url = getattr(settings, "gateway_base_url", "") or ""
     api_key = getattr(settings, "gateway_api_key", "") or ""
     if not base_url or not api_key:
         return ""
-    t0 = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                json={"model": model,
-                      "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": max_tokens, "temperature": 0.2},
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
-            choice = (data.get("choices") or [{}])[0]
-            if str(choice.get("finish_reason", "") or "") == "length":
-                logger.warning(
-                    "%s truncated at max_tokens=%s on %s — discarding the reply rather "
-                    "than parsing a partial one (raise the budget for this call)",
-                    agent_name or "gateway call", max_tokens, model,
+
+    budget, wait = max_tokens, timeout_s
+    for attempt in range(retries + 1):
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=wait) as client:
+                resp = await client.post(
+                    f"{base_url.rstrip('/')}/chat/completions",
+                    json={"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": budget, "temperature": 0.2},
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
-                return ""
-            return (choice.get("message", {}).get("content", "") or "").strip()
-    except (TimeoutError, httpx.TimeoutException):
-        # httpx.TimeoutException is not a subclass of the builtin TimeoutError, so
-        # catching only the latter let real read timeouts fall into the generic
-        # branch below and be logged at debug level — the strategist measured
-        # 100-150s per call against a live gateway, i.e. it timed out on every
-        # single request while looking configured and healthy.
-        logger.warning(
-            "%s timed out after %.0fs on %s — no answer obtained (raise the timeout "
-            "for this call if it keeps happening)",
-            agent_name or "gateway call", timeout_s, model,
+                resp.raise_for_status()
+                data = resp.json()
+                _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
+                choice = (data.get("choices") or [{}])[0]
+                if str(choice.get("finish_reason", "") or "") != "length":
+                    return (choice.get("message", {}).get("content", "") or "").strip()
+        except (TimeoutError, httpx.TimeoutException):
+            # httpx.TimeoutException is not a subclass of the builtin TimeoutError, so
+            # catching only the latter let real read timeouts fall into the generic
+            # branch below and be logged at debug level — the strategist measured
+            # 100-150s per call against a live gateway, i.e. it timed out on every
+            # single request while looking configured and healthy.
+            logger.warning(
+                "%s timed out after %.0fs on %s — no answer obtained (raise the timeout "
+                "for this call if it keeps happening)",
+                agent_name or "gateway call", wait, model,
+            )
+            return ""
+        except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
+            logger.debug("round_summary gateway call failed: %s", e)
+            return ""
+
+        # Truncated. Two of the four prompts using this call (_ROUND_PROMPT and
+        # _SUMMARIZE_PROMPT) demand that EVERY technical detail survive — paths,
+        # offsets, keys, credentials — with no length bound, so their natural
+        # output grows with the round and no fixed cap is provably safe. Rather
+        # than guess a bigger number, grow it and try again: a distillation that
+        # silently degrades to the raw round output is what inflates the journal
+        # the FRESH_RESTART_ROUNDS merge exists to keep small.
+        grown = min(budget * TRUNCATION_GROWTH, TRUNCATION_CEILING)
+        if attempt >= retries or grown <= budget:
+            logger.warning(
+                "%s truncated at max_tokens=%s on %s — discarding the reply rather "
+                "than parsing a partial one (raise the budget for this call)",
+                agent_name or "gateway call", budget, model,
+            )
+            return ""
+        logger.info(
+            "%s truncated at max_tokens=%s on %s — retrying with %s",
+            agent_name or "gateway call", budget, model, grown,
         )
-        return ""
-    except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
-        logger.debug("round_summary gateway call failed: %s", e)
-        return ""
+        budget = grown
+        # A longer completion takes proportionally longer to generate; retrying at
+        # the original timeout would convert a truncation into a timeout.
+        wait = min(wait * TRUNCATION_GROWTH, TRUNCATION_TIMEOUT_CEILING)
+    return ""
 
 
 def _record(cost_tracker, agent_name: str, model: str, data: dict, seconds: float) -> None:

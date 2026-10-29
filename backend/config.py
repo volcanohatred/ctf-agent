@@ -254,6 +254,12 @@ class Settings(BaseSettings):
     # and a budget that only the fastest rounds fit is a budget that is usually off.
     summarizer_max_tokens: int = 2500
     summarizer_timeout_s: float = 60.0
+    # Retries on a truncated reply, each with the budget multiplied by
+    # round_summary.TRUNCATION_GROWTH. Two summarizer prompts demand that every
+    # technical detail survive with no length bound, so their natural output grows
+    # with the round and no fixed cap is provably sufficient — this is what keeps a
+    # cap from silently degrading the distillation. 0 restores discard-on-truncation.
+    summarizer_truncation_retries: int = 1
     # Fact trust gate. A finding one solver asserts is posted as an UNVERIFIED
     # CLAIM; it is promoted to a corroborated FACT only when a DIFFERENT solver
     # independently reports the same thing. This is what stops one model's

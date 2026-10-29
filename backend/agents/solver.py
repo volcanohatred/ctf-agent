@@ -66,6 +66,22 @@ logger = logging.getLogger(__name__)
 
 MAX_FINDING_BLOCKS = 24
 MAX_FINDING_CHARS = 24_000
+
+# Tools that talk to the swarm or the operator rather than to the challenge. They
+# must not count toward `tool_calls`, because `did_work` (tool_calls > 0) is what
+# `_account_infra` uses to decide a round was a broken endpoint rather than a
+# legitimate give-up — and a round whose only activity was submitting flags and
+# reading the board never touched the target.
+#
+# The Claude backend already behaved this way by accident: it intercepts
+# submit_flag / notify_coordinator / request_help as pseudo-commands and returns
+# before incrementing. This backend counted every non-loop-broken call, so the SAME
+# round was `did_work=False` on one backend and True on the other — published and
+# exempt from the infra guard on one, rewritten to INFRA_ERROR and counted toward
+# retiring the swarm on the other.
+BOOKKEEPING_TOOLS = frozenset({
+    "submit_flag", "check_findings", "notify_coordinator", "request_help",
+})
 # Restart payloads carry the distilled journal, the team digest, an escalating
 # skill hint (whose L3 form embeds a whole pack index) and the next untried
 # technique. Measured live at 7.8-10.5 KB, so the window must hold a real payload
@@ -102,7 +118,7 @@ class TracingToolset(WrapperToolset[SolverDeps]):
             # Inject loop warning by returning it as the tool result
             return LOOP_BLOCKED_MESSAGE
 
-        self.tool_counter[0] += 1
+        self.tool_counter[0] += 1 if name not in BOOKKEEPING_TOOLS else 0
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
 
         result_str = str(result) if result is not None else ""

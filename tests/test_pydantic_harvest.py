@@ -355,3 +355,127 @@ async def test_no_task_is_left_pending_after_any_outcome(tmp_path) -> None:
                 await waiter
         assert task.done(), "the inner run task must always be awaited"
     s.tracer.close()
+
+
+# ---------------------------------------------------------------------------
+# Which tool calls count as "work"
+#
+# `did_work` (tool_calls > 0) is what `_account_infra` uses to decide a round was a
+# broken endpoint rather than a legitimate give-up. The two backends disagreed: the
+# Claude backend intercepts submit_flag / notify_coordinator / request_help as
+# pseudo-commands and returns before incrementing, while this one counted every
+# non-loop-broken call. So the SAME round was did_work=False on one backend —
+# rewritten to INFRA_ERROR and counted toward retiring the swarm — and True on the
+# other, published and exempt from the infra guard.
+# ---------------------------------------------------------------------------
+
+class _FakeWrappedToolset:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_tool(self, name, tool_args, ctx, tool):
+        self.calls.append(name)
+        return f"result of {name}"
+
+
+def _make_toolset(tmp_path):
+    from backend.agents.solver import TracingToolset
+
+    wrapped = _FakeWrappedToolset()
+    ts = TracingToolset(
+        wrapped=wrapped,
+        tracer=SolverTracer("unit-toolset", "pyd", log_dir=str(tmp_path)),
+        loop_detector=LoopDetector(),
+        step_counter=[0],
+        tool_counter=[0],
+    )
+    return ts, wrapped
+
+
+def _fake_ctx():
+    return SimpleNamespace(deps=SimpleNamespace(message_bus=None, model_spec="m1",
+                                                confirmed_flag=None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["bash", "read_file", "write_file", "list_files",
+                                  "web_fetch", "webhook_create",
+                                  "webhook_get_requests", "view_image"])
+async def test_tools_that_touch_the_challenge_count_as_work(tmp_path, name) -> None:
+    ts, wrapped = _make_toolset(tmp_path)
+
+    await ts.call_tool(name, {}, _fake_ctx(), None)
+
+    assert ts.tool_counter[0] == 1, name
+    assert wrapped.calls == [name]
+    ts.tracer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["submit_flag", "check_findings",
+                                  "notify_coordinator", "request_help"])
+async def test_bookkeeping_tools_do_not_count_as_work(tmp_path, name) -> None:
+    """A round whose only activity was submitting flags and reading the board never
+    touched the target, so it must not look like a productive round."""
+    ts, wrapped = _make_toolset(tmp_path)
+
+    await ts.call_tool(name, {}, _fake_ctx(), None)
+
+    assert ts.tool_counter[0] == 0, f"{name} should not count toward did_work"
+    assert ts.step_counter[0] == 1, "but it is still a step, and still traced"
+    assert wrapped.calls == [name], "the tool must still actually run"
+    ts.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_round_counts_only_the_real_work(tmp_path) -> None:
+    ts, _wrapped = _make_toolset(tmp_path)
+    ctx = _fake_ctx()
+
+    for name in ("submit_flag", "bash", "check_findings", "read_file",
+                 "notify_coordinator"):
+        await ts.call_tool(name, {}, ctx, None)
+
+    assert ts.step_counter[0] == 5
+    assert ts.tool_counter[0] == 2, "only bash and read_file touched the challenge"
+
+
+def test_the_bookkeeping_set_matches_the_claude_backends_interceptions() -> None:
+    """The two backends must agree on what counts as work, and the Claude side
+    expresses it structurally — intercepted pseudo-commands return before the
+    `_tool_calls += 1` line — rather than through a named set, so nothing enforces
+    the pairing except this test.
+
+    Each bookkeeping tool must be one of:
+      * intercepted as a bash pseudo-command on the Claude side (matched by its
+        regex form, `r"submit_flag\\s+..."`, not a quoted literal), or
+      * absent from that backend entirely, like `check_findings`, which ClaudeSolver
+        has no equivalent of because it injects board findings from a PostToolUse
+        hook every 5 steps instead of exposing a tool.
+    """
+    import re
+    from pathlib import Path
+
+    from backend.agents.solver import BOOKKEEPING_TOOLS
+
+    claude_src = (Path(__file__).resolve().parent.parent
+                  / "backend" / "agents" / "claude_solver.py").read_text(encoding="utf-8")
+
+    # A pseudo-command is intercepted iff a regex matches it AND the match returns
+    # before the counter increment. Assert the increment comes after all three.
+    increment_at = claude_src.index("self._tool_calls += 1")
+    for name in BOOKKEEPING_TOOLS:
+        pattern = re.compile(r're\.match\(r"' + re.escape(name) + r"\\s\+")
+        match = pattern.search(claude_src)
+        if match is None:
+            # Not a pseudo-command there; it must not exist as a tool at all, or it
+            # would be counted as work on one backend and not the other.
+            assert f'"{name}"' not in claude_src, (
+                f"{name} exists on the Claude backend but is not in its intercepted "
+                "pseudo-commands, so the backends disagree on whether it is work"
+            )
+            continue
+        assert match.start() < increment_at, (
+            f"{name} is matched AFTER the counter increment, so it counts as work "
+            "on the Claude backend but not here"
+        )

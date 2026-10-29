@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from backend.config import float_setting, int_setting
+from backend.config import float_setting, int_setting, str_setting
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +34,20 @@ TRUNCATION_GROWTH = 4
 TRUNCATION_CEILING = 32_000
 TRUNCATION_TIMEOUT_CEILING = 600.0
 
+# Set once if the gateway answers HTTP 400 to `reasoning_effort`, so an
+# unsupported field cannot silently disable every summarizer call in the run.
+_REASONING_REJECTED = False
+
 _ROUND_PROMPT = (
     "你是 CTF 复盘助手。把一个 solver 本轮的产出蒸馏成给「下一轮干净会话」用的状态卡，"
     "用中文要点列出，必须保留所有关键技术细节：\n"
     "- 试过的方向/技术（哪些有效、哪些失败）\n"
     "- 发现的具体产物：文件路径、地址、偏移、密钥、可能的 flag、凭据\n"
     "- 当前最优假设和下一步建议\n"
-    "去掉过程性的啰嗦输出。直接给要点，不要解释。\n\n【本轮输出】\n{text}"
+    "去掉过程性的啰嗦输出。直接给要点，不要解释。\n"
+    "**全文控制在 20 行以内。** 硬信息（路径、地址、偏移、密钥、flag、凭据）必须逐条列出，"
+    "一行放不下的宁可压缩描述文字也不要省略这些值；已经失败的方向每条只写一行结论，"
+    "不要复述失败过程。\n\n【本轮输出】\n{text}"
 )
 
 _META_PROMPT = (
@@ -97,8 +104,13 @@ async def _call_gateway(
     cost_tracker: object | None = None,
     agent_name: str = "",
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """One OpenAI-compatible chat completion. Returns "" on any failure.
+
+    `reasoning_effort` is sent as a top-level field when non-empty. Summarizer-class
+    callers pass it; the reasoning tasks (audit, strategist, briefing, triage) do
+    not, because for those the thinking IS the product.
 
     A reply truncated by `max_tokens` also returns "". That is not the same as a
     transport failure but it must be handled the same way, because the callers ask
@@ -125,17 +137,37 @@ async def _call_gateway(
         return ""
 
     budget, wait = max_tokens, timeout_s
+    effort = (reasoning_effort or "").strip()
+    global _REASONING_REJECTED
+
+    async def _post(client, with_effort: bool):
+        body: dict = {"model": model,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": budget, "temperature": 0.2}
+        if with_effort:
+            body["reasoning_effort"] = effort
+        return await client.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            json=body, headers={"Authorization": f"Bearer {api_key}"})
+
     for attempt in range(retries + 1):
         t0 = time.monotonic()
         try:
+            sent_effort = bool(effort) and not _REASONING_REJECTED
             async with httpx.AsyncClient(timeout=wait) as client:
-                resp = await client.post(
-                    f"{base_url.rstrip('/')}/chat/completions",
-                    json={"model": model,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": budget, "temperature": 0.2},
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
+                resp = await _post(client, sent_effort)
+                if resp.status_code == 400 and sent_effort:
+                    # A gateway that does not know the field would 400 on EVERY
+                    # summarizer call, and the generic handler below turns that into
+                    # "" — silently disabling summarization for the whole run. Pay
+                    # the 400 once, remember it, and stop sending the field.
+                    _REASONING_REJECTED = True
+                    logger.warning(
+                        "%s: gateway rejected reasoning_effort=%r (HTTP 400) — not "
+                        "sending it again this process", agent_name or "gateway call",
+                        effort,
+                    )
+                    resp = await _post(client, False)
                 resp.raise_for_status()
                 data = resp.json()
                 _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
@@ -228,6 +260,7 @@ async def summarize_siblings(
     out = await _call_gateway(
         _SIBLING_PROMPT.format(text=joined[:20000]), settings, _model(settings),
         cost_tracker=cost_tracker, agent_name=agent_name,
+        reasoning_effort=str_setting(settings, "summarizer_reasoning_effort"),
     )
     if out:
         return SummaryResult(text=out, condensed=True, model=_model(settings))
@@ -256,6 +289,7 @@ async def summarize_round(
     out = await _call_gateway(
         _ROUND_PROMPT.format(text=text[:18000]), settings, _model(settings),
         cost_tracker=cost_tracker, agent_name=agent_name,
+        reasoning_effort=str_setting(settings, "summarizer_reasoning_effort"),
     )
     return out or text
 
@@ -281,6 +315,7 @@ async def meta_summarize(
     out = await _call_gateway(
         _META_PROMPT.format(text=joined[:20000]), settings, _model(settings),
         cost_tracker=cost_tracker, agent_name=agent_name,
+        reasoning_effort=str_setting(settings, "summarizer_reasoning_effort"),
     )
     if out:
         return SummaryResult(text=out, condensed=True, model=_model(settings))

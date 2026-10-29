@@ -27,7 +27,9 @@ DEFAULT_SUMMARIZER_MODEL = "deepseek-v4-flash"
 _SUMMARIZE_PROMPT = (
     "你是一个 CTF 解题助手。把下面这段 solver 输出提炼成给队友看的关键信息摘要，"
     "必须完整保留：flag、密钥、地址、payload、用了什么技术、排除了哪些方向、最终结论。"
-    "去掉过程性的啰嗦输出。直接输出摘要，不要解释。\n\n"
+    "去掉过程性的啰嗦输出。直接输出摘要，不要解释。\n"
+    "**全文控制在 15 行以内。** flag、密钥、地址、payload 这类硬值必须原样逐条列出，"
+    "宁可压缩周围的描述文字也不要省略或改写它们；已排除的方向每条只写一行结论。\n\n"
     "【solver 输出】\n{text}"
 )
 
@@ -56,6 +58,8 @@ async def summarize_for_siblings(
     text = text.strip()
     if not text:
         return text
+    from backend.config import str_setting
+
     out = await _call_gateway(
         _SUMMARIZE_PROMPT.format(text=text[:max_chars_in]),
         settings,
@@ -63,5 +67,6 @@ async def summarize_for_siblings(
         timeout_s=timeout_s,
         cost_tracker=cost_tracker,
         agent_name=agent_name,
+        reasoning_effort=str_setting(settings, "summarizer_reasoning_effort"),
     )
     return out or text

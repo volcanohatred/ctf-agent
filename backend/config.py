@@ -260,6 +260,19 @@ class Settings(BaseSettings):
     # with the round and no fixed cap is provably sufficient — this is what keeps a
     # cap from silently degrading the distillation. 0 restores discard-on-truncation.
     summarizer_truncation_retries: int = 1
+    # Sent as a top-level `reasoning_effort` field on summarizer-class calls ONLY.
+    # SUMMARIZER_MODEL is a reasoning model, and max_tokens caps reasoning + visible
+    # content TOGETHER: measured against a live gateway, a distillation prompt at
+    # max_tokens=2500 returned finish_reason=length with reasoning_tokens=2500 and
+    # ZERO characters of content — the budget was entirely consumed by thinking
+    # before the answer began. The same call with reasoning_effort=none produced
+    # 5838 characters of content. Growing the cap therefore buys more thinking, not
+    # more answer (2500 -> 10000 still truncated), and a length instruction in the
+    # prompt cannot help either, since the truncation happens upstream of the text
+    # it would constrain. Empty string = do not send the field.
+    # The audit / strategist / briefing / triage calls deliberately do NOT set this:
+    # for those the reasoning is the product.
+    summarizer_reasoning_effort: str = "none"
     # Fact trust gate. A finding one solver asserts is posted as an UNVERIFIED
     # CLAIM; it is promoted to a corroborated FACT only when a DIFFERENT solver
     # independently reports the same thing. This is what stops one model's

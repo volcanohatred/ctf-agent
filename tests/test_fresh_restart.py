@@ -711,3 +711,105 @@ async def test_a_truncated_finding_summary_retries_before_falling_back(monkeypat
     text = "a long finding " * 200
     assert await summarize_mod.summarize_for_siblings(text, _gw_settings()) == text.strip()
     assert len(cap.bodies) == 2, "it must retry before giving up and keeping the full text"
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort — the cap was never the real limit
+# ---------------------------------------------------------------------------
+# Measured against a live gateway with SUMMARIZER_MODEL=deepseek-v4-flash:
+#   baseline               finish=length  completion=2500  reasoning=2500  content=0 chars
+#   reasoning_effort=none  finish=length  completion=2500  reasoning=0     content=5838 chars
+# max_tokens caps reasoning and visible content TOGETHER, so at 2500 the model
+# spent the entire budget thinking and emitted no answer at all. Growing the cap
+# buys more thinking, not more answer: 2500 -> 10000 still came back truncated.
+
+
+@pytest.fixture(autouse=True)
+def _reset_reasoning_flag(monkeypatch):
+    monkeypatch.setattr(rs, "_REASONING_REJECTED", False)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_is_sent_when_set(monkeypatch) -> None:
+    cap = _ScriptedCapture(monkeypatch, [_reply("ok")])
+    await _call_gateway("p", _gw_settings(), "m", reasoning_effort="none")
+    assert cap.bodies[0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reasoning_effort_does_not_add_the_field(monkeypatch) -> None:
+    """Separate test, not a second capture in the one above: two _ScriptedCapture
+    instances nest, and the inner one's transport is overwritten by the outer."""
+    cap = _ScriptedCapture(monkeypatch, [_reply("ok")])
+    await _call_gateway("p", _gw_settings(), "m", reasoning_effort="")
+    assert "reasoning_effort" not in cap.bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_the_summarizer_prompts_resolve_reasoning_effort_from_settings(monkeypatch) -> None:
+    cap = _ScriptedCapture(monkeypatch, [_reply("ok")])
+    await _call_gateway("p", _gw_settings(summarizer_reasoning_effort="none"), "m",
+                        reasoning_effort="none")
+    assert cap.bodies[0]["reasoning_effort"] == "none"
+    from backend.config import Settings
+    assert Settings().summarizer_reasoning_effort == "none", (
+        "the default must disable thinking, or the summarizer budget is consumed by it")
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_that_rejects_the_field_falls_back_instead_of_dying(monkeypatch) -> None:
+    """A 400 on every summarizer call would silently disable summarization for the
+    whole run, because the generic handler turns any HTTP error into ""."""
+    seen: list[dict] = []
+
+    def handler(request):
+        import json as _json
+        body = _json.loads(request.content)
+        seen.append(body)
+        if "reasoning_effort" in body:
+            return httpx.Response(400, json={"error": "unknown field reasoning_effort"})
+        return httpx.Response(200, json=_reply("the summary"))
+
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+
+    class PatchedClient(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedClient)
+
+    out = await _call_gateway("p", _gw_settings(), "m", reasoning_effort="none")
+    assert out == "the summary", "must recover without the field"
+    assert rs._REASONING_REJECTED is True
+
+    seen.clear()
+    await _call_gateway("p", _gw_settings(), "m", reasoning_effort="none")
+    assert len(seen) == 1 and "reasoning_effort" not in seen[0], (
+        "the rejection must be remembered, not paid again on every call")
+
+
+@pytest.mark.asyncio
+async def test_the_reasoning_tasks_do_not_disable_their_own_thinking(monkeypatch) -> None:
+    """audit / strategist / briefing / triage must keep reasoning: for those the
+    thinking IS the product, and a flash model that skips it rubber-stamps answers."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "backend"
+    for rel in ("audit.py", "strategist.py", "briefing.py", "verifier.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "reasoning_effort" not in src, f"{rel} must not suppress its own reasoning"
+
+
+def test_the_unbounded_prompts_now_carry_an_explicit_length_bound() -> None:
+    """Both demand that every hard value survive, which is why they had no bound.
+    The bound protects the prose, and the wording protects the values."""
+    import backend.summarize as sm
+
+    for name, prompt in (("round", rs._ROUND_PROMPT), ("meta", rs._META_PROMPT),
+                         ("sibling", rs._SIBLING_PROMPT), ("finding", sm._SUMMARIZE_PROMPT)):
+        assert "行以内" in prompt or "不超过" in prompt, f"{name} prompt has no length bound"
+    for name, prompt in (("round", rs._ROUND_PROMPT), ("finding", sm._SUMMARIZE_PROMPT)):
+        assert "不要省略" in prompt or "不要改写" in prompt, (
+            f"{name} prompt bounds length without protecting the hard values")

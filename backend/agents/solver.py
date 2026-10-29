@@ -15,6 +15,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
+from backend.config import str_setting
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import SolverDeps
@@ -193,9 +194,7 @@ class Solver:
             workspace_dir="",
             use_vision=self.use_vision,
             cost_tracker=cost_tracker,
-            web_fetch_allow_hosts=str(
-                getattr(settings, "web_fetch_allow_hosts", "") or ""
-            ),
+            web_fetch_allow_hosts=str_setting(settings, "web_fetch_allow_hosts"),
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -257,7 +256,7 @@ class Solver:
             self.meta,
             distfile_names,
             container_arch=container_arch,
-            skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
+            skills_enabled=bool(str_setting(self.settings, "skills_dir")),
         )
         if self.role_prompt:
             system_prompt = f"{system_prompt}\n\n{self.role_prompt}"

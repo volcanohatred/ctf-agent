@@ -18,6 +18,8 @@ from typing import Any
 
 import aiodocker
 
+from backend.config import float_setting, int_setting
+
 logger = logging.getLogger(__name__)
 
 CONTAINER_LABEL = "ctf-agent"
@@ -215,8 +217,8 @@ def sandbox_from_settings(challenge_dir: str, settings: object) -> DockerSandbox
         image=getattr(settings, "sandbox_image", "ctf-sandbox"),
         challenge_dir=challenge_dir,
         memory_limit=getattr(settings, "container_memory_limit", "16g"),
-        cpu_limit=float(getattr(settings, "container_cpu_limit", 2.0) or 2.0),
-        command_timeout_s=int(getattr(settings, "sandbox_command_timeout_s", 900) or 900),
+        cpu_limit=float_setting(settings, "container_cpu_limit"),
+        command_timeout_s=int_setting(settings, "sandbox_command_timeout_s"),
         workspace_root=workspace_root,
         skills_host_dir=skills_dir,
         host_prefix_map=prefix_map,

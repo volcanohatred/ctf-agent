@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -224,7 +225,13 @@ class Settings(BaseSettings):
     # entry, reset the session, and restart with a clean context carrying only
     # the distilled state. Every N rounds the journal is meta-summarized (and
     # de-duplicated) so the carried state never grows unboundedly.
-    # 0/1 disables (falls back to the continue-session bump).
+    #
+    # This is the MERGE INTERVAL, not a restart interval: ANY value > 0 restarts on
+    # every bump, and 0 is the only way to get the continue-session bump. The gate
+    # is `> 0`, so the previously documented "0/1 disables" was wrong for 1 — and 1
+    # is the most expensive setting there is, because `len(journal) >= 1` is true
+    # after every single round, so each bump pays a meta-summarize call and the
+    # journal never holds more than one entry. validate_tuning warns about it.
     fresh_restart_rounds: int = 5
     # Long findings posted to the blackboard get an LLM key-info summary for
     # sibling injection (full text is always kept; nothing is truncated).
@@ -364,6 +371,65 @@ class Settings(BaseSettings):
         }
 
 
+def _default_for(name: str) -> Any:
+    """The declared default of a Settings field, read from the model itself.
+
+    Call sites used to hardcode a fallback literal — `getattr(settings, "x", 0)` —
+    because tests pass a SimpleNamespace that lacks fields. Those literals drifted:
+    an audit found 11 where the fallback disagreed with the real default, so a
+    partial settings object silently ran with unlimited rounds, no wall-clock
+    budget, no CLI timeout, and the strategist and circuit breaker disabled. Reading
+    the default from `Settings.model_fields` makes that drift structurally
+    impossible rather than merely unlikely.
+    """
+    field = Settings.model_fields.get(name)
+    if field is None:
+        raise KeyError(f"{name!r} is not a Settings field")
+    return field.default
+
+
+def int_setting(settings: object, name: str) -> int:
+    """Read an int knob. Only a MISSING or None value falls back to the default.
+
+    Never `getattr(s, name, X) or X`: that idiom rewrites an explicit 0 into X, so
+    every knob whose 0 means "off", "unlimited" or "no cap" became inexpressible.
+    Two shipped knobs documented an off-state that the code could not reach —
+    PATROL_INTERVAL_S=0 was rewritten to 120 by its own `or`, and
+    MAX_SPAWNS_PER_CHALLENGE=0 to 3.
+    """
+    value = getattr(settings, name, None)
+    if value is None or value == "":
+        return int(_default_for(name))
+    return int(value)
+
+
+def float_setting(settings: object, name: str) -> float:
+    """Read a float knob. Same None-only fallback rule as `int_setting`."""
+    value = getattr(settings, name, None)
+    if value is None or value == "":
+        return float(_default_for(name))
+    return float(value)
+
+
+def bool_setting(settings: object, name: str) -> bool:
+    """Read a bool knob, accepting the strings an env file can deliver."""
+    value = getattr(settings, name, None)
+    if value is None or value == "":
+        return bool(_default_for(name))
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
+
+def str_setting(settings: object, name: str) -> str:
+    """Read a string knob. Missing/None falls back; an explicit "" is honoured,
+    because for several knobs empty is the meaningful value."""
+    value = getattr(settings, name, None)
+    if value is None:
+        return str(_default_for(name) or "")
+    return str(value)
+
+
 def validate_tuning(settings: Settings) -> list[str]:
     """Return human-readable warnings about tuning combinations that defeat a
     mechanism silently.
@@ -375,7 +441,10 @@ def validate_tuning(settings: Settings) -> list[str]:
     warnings: list[str] = []
 
     # getattr with defaults so this stays usable against a partial settings
-    # object (tests, and callers that build Settings-like namespaces).
+    # object (tests, and callers that build Settings-like namespaces). The
+    # fallbacks here are deliberately 0 rather than the shipped defaults: for a
+    # caller that supplies nothing, "no opinion" must not invent a misalignment
+    # warning out of defaults the caller never asked for.
     cap = int(getattr(settings, "max_attempts_per_challenge", 0) or 0)
     fresh = int(getattr(settings, "fresh_restart_rounds", 0) or 0)
     budget = int(getattr(settings, "solver_time_budget_s", 0) or 0)
@@ -415,6 +484,19 @@ def validate_tuning(settings: Settings) -> list[str]:
             "mechanism still works, just without merging or de-duplication by model."
         )
 
+    if fresh == 1:
+        warnings.append(
+            "FRESH_RESTART_ROUNDS=1 restarts the session every bump AND meta-summarizes "
+            "the journal every bump, so each round pays a summarizer call and the journal "
+            "never holds more than one entry — the distil->merge cycle this knob exists "
+            "for cannot happen. This is the most expensive setting available. Use 0 for "
+            "the continue-session bump, or 3-5 for a real merge cycle."
+        )
+
+    # Deliberately a bare getattr with a 0 fallback, not int_setting: this function
+    # must stay usable against a partial settings object, and for such a caller
+    # "no opinion" must not invent a warning out of defaults they never asked for.
+    # That exemption is enforced by name in tests/test_settings_access.py.
     strategist = int(getattr(settings, "strategist_every_bumps", 0) or 0)
     if (strategist > 0
             and not (getattr(settings, "gateway_base_url", "")

@@ -14,6 +14,8 @@ from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
+from backend.config import int_setting
+
 if TYPE_CHECKING:
     from backend.config import Settings
 
@@ -221,7 +223,7 @@ def claude_cli_env(settings: Settings) -> dict[str, str]:
     # Bound the CLI's own HTTP call. Without this a half-open gateway connection
     # can stall a turn indefinitely — the wall-clock budget then interrupts a
     # turn that was never making progress, and the reason is invisible.
-    api_timeout_ms = int(getattr(settings, "cli_api_timeout_ms", 0) or 0)
+    api_timeout_ms = int_setting(settings, "cli_api_timeout_ms")
     if api_timeout_ms > 0:
         env["API_TIMEOUT_MS"] = str(api_timeout_ms)
 
@@ -230,7 +232,7 @@ def claude_cli_env(settings: Settings) -> dict[str, str]:
     # just above the in-container `timeout` wrapper: the container must kill the
     # process first so the model sees a real exit code and stderr, rather than a
     # CLI-side kill with no explanation.
-    cmd_s = int(getattr(settings, "sandbox_command_timeout_s", 0) or 0)
+    cmd_s = int_setting(settings, "sandbox_command_timeout_s")
     if cmd_s > 0:
         bash_ms = str((cmd_s + 30) * 1000)
         env["BASH_DEFAULT_TIMEOUT_MS"] = str(min(cmd_s, 120) * 1000)

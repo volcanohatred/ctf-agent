@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from backend.agents.solver import Solver
 from backend.agents.verifier_agent import VerificationRunner
 from backend.approaches import build_approach_queue
+from backend.config import bool_setting, float_setting, int_setting, str_setting
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.dedup import dedup_lines, new_lines, normalize
@@ -271,7 +272,7 @@ class ChallengeSwarm:
 
     def __post_init__(self) -> None:
         self._all_specs = list(self.model_specs)
-        self.skill_router = SkillRouter(skills_dir=getattr(self.settings, "skills_dir", "") or "")
+        self.skill_router = SkillRouter(skills_dir=str_setting(self.settings, "skills_dir"))
         self._skill_pack_ids = []
         # Master switch. Gating here rather than in _skill_hint means triage never
         # runs and the rotation queue is never built, so both injection and rotation
@@ -282,7 +283,7 @@ class ChallengeSwarm:
         # describes the passive mount, which is the one mechanism with no plausible
         # downside. Turning off the push without turning off the availability is
         # exactly the configuration worth measuring.
-        if not bool(getattr(self.settings, "skill_hints", True)):
+        if not bool_setting(self.settings, "skill_hints"):
             logger.info(
                 f"[{self.meta.name}] SKILL_HINTS=false — no triage, no hint injection, "
                 "no approach rotation (the library stays mounted for solvers to read "
@@ -303,7 +304,7 @@ class ChallengeSwarm:
                     )
                     self._approach_queue = build_approach_queue(
                         self._skill_pack_ids,
-                        getattr(self.settings, "skills_dir", "") or "",
+                        str_setting(self.settings, "skills_dir"),
                     )
                     logger.info(
                         f"[{self.meta.name}] Approach queue: {len(self._approach_queue)} techniques"
@@ -464,7 +465,7 @@ class ChallengeSwarm:
         them, and re-reading them is the point.
         """
         async with self._digest_lock:
-            refresh_every = max(1, int(getattr(self.settings, "sibling_digest_refresh_bumps", 1) or 1))
+            refresh_every = max(1, int_setting(self.settings, "sibling_digest_refresh_bumps"))
             age = generation - self._team_digest_gen
             if self._team_digest and 0 <= age < refresh_every:
                 return self._team_digest
@@ -475,7 +476,7 @@ class ChallengeSwarm:
                 try:
                     from backend.round_summary import summarize_siblings
 
-                    every = int(getattr(self.settings, "sibling_digest_min_reports", 2) or 2)
+                    every = int_setting(self.settings, "sibling_digest_min_reports")
                     if len(reports) >= every:
                         res = await summarize_siblings(
                             reports, self.settings,
@@ -521,9 +522,9 @@ class ChallengeSwarm:
         # Checked explicitly rather than relying on __post_init__ having left
         # _skill_pack_ids empty: the switch that measures this mechanism has to hold
         # even if pack ids are populated from somewhere else later.
-        if not bool(getattr(self.settings, "skill_hints", True)):
+        if not bool_setting(self.settings, "skill_hints"):
             return ""
-        threshold = int(getattr(self.settings, "skill_after_bumps", 1) or 0)
+        threshold = int(int_setting(self.settings, "skill_after_bumps") or 0)
         if threshold <= 0:
             return ""
         if not self._skill_pack_ids or bump_count < threshold:
@@ -560,9 +561,9 @@ class ChallengeSwarm:
         # someone who populates the queue from elsewhere. The imperative
         # "本轮专攻新方向…先读再做" is the single most suspected source of harm for
         # weak models, so the switch that measures it must hold unconditionally.
-        if not bool(getattr(self.settings, "skill_hints", True)):
+        if not bool_setting(self.settings, "skill_hints"):
             return None
-        if not bool(getattr(self.settings, "skill_rotate_approaches", True)):
+        if not bool_setting(self.settings, "skill_rotate_approaches"):
             return None
 
         prev_path = self._assigned_approach.get(model_spec)
@@ -680,7 +681,7 @@ class ChallengeSwarm:
         """
         if self._escalated or self._escalation_exhausted or self.cancel_event.is_set():
             return
-        threshold = int(getattr(self.settings, "escalate_after_bumps", 0) or 0)
+        threshold = int_setting(self.settings, "escalate_after_bumps")
         if threshold <= 0 or self._total_bumps < threshold:
             return
         spec = escalation_spec(self._all_specs, self.settings)
@@ -718,7 +719,7 @@ class ChallengeSwarm:
         PIVOT would yank every solver off a working line of attack, which is
         strictly worse than no opinion at all.
         """
-        every = int(getattr(self.settings, "strategist_every_bumps", 0) or 0)
+        every = int_setting(self.settings, "strategist_every_bumps")
         if every <= 0:
             return ""
 
@@ -817,7 +818,10 @@ class ChallengeSwarm:
                          exc_info=True)
             return None
         finally:
-            await solver.stop()
+            # Same handover hazard as _run_solver: an escalation solver can also hit
+            # the quota fallback, and on an exception the local would still point at
+            # the solver that handed its container away.
+            await self._stop_registered_solver(model_spec, solver)
 
     def _escalation_briefing(self) -> str:
         failed = "\n".join(f"  ✗ {t}" for t in self._failed_approaches) or "  (none recorded)"
@@ -901,7 +905,7 @@ class ChallengeSwarm:
         board lock: it is a gateway round-trip, and holding a lock across it would
         serialise every solver's publishing behind one slow call.
         """
-        threshold = int(getattr(self.settings, "summarize_threshold_chars", 900) or 900)
+        threshold = int_setting(self.settings, "summarize_threshold_chars")
         if len(content) <= threshold:
             return ""
         try:
@@ -955,7 +959,7 @@ class ChallengeSwarm:
           * a line already corroborated by an earlier pair is skipped, so a third
             agreement does not post the same fact to the board a second time.
         """
-        corroborate = bool(getattr(self.settings, "corroborate_facts", True))
+        corroborate = bool_setting(self.settings, "corroborate_facts")
         corroborated: list[str] = []
         claims: list[str] = []
         novel = False
@@ -1096,7 +1100,7 @@ class ChallengeSwarm:
         sides are pushed to the front of the verification queue — that is the A/B
         confrontation, and the probe is what settles it rather than another opinion.
         """
-        if not new_statements or not bool(getattr(self.settings, "audit_contradictions", True)):
+        if not new_statements or not bool_setting(self.settings, "audit_contradictions"):
             return
         if self.cancel_event.is_set():
             return
@@ -1166,7 +1170,7 @@ class ChallengeSwarm:
         the result recognisable to it, and reuses the existing queue key so the same
         claim is not probed twice.
         """
-        if not bool(getattr(self.settings, "verify_claims", True)):
+        if not bool_setting(self.settings, "verify_claims"):
             return
         if self._probe_budget_exhausted():
             return
@@ -1240,7 +1244,7 @@ class ChallengeSwarm:
         contradiction-driven probes (priority 10, the most expensive kind) entirely
         unbudgeted.
         """
-        budget = int(getattr(self.settings, "verifier_max_probes", 0) or 0)
+        budget = int_setting(self.settings, "verifier_max_probes")
         return budget > 0 and self._probes_spent >= budget
 
     def _enqueue_for_verification(self, claim: str, source: str) -> None:
@@ -1250,7 +1254,7 @@ class ChallengeSwarm:
         assertion, and a verifier handed a paragraph tests whichever sentence it
         happens to fixate on while appearing to have checked the whole thing.
         """
-        if not bool(getattr(self.settings, "verify_claims", True)):
+        if not bool_setting(self.settings, "verify_claims"):
             return
         if self.cancel_event.is_set():
             return
@@ -1349,7 +1353,7 @@ class ChallengeSwarm:
         ever-growing conversation history."""
         from backend.round_summary import meta_summarize, summarize_round
 
-        fresh_rounds = int(getattr(self.settings, "fresh_restart_rounds", 5) or 0)
+        fresh_rounds = int_setting(self.settings, "fresh_restart_rounds")
         # 1. distill this round — prefer the phase-2 harvest, then the solver's
         #    accumulated findings, then the synthetic placeholder.
         raw = (result.concluded or getattr(solver, "findings", "")
@@ -1509,7 +1513,7 @@ class ChallengeSwarm:
         grinding through the entire time limit while the report blames the
         challenge. Sets cancel_event when the swarm-level threshold is reached.
         """
-        max_infra = int(getattr(self.settings, "max_infra_failures", 3) or 0)
+        max_infra = int_setting(self.settings, "max_infra_failures")
         infra = result.is_infra_failure or (
             result.status == GAVE_UP and not result.did_work
         )
@@ -1537,6 +1541,36 @@ class ChallengeSwarm:
             )
             self.cancel_event.set()
 
+    async def _stop_registered_solver(self, model_spec: str, fallback) -> None:
+        """Stop whichever solver currently owns this spec's sandbox.
+
+        The quota-fallback path replaces the solver object mid-loop and hands the
+        LIVE container over: `detach_sandbox()` clears the old solver's
+        `_owns_sandbox`, so its `stop()` deliberately leaves the container running
+        and the replacement is responsible for it. `_run_solver_loop` returns the
+        replacement, but only on a normal return — if anything raises or a cancel
+        lands after the handover, the caller's local still refers to the OLD solver,
+        whose stop() is now a no-op for the container. Nothing else holds a
+        reference, so the container and its workspace leaked.
+
+        Reading `self.solvers[model_spec]` (which the handover updates) closes that.
+        Both are stopped when they differ, so a partially-completed handover cannot
+        leak either side.
+        """
+        registered = self.solvers.get(model_spec)
+        targets = []
+        if registered is not None:
+            targets.append(registered)
+        if fallback is not None and fallback is not registered:
+            targets.append(fallback)
+        for solver in targets:
+            try:
+                await solver.stop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — teardown must not mask the outcome
+                logger.warning(f"[{self.meta.name}/{model_spec}] solver stop failed: {e}")
+
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
         solver = self._create_solver(model_spec)
         self.solvers[model_spec] = solver
@@ -1555,7 +1589,7 @@ class ChallengeSwarm:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
             return None
         finally:
-            await solver.stop()
+            await self._stop_registered_solver(model_spec, solver)
 
     async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → (interrupt + conclude) → bump → run → ...
@@ -1567,9 +1601,9 @@ class ChallengeSwarm:
         bump_count = 0
         consecutive_errors = 0
         quota_retries = 0
-        budget_s = int(getattr(self.settings, "solver_time_budget_s", 0) or 0)
-        conclude_s = int(getattr(self.settings, "conclude_timeout_s", 90) or 90)
-        max_rounds = int(getattr(self.settings, "max_attempts_per_challenge", 0) or 0)
+        budget_s = int_setting(self.settings, "solver_time_budget_s")
+        conclude_s = int_setting(self.settings, "conclude_timeout_s")
+        max_rounds = int_setting(self.settings, "max_attempts_per_challenge")
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
@@ -1702,7 +1736,7 @@ class ChallengeSwarm:
             if result.is_infra_failure or not result.did_work or overflowed:
                 self._last_round_novel.pop(model_spec, None)
             else:
-                limit = int(getattr(self.settings, "stale_round_limit", 0) or 0)
+                limit = int_setting(self.settings, "stale_round_limit")
                 stale = (
                     0 if self._last_round_novel.pop(model_spec, False)
                     else self._stale_rounds.get(model_spec, 0) + 1
@@ -1771,7 +1805,7 @@ class ChallengeSwarm:
             # restart clean carrying only the distilled state (no history bloat).
             # Also forced after a context overflow, where the history is already
             # gone and only the distilled state can carry anything forward.
-            if force_restart or int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
+            if force_restart or int_setting(self.settings, "fresh_restart_rounds") > 0:
                 await self._fresh_restart(solver, model_spec, result, reason, bump_count, outcome)
             else:
                 solver.bump(await self._build_bump_payload(model_spec, reason, bump_count,
@@ -1785,15 +1819,15 @@ class ChallengeSwarm:
 
     def _bump_cooldown(self, bump_count: int) -> float:
         """Backoff before the next round: base + step*round, capped at max."""
-        base = float(getattr(self.settings, "bump_cooldown_base_s", 5) or 0)
-        step = float(getattr(self.settings, "bump_cooldown_step_s", 10) or 0)
-        cap = float(getattr(self.settings, "bump_cooldown_max_s", 120) or 0)
+        base = float_setting(self.settings, "bump_cooldown_base_s")
+        step = float_setting(self.settings, "bump_cooldown_step_s")
+        cap = float_setting(self.settings, "bump_cooldown_max_s")
         wait = base + step * bump_count
         return min(wait, cap) if cap > 0 else wait
 
     def _quota_backoff(self, retries: int) -> float:
-        base = float(getattr(self.settings, "quota_backoff_base_s", 60) or 0)
-        cap = float(getattr(self.settings, "quota_backoff_max_s", 300) or 0)
+        base = float_setting(self.settings, "quota_backoff_base_s")
+        cap = float_setting(self.settings, "quota_backoff_max_s")
         wait = base * retries
         return min(wait, cap) if cap > 0 else wait
 
@@ -1826,7 +1860,7 @@ class ChallengeSwarm:
         """
         if not pending:
             return
-        grace = float(getattr(self.settings, "solver_teardown_grace_s", 60) or 60)
+        grace = float_setting(self.settings, "solver_teardown_grace_s")
         _done, still = await asyncio.wait(pending, timeout=grace)
         if still:
             logger.warning(

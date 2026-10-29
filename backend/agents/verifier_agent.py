@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from backend.config import bool_setting, int_setting
 from backend.verifier import (
     INCONCLUSIVE,
     ROLE_PROMPT,
@@ -278,7 +279,7 @@ class VerificationRunner:
         # on the answer. Filtering untestable and non-load-bearing claims here is
         # what keeps the verifier pointed at premises whose falsity would actually
         # invalidate other agents' work.
-        if bool(getattr(swarm.settings, "verifier_triage", True)):
+        if bool_setting(swarm.settings, "verifier_triage"):
             triage = await self._triage(claim)
             if not triage.should_verify:
                 self.filtered += 1
@@ -320,7 +321,7 @@ class VerificationRunner:
 
         solver.bump(build_claim_task(claim.content, claim.source, claim.probe_hint))
 
-        budget = int(getattr(swarm.settings, "verifier_budget_s", 300) or 300)
+        budget = int_setting(swarm.settings, "verifier_budget_s")
         try:
             result = await solver.run_until_done_or_gave_up(budget)
         except asyncio.CancelledError:

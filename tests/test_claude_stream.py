@@ -147,6 +147,7 @@ def make_solver(client, cancel_event=None, session_id="sess-0") -> ClaudeSolver:
     # partway through. These two are the Verifier's hooks; empty = stock behaviour.
     s.role_prompt = ""
     s.conclude_prompt = ""
+    s._context_overflow = False
     s.cancel_event = cancel_event or asyncio.Event()
     s.loop_detector = LoopDetector()
     s.tracer = SolverTracer("unit-stream", "kimi-k3")
@@ -574,3 +575,130 @@ def test_pydantic_backend_uses_the_same_window() -> None:
     from backend.agents import solver as pyd_solver
 
     assert pyd_solver.BUMP_TRACE_CHARS == cs.BUMP_TRACE_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Context overflow — the default backend used to misclassify it as a dead gateway
+# ---------------------------------------------------------------------------
+
+OVERFLOW_TEXTS = [
+    "API Error: prompt is too long: 210000 tokens > 200000 maximum",
+    "API Error: This model's maximum context length is 200000 tokens",
+    "request failed: input length exceeds the context window",
+]
+
+
+@pytest.mark.parametrize("text", OVERFLOW_TEXTS)
+def test_a_context_overflow_is_not_an_infrastructure_failure(text: str) -> None:
+    """The defect, and why it was expensive.
+
+    The CLI reports an overflow as ordinary assistant text, `_API_ERROR_RE` matches
+    the "API Error" prefix, there is no HTTP status and no quota keyword — so it fell
+    through to `return INFRA_ERROR`. On the DEFAULT backend that incremented
+    `_infra_failures` (three retire the whole swarm, telling the operator to check
+    ANTHROPIC_BASE_URL) and `consecutive_errors`, while `context_overflow` stayed
+    False so the overflow coaching and the forced clean restart never ran.
+    """
+    from backend.solver_base import INFRA_ERROR, QUOTA_ERROR
+
+    s = make_solver(FakeClient())
+    s._finding_blocks.append(text)
+    message = FakeResultMessage(is_error=True, subtype="error_during_execution")
+
+    api_error, status_override = s._classify_result(message)
+
+    assert status_override not in (INFRA_ERROR, QUOTA_ERROR), (
+        f"an overflow was classified as {status_override}"
+    )
+    assert s._context_overflow is True
+    assert api_error, "the reason must still be recorded for the trace"
+    s.tracer.close()
+
+
+@pytest.mark.parametrize("text", OVERFLOW_TEXTS)
+def test_an_overflow_drops_the_session_so_the_next_round_can_succeed(text: str) -> None:
+    """Overflow is recoverable ONLY by dropping the conversation. Leaving the session
+    id in place means the next round resumes the same over-long history and fails
+    identically forever — which is what made this look like a persistent outage."""
+    s = make_solver(FakeClient(), session_id="sess-overlong")
+    s._finding_blocks.append(text)
+
+    s._classify_result(FakeResultMessage(is_error=True, subtype="error_during_execution"))
+
+    assert s._session_id is None
+    s.tracer.close()
+
+
+def test_the_overflow_flag_reaches_the_result() -> None:
+    """The swarm branches on `result.context_overflow` to force a clean restart and
+    to keep the round out of the consecutive-error counter. A flag set on the solver
+    but not carried onto the result is the same as not detecting it."""
+    s = make_solver(FakeClient())
+    s._context_overflow = True
+
+    result = s._result("error", {"steps": 0, "calls": 0, "cost": 0.0})
+
+    assert result.context_overflow is True
+    s.tracer.close()
+
+
+def test_a_genuine_gateway_failure_is_still_infra() -> None:
+    """The fix must not blind the classifier to real outages — the ECONNREFUSED run
+    that motivated this whole module still has to be caught."""
+    from backend.solver_base import INFRA_ERROR
+
+    s = make_solver(FakeClient())
+    s._finding_blocks.append("API Error: Connection refused (ECONNREFUSED)")
+
+    _api_error, status = s._classify_result(
+        FakeResultMessage(is_error=True, subtype="error_during_execution"))
+
+    assert status == INFRA_ERROR
+    assert s._context_overflow is False
+    s.tracer.close()
+
+
+def test_hitting_the_turn_ceiling_is_not_an_infrastructure_failure() -> None:
+    """`error_max_turns` used to return a non-empty api_error, which makes
+    `is_infra_failure` true, so `_account_infra` rewrote the status to INFRA_ERROR
+    and counted a PRODUCTIVE round toward retiring the swarm — three of them told
+    the operator to check their gateway."""
+    from backend.solver_base import INFRA_ERROR
+
+    s = make_solver(FakeClient())
+    s._tool_calls = 40
+
+    api_error, status = s._classify_result(
+        FakeResultMessage(is_error=True, subtype="error_max_turns"))
+
+    assert status not in (INFRA_ERROR,)
+    assert api_error == "", "a non-empty api_error would mark the round as infra"
+    s.tracer.close()
+
+
+def test_an_overflow_exception_is_also_recognised() -> None:
+    """The SDK can raise instead of reporting in a ResultMessage; the Pydantic
+    backend already handled that path and this one did not."""
+    from backend.solver_base import ERROR, INFRA_ERROR
+
+    class FakeContextOverflow(Exception):
+        pass
+
+    FakeContextOverflow.__name__ = "ModelContextWindowExceededError"
+
+    s = make_solver(FakeClient(), session_id="sess-x")
+    exc = FakeContextOverflow("conversation no longer fits")
+
+    from backend.solver_base import is_context_overflow
+
+    assert is_context_overflow(exc), "the class name must match across the MRO"
+    assert s._result(ERROR, {"steps": 0, "calls": 0, "cost": 0.0}).status == ERROR
+    # And a plain transport exception is still classified by CLASS, not just text:
+    from backend.solver_base import classify_exception
+
+    class FakeTimeout(Exception):
+        pass
+
+    FakeTimeout.__name__ = "APITimeoutError"
+    assert classify_exception(FakeTimeout("x")) == INFRA_ERROR
+    s.tracer.close()

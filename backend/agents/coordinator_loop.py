@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.agents.coordinator_core import reap_finished_swarms
-from backend.config import Settings
+from backend.config import Settings, float_setting, int_setting, str_setting
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import CoordinatorDeps
@@ -60,9 +60,9 @@ def build_deps(
         model_specs=specs,
         challenges_root=challenges_root,
         no_submit=no_submit,
-        max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
-        msg_port=getattr(settings, "msg_port", 0),
-        msg_host=getattr(settings, "msg_host", "127.0.0.1"),
+        max_concurrent_challenges=int_setting(settings, "max_concurrent_challenges"),
+        msg_port=int_setting(settings, "msg_port"),
+        msg_host=str_setting(settings, "msg_host"),
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
     )
@@ -131,7 +131,7 @@ async def run_event_loop(
 
     patrol_task: asyncio.Task | None = None
     dashboard = None
-    turn_timeout = float(getattr(deps.settings, "coordinator_turn_timeout_s", 300) or 300)
+    turn_timeout = float_setting(deps.settings, "coordinator_turn_timeout_s")
     consecutive_turn_failures = 0
 
     async def _turn(msg: str) -> bool:
@@ -172,7 +172,7 @@ async def run_event_loop(
         await _auto_spawn_unsolved(deps, poller)
 
         # Operator dashboard (live swarm view + guidance mailbox UI)
-        dash_port = int(getattr(deps.settings, "dashboard_port", 8080) or 0)
+        dash_port = int_setting(deps.settings, "dashboard_port")
         if dash_port > 0:
             try:
                 from backend.web_dashboard import DashboardServer
@@ -187,13 +187,13 @@ async def run_event_loop(
                 logger.warning("Dashboard failed to start: %s", e)
 
         # Start the proactive patrol (stuck-solver detection + fast nudges)
-        patrol_interval = int(getattr(deps.settings, "patrol_interval_s", 120) or 120)
+        patrol_interval = int_setting(deps.settings, "patrol_interval_s")
         if patrol_interval > 0:
             patrol_task = asyncio.create_task(
                 _patrol_loop(
                     deps,
                     interval_s=patrol_interval,
-                    stuck_quiet_s=int(getattr(deps.settings, "patrol_stuck_quiet_s", 240) or 240),
+                    stuck_quiet_s=int_setting(deps.settings, "patrol_stuck_quiet_s"),
                 ),
                 name="coordinator-patrol",
             )
@@ -263,7 +263,7 @@ async def run_event_loop(
                 try:
                     n = await _auto_spawn_unsolved(
                         deps, poller,
-                        max_spawns=int(getattr(deps.settings, "max_spawns_per_challenge", 3) or 3),
+                        max_spawns=int_setting(deps.settings, "max_spawns_per_challenge"),
                     )
                     if n:
                         logger.info("Re-spawned %d unsolved challenge(s)", n)

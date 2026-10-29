@@ -867,6 +867,67 @@ def test_quota_fallback_mapping_strips_the_effort_suffix() -> None:
     assert _quota_fallback_spec("claude-sdk/unknown-model") is None
 
 
+@pytest.mark.asyncio
+async def test_the_handed_over_container_is_stopped_after_a_late_failure() -> None:
+    """The quota fallback hands the LIVE container to a replacement solver:
+    `detach_sandbox()` clears the old solver's `_owns_sandbox`, so its `stop()`
+    deliberately leaves the container running and the replacement owns it.
+
+    `_run_solver_loop` returns the replacement, but only on a normal return. If
+    anything raises after the handover, the caller's local still refers to the OLD
+    solver — whose stop() is now a no-op for the container — and nothing else holds
+    a reference. One orphaned container and workspace per occurrence.
+    """
+    old = ScriptedSolver("m1", [_gave_up()])
+    new = ScriptedSolver("m1", [_gave_up()])
+    swarm = _swarm({"m1": old})
+    # Simulate the post-handover state: the registry points at the replacement
+    # while the caller's local still holds the original.
+    swarm.solvers["m1"] = new
+
+    await swarm._stop_registered_solver("m1", old)
+
+    assert new.stopped, "the solver that OWNS the container must be stopped"
+    assert old.stopped, "the stale reference must also be stopped, in case the handover was partial"
+
+
+@pytest.mark.asyncio
+async def test_stopping_is_idempotent_when_there_was_no_handover() -> None:
+    solver = ScriptedSolver("m1", [_gave_up()])
+    swarm = _swarm({"m1": solver})
+
+    await swarm._stop_registered_solver("m1", solver)
+
+    assert solver.stopped
+    # Stopped exactly once, not twice — the registered solver and the local are the
+    # same object, and a second stop() would run teardown on a dead container.
+    assert solver.sandbox.stopped
+
+
+@pytest.mark.asyncio
+async def test_a_failing_stop_does_not_prevent_the_other_one() -> None:
+    """Teardown of the stale reference must not be able to skip the one that owns
+    the container, and must not mask the round's real outcome."""
+    class Exploding(ScriptedSolver):
+        async def stop(self) -> None:
+            raise RuntimeError("container already gone")
+
+    old = Exploding("m1", [_gave_up()])
+    new = ScriptedSolver("m1", [_gave_up()])
+    swarm = _swarm({"m1": old})
+    swarm.solvers["m1"] = new
+
+    await swarm._stop_registered_solver("m1", old)   # must not raise
+
+    assert new.stopped, "the owner was stopped even though the stale one exploded"
+
+
+@pytest.mark.asyncio
+async def test_stopping_an_unregistered_spec_is_safe() -> None:
+    swarm = _swarm({})
+    await swarm._stop_registered_solver("nobody", None)
+
+
 # ---------------------------------------------------------------------------
 # Status reporting
 # ---------------------------------------------------------------------------

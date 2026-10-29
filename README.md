@@ -553,7 +553,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 630 tests, no Docker / no LLM / no network
+uv run pytest -q             # 692 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports
@@ -600,7 +600,7 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `SKILL_AFTER_BUMPS` | `1` | Inject skill hint **text** after N failed attempts. **0 disables** (matches `ESCALATE_AFTER_BUMPS`). Gates text only, not rotation |
 | `SKILL_ROTATE_APPROACHES` | `true` | Assign the next handbook each retry. Separate switch from injection so the two can be A/B'd — see *Skill Library* |
 | `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
-| `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |
+| `FRESH_RESTART_ROUNDS` | `5` | **Merge interval**, not a restart interval: any value > 0 restarts the session every bump, `0` is the continue-session bump. `1` is the most expensive setting (meta-summarizes every round); `validate_tuning` warns |
 | `SIBLING_DIGEST_MIN_REPORTS` | `2` | Distinct reports needed before spending a model call on the team digest |
 | `SIBLING_DIGEST_REFRESH_BUMPS` | `1` | Recompute the team digest at most once every N bumps (shared by all solvers) |
 | `SUMMARIZER_MODEL` | `deepseek-v4-flash` | Model for journal distillation, merges and the team digest — all cost-tracked |

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from backend.config import float_setting, int_setting, str_setting
+
 logger = logging.getLogger(__name__)
 
 # HTTP statuses that mean "reachable, but you will not get answers right now".
@@ -306,11 +308,11 @@ async def check_health(settings: object, probe_model: str = "") -> HealthReport:
     """
     from backend.models import DEFAULT_MODELS, model_id_from_spec
 
-    timeout_s = float(getattr(settings, "health_check_timeout_s", 20.0) or 20.0)
-    attempts = int(getattr(settings, "health_check_retries", 3) or 1)
+    timeout_s = float_setting(settings, "health_check_timeout_s")
+    attempts = int_setting(settings, "health_check_retries")
     specs = list(DEFAULT_MODELS)
     primary = probe_model or model_id_from_spec(specs[0])
-    summarizer = getattr(settings, "summarizer_model", "") or ""
+    summarizer = str_setting(settings, "summarizer_model")
 
     report = HealthReport()
     report.probes.append(

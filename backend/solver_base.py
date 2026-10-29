@@ -154,13 +154,34 @@ def classify_exception(exc: BaseException) -> str | None:
     return classify_api_error(str(exc))
 
 
+def is_context_overflow_text(text: str) -> bool:
+    """True when an error MESSAGE means "the conversation no longer fits".
+
+    Split out from `is_context_overflow` because the two backends learn this
+    differently: the Pydantic backend gets an exception, while the Claude CLI reports
+    API failures as an ordinary assistant text block inside a ResultMessage. Only the
+    exception form was handled, so on the DEFAULT backend a context overflow was
+    classified as INFRA_ERROR — it incremented `_infra_failures` (three retire the
+    whole swarm, blaming the gateway) and `consecutive_errors` (five retire the
+    solver), while `context_overflow` stayed False and the overflow-specific
+    coaching and forced clean restart never ran.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(needle in low for needle in (
+        "context window", "maximum context", "too many tokens",
+        "prompt is too long", "context length exceeded", "exceeds the model",
+        "reduce the length of your input",
+    ))
+
+
 def is_context_overflow(exc: BaseException) -> bool:
     """True when the failure means "the conversation no longer fits"."""
     names = {c.__name__ for c in type(exc).__mro__}
     if names & _CONTEXT_EXC_NAMES:
         return True
-    text = str(exc).lower()
-    return "context window" in text or "maximum context" in text or "too many tokens" in text
+    return is_context_overflow_text(str(exc))
 
 
 @dataclass

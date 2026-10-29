@@ -27,6 +27,7 @@ from typing import Any
 from aiohttp import web
 
 from backend.briefing import Turn, ask
+from backend.config import int_setting
 from backend.message_bus import KIND_CLAIM, KIND_FACT, KIND_VERIFIED
 from backend.trace_read import last_model_text, trace_activity
 
@@ -181,8 +182,12 @@ class DashboardServer:
         # and print it so the operator can still reach the UI.
         self.token = token or secrets.token_urlsafe(24)
         self._generated_token = not token
-        self.feed_chars = int(getattr(getattr(deps, "settings", None),
-                                      "dashboard_feed_chars", 4000) or 4000)
+        # `deps` may be a partial namespace in tests; int_setting treats a missing
+        # attribute the same as an absent one and falls back to the declared
+        # default, so the defensive getattr is preserved without a second hardcoded
+        # literal that could drift from config.py.
+        self.feed_chars = int_setting(getattr(deps, "settings", None) or SimpleNamespace(),
+                                     "dashboard_feed_chars")
 
     async def start(self) -> None:
         app = web.Application()

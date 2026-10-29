@@ -37,6 +37,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
 )
 
+from backend.config import int_setting, str_setting
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
@@ -53,6 +54,9 @@ from backend.solver_base import (
     SolverResult,
     classify_api_error,
     classify_api_status,
+    classify_exception,
+    is_context_overflow,
+    is_context_overflow_text,
 )
 from backend.tracing import SolverTracer
 
@@ -158,6 +162,10 @@ class ClaudeSolver:
         self._concluding = False
         self._interrupted = False
         self._externally_cancelled = False
+        # Set when this round ended because the conversation no longer fits. Read by
+        # `_result()`; see `_classify_result` for why this backend needs a text-based
+        # check rather than the exception-based one the Pydantic backend uses.
+        self._context_overflow = False
 
     # ------------------------------------------------------------------
     # Findings
@@ -241,13 +249,13 @@ class ClaudeSolver:
             system_prompt = sandbox_preamble + build_prompt(
                 self.meta, distfile_names, container_arch=container_arch,
                 has_named_tools=False,
-                skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
+                skills_enabled=bool(str_setting(self.settings, "skills_dir")),
             ) + "\n\n" + self.role_prompt
         else:
             system_prompt = sandbox_preamble + build_prompt(
                 self.meta, distfile_names, container_arch=container_arch,
                 has_named_tools=False,
-                skills_enabled=bool(getattr(self.settings, "skills_dir", "")),
+                skills_enabled=bool(str_setting(self.settings, "skills_dir")),
             )
 
         self._client = ClaudeSDKClient(
@@ -319,7 +327,7 @@ class ClaudeSolver:
         round. `-k 5` sends TERM then KILL 5s later — the same shape as Cairn's
         `timeout -k 5s <n>s` wrapper.
         """
-        limit = int(getattr(self.settings, "sandbox_command_timeout_s", 0) or 0)
+        limit = int_setting(self.settings, "sandbox_command_timeout_s")
         inner = command
         if limit > 0:
             inner = f"timeout -k 5 {limit} bash -c {shlex.quote(command)}"
@@ -672,6 +680,7 @@ class ClaudeSolver:
         calls_before = self._tool_calls
         self._interrupted = False
         self._externally_cancelled = False
+        self._context_overflow = False
         self._last_usage = (0, 0, 0)
         self._finding_blocks.clear()
         deadline = (asyncio.get_running_loop().time() + budget_s) if budget_s > 0 else None
@@ -724,10 +733,23 @@ class ClaudeSolver:
             raise
         except Exception as e:  # noqa: BLE001
             error_str = str(e)
+            # Mirror the Pydantic backend's ordering: cancel, then overflow, then
+            # exception-class classification, then text classification. This path
+            # used to go straight to `classify_api_error(error_str) or ERROR`, so an
+            # SDK exception whose CLASS name identifies it (`APITimeoutError`,
+            # `APIConnectionError`) but whose `str()` does not match the conservative
+            # text regexes was demoted to a plain ERROR — feeding the consecutive-
+            # error counter instead of the infra guard's backoff semantics.
+            if is_context_overflow(e):
+                logger.warning(f"[{self.agent_name}] Context overflow — dropping session")
+                self.tracer.event("context_overflow_reset", error=error_str[:200])
+                self._session_id = None
+                self._context_overflow = True
+                return self._result(ERROR, deltas, api_error=error_str[:300])
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
             self._add_finding(f"Error: {e}")
             self.tracer.event("error", error=error_str)
-            kind = classify_api_error(error_str) or ERROR
+            kind = classify_exception(e) or classify_api_error(error_str) or ERROR
             return self._result(kind, deltas, api_error=error_str)
 
     def _classify_result(self, message: ResultMessage) -> tuple[str, str | None]:
@@ -754,16 +776,38 @@ class ClaudeSolver:
             return "", None
 
         from_status = classify_api_status(api_status)
+        text = self.findings
+        # Context overflow must be recognised BEFORE the generic classification. The
+        # CLI reports it as ordinary assistant text ("API Error: prompt is too long:
+        # 210000 tokens > 200000 maximum"), which `_API_ERROR_RE` matches, and it
+        # carries no HTTP status and no quota keyword — so it fell all the way
+        # through to `return INFRA_ERROR`. On the default backend that meant a real
+        # overflow incremented `_infra_failures` (three retire the swarm, blaming the
+        # gateway) and `consecutive_errors`, while `context_overflow` stayed False so
+        # the overflow coaching and the forced clean restart never ran.
+        if is_context_overflow_text(text) or is_context_overflow_text(detail):
+            self._context_overflow = True
+            # Recoverable only by dropping the conversation, so drop it now — the
+            # next round must not fail identically forever.
+            self._session_id = None
+            return (detail or text[:300] or "context window exceeded"), None
         if from_status:
             return detail or f"api_error_status={api_status}", from_status
 
-        text = self.findings
         if is_error or subtype.startswith("error"):
             kind = classify_api_error(text) or classify_api_error(detail)
             if kind:
                 return detail or text[:400], kind
             if subtype == "error_max_turns" or terminal == "max_turns":
-                return detail or "max turns reached", None
+                # Deliberately NOT reported as api_error. A non-empty api_error makes
+                # `is_infra_failure` true, so `_account_infra` rewrote the status to
+                # INFRA_ERROR and counted the round toward retiring the swarm — a
+                # productive round that ran out of turns was booked as a dead
+                # gateway, and three of them retired a healthy swarm telling the
+                # operator to check ANTHROPIC_BASE_URL. Hitting the turn ceiling is
+                # an ordinary GAVE_UP: the model worked, the round ended.
+                self.tracer.event("max_turns_reached", steps=self._step_count)
+                return "", None
             return detail or f"turn failed ({subtype or 'unknown'})", INFRA_ERROR
 
         # No error flag, but the text itself may be a bare API error message —
@@ -918,6 +962,7 @@ class ClaudeSolver:
             tool_calls=self._tool_calls - deltas.get("calls", 0),
             api_error=api_error,
             interrupted=self._interrupted,
+            context_overflow=self._context_overflow,
             input_tokens=in_tok, output_tokens=out_tok, cache_read_tokens=cache_tok,
         )
 

@@ -51,10 +51,31 @@ def test_defaults_allow_two_merge_cycles() -> None:
     assert not [w for w in validate_tuning(s) if "MAX_ATTEMPTS_PER_CHALLENGE" in w]
 
 
-@pytest.mark.parametrize("cap,fresh", [(11, 5), (12, 5), (16, 5), (21, 5), (6, 2), (3, 1)])
+@pytest.mark.parametrize("cap,fresh", [(11, 5), (12, 5), (16, 5), (21, 5), (6, 2), (5, 2)])
 def test_aligned_cap_and_cycle_stay_quiet(cap: int, fresh: int) -> None:
     assert validate_tuning(_settings(max_attempts_per_challenge=cap,
                                      fresh_restart_rounds=fresh)) == []
+
+
+def test_fresh_restart_rounds_of_one_is_reported_as_the_worst_setting() -> None:
+    """1 is not "disabled" and not a merge interval — it is the most expensive value
+    available. The gate is `> 0`, so the session restarts every bump, and
+    `len(journal) >= 1` is then true after every round, so each bump also pays a
+    meta-summarize call while the journal never holds more than one entry. The
+    distil->merge cycle the knob exists for cannot happen.
+
+    config.py and .env.example both used to document "0/1 disables", which sent
+    operators looking for the continue-session bump straight into this.
+    """
+    warns = validate_tuning(_settings(fresh_restart_rounds=1))
+    assert any("FRESH_RESTART_ROUNDS=1" in w for w in warns), warns
+    assert any("most expensive" in w for w in warns)
+
+
+def test_fresh_restart_rounds_of_zero_is_a_legitimate_choice() -> None:
+    """0 IS the continue-session bump, and must not be warned about — it is the
+    documented way to opt out of fresh restarts entirely."""
+    assert validate_tuning(_settings(fresh_restart_rounds=0)) == []
 
 
 # ---------------------------------------------------------------------------

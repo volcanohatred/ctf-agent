@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import deque
@@ -375,13 +376,27 @@ class Solver:
             # `timeout` is pydantic-ai's own per-run wall clock: it raises
             # RunTimedOut and leaves the agent usable, which is what makes the
             # phase-2 conclude possible on this backend too.
-            result = await self._agent.run(
+            #
+            # The run is raced against cancel_event rather than simply awaited.
+            # `_wind_down`'s contract is that solvers watch the event and break out
+            # of their stream loop within a couple of seconds, letting each run its
+            # own container/workspace teardown uninterrupted — ClaudeSolver polls
+            # every 2s and honours it. This backend awaited `agent.run` to
+            # completion and only read the event afterwards, so on a flag-found or
+            # a coordinator shutdown it ignored the cancellation for the rest of a
+            # turn that can run to SOLVER_TIME_BUDGET_S (1500s), ate the whole 60s
+            # grace, and was then hard-task-cancelled — which is the exact path
+            # `_wind_down` exists to avoid, and it lost the round's findings.
+            run_task = asyncio.create_task(self._agent.run(
                 self._next_prompt(),
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
                 usage_limits=UsageLimits(request_limit=None),
                 timeout=float(budget_s) if budget_s > 0 else None,
-            )
+            ))
+            result = await self._await_run_or_cancel(run_task)
+            if result is None:
+                return self._result(CANCELLED, deltas)
 
             duration = time.monotonic() - t0
             usage = result.usage
@@ -420,6 +435,50 @@ class Solver:
             raise
         except Exception as e:  # noqa: BLE001 — mapped onto solver statuses below
             return self._handle_run_exception(e, deltas)
+
+    async def _await_run_or_cancel(self, run_task: asyncio.Task):
+        """Await an agent run, abandoning it if the swarm is cancelled first.
+
+        Returns the run's result, or None when cancel_event won the race. The
+        abandoned task is always cancelled AND awaited, so it cannot linger as
+        "Task was destroyed but it is pending" at loop close.
+
+        A cancel of THIS task (not the swarm's) still propagates: that is the
+        hard-cancel `_wind_down` applies to a straggler after its grace period, and
+        swallowing it here would defeat the last resort that makes the grace safe.
+        """
+        if self.cancel_event.is_set():
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run_task
+            self.tracer.event("cancelled", phase="execute", reason="swarm already cancelled")
+            return None
+
+        cancel_waiter = asyncio.create_task(self.cancel_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {run_task, cancel_waiter}, return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run_task
+            raise
+        finally:
+            cancel_waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cancel_waiter
+
+        if run_task not in done:
+            # cancel_event fired first: leave the turn, let teardown run.
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run_task
+            self._interrupted = True
+            self.tracer.event("cancelled", phase="execute", reason="cancel_event")
+            return None
+        # Re-raises whatever the run raised, so the existing handler still maps it.
+        return run_task.result()
 
     def _handle_run_exception(self, e: Exception, deltas: dict) -> SolverResult:
         """Map a pydantic-ai/model exception onto a solver status."""

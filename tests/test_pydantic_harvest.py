@@ -14,6 +14,7 @@ recover it. When it cannot be recovered, the harvest must refuse — "nothing" b
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from types import SimpleNamespace
 
@@ -209,3 +210,148 @@ def _read_events(path: str) -> list[dict]:
             except ValueError:
                 continue
     return out
+
+
+# ---------------------------------------------------------------------------
+# Mid-turn cancellation
+#
+# `_wind_down`'s contract is that solvers watch cancel_event and break out of their
+# stream loop within a couple of seconds, so each can run its own container and
+# workspace teardown uninterrupted. ClaudeSolver polls every 2s and honours it; this
+# backend awaited `agent.run` to completion and only read the event afterwards, so it
+# ignored cancellation for the rest of a turn that can run to SOLVER_TIME_BUDGET_S
+# (1500s), ate the whole 60s grace, and was then hard-task-cancelled — the exact path
+# `_wind_down` exists to avoid, and it lost the round's findings.
+# ---------------------------------------------------------------------------
+
+def _real_cancel_event() -> asyncio.Event:
+    return asyncio.Event()
+
+
+async def test_a_run_that_completes_returns_its_result(tmp_path) -> None:
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+
+    async def _run():
+        return "the-result"
+
+    task = asyncio.create_task(_run())
+    assert await s._await_run_or_cancel(task) == "the-result"
+    s.tracer.close()
+
+
+async def test_an_already_cancelled_swarm_does_not_start_the_turn(tmp_path) -> None:
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+    s.cancel_event.set()
+
+    started = []
+
+    async def _run():
+        started.append(True)
+        return "should-not-be-returned"
+
+    task = asyncio.create_task(_run())
+    assert await s._await_run_or_cancel(task) is None
+    await asyncio.sleep(0)
+    assert task.cancelled() or task.done()
+    s.tracer.close()
+
+
+async def test_a_cancel_mid_turn_abandons_the_run_promptly(tmp_path) -> None:
+    """The whole point: a long turn must not ride out its budget after the swarm is
+    done with it."""
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+
+    abandoned = asyncio.Event()
+
+    async def _long_run():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
+        return "never"
+
+    task = asyncio.create_task(_long_run())
+    waiter = asyncio.create_task(s._await_run_or_cancel(task))
+    await asyncio.sleep(0.02)
+    s.cancel_event.set()
+
+    assert await asyncio.wait_for(waiter, timeout=2) is None
+    assert abandoned.is_set(), "the abandoned run must actually be cancelled"
+    assert s._interrupted is True
+    s.tracer.close()
+
+
+async def test_a_failing_run_still_raises_so_the_handler_maps_it(tmp_path) -> None:
+    """The race must not swallow the run's exception — `_handle_run_exception` is
+    what turns a RunTimedOut into the interrupted/harvest path."""
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+
+    class Boom(Exception):
+        pass
+
+    async def _run():
+        raise Boom("the run failed")
+
+    task = asyncio.create_task(_run())
+    with pytest.raises(Boom):
+        await s._await_run_or_cancel(task)
+    s.tracer.close()
+
+
+async def test_cancelling_the_awaiter_propagates_and_cleans_up_the_run(tmp_path) -> None:
+    """This is `_wind_down`'s last-resort hard cancel of a straggler. Swallowing it
+    here would defeat the only mechanism that bounds a wedged solver."""
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+
+    abandoned = asyncio.Event()
+
+    async def _long_run():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
+        return "never"
+
+    task = asyncio.create_task(_long_run())
+    awaiter = asyncio.create_task(s._await_run_or_cancel(task))
+    await asyncio.sleep(0.02)
+    awaiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await awaiter
+    assert abandoned.is_set(), "the inner run must not be left pending"
+    s.tracer.close()
+
+
+async def test_no_task_is_left_pending_after_any_outcome(tmp_path) -> None:
+    """An unawaited task is destroyed at loop close with a warning, and if it owned a
+    container that container leaks."""
+    s = _make_solver(tmp_path)
+    s.cancel_event = _real_cancel_event()
+
+    for cancel_first in (False, True):
+        s.cancel_event.clear()
+
+        async def _run():
+            await asyncio.sleep(10)
+            return "x"
+
+        task = asyncio.create_task(_run())
+        waiter = asyncio.create_task(s._await_run_or_cancel(task))
+        await asyncio.sleep(0.01)
+        if cancel_first:
+            s.cancel_event.set()
+            await asyncio.wait_for(waiter, timeout=2)
+        else:
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        assert task.done(), "the inner run task must always be awaited"
+    s.tracer.close()

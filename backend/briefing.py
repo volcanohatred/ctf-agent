@@ -197,7 +197,9 @@ def build_dossier(
         f"- ✓ 双模型证实：{status.get('corroborated_facts', 0)} 条",
         f"- ⚠ 仅单一声称、未验证：{status.get('unverified_claims', 0)} 条",
         f"- ⛔ 被探针证伪的前提：{status.get('probe_refuted', 0)} 条",
-        f"- ⚡ 检测到的自相矛盾：{status.get('contradictions', 0)} 处",
+        f"- ⚡ 检测到的自相矛盾：{status.get('contradictions', 0)} 处"
+        f"　审计调用失败：{status.get('audit_failures', 0)} 次"
+        "　← 失败数高说明矛盾审计一直没真正跑起来，「0 处矛盾」不代表队伍一致",
         f"- ⛔ 熔断触发（有 solver 连续多轮零新信息）：{status.get('stale_breaks', 0)} 次",
         f"- 🧭 战略家 PIVOT：{status.get('strategist_pivots', 0)} 次"
         f"　战略家调用失败：{status.get('strategist_failures', 0)} 次"

@@ -178,3 +178,115 @@ def test_answer_key_is_stripped_from_the_sandbox_mount() -> None:
         assert "flag" not in data and "flags" not in data
         assert data["name"] == "reg-forensics-magic"
         assert "损坏的 PNG" in data["description"]
+
+
+# ---------------------------------------------------------------------------
+# Sanitization failure must never mount the answer key
+# ---------------------------------------------------------------------------
+
+def test_a_description_mentioning_flags_is_not_mistaken_for_a_leak() -> None:
+    """The guard inspects VALUES for a flag-shaped literal, not the document for the
+    word "flag". Challenge descriptions legitimately discuss recovering one — the
+    UTF8_METADATA fixture above says so — and a substring test rejected those
+    challenges outright, which is a worse failure than the leak it was guarding."""
+    import yaml
+
+    from backend.sandbox import _find_flag_literal
+
+    data = yaml.safe_load(UTF8_METADATA)
+    data.pop("flag", None)          # what _sanitized_metadata does before checking
+    assert "flag" in data["description"], "the fixture must actually mention it"
+    assert _find_flag_literal(data) is None, "a description is not an answer key"
+
+
+@pytest.mark.parametrize("payload,path_hint", [
+    ({"flag": "flag{real}"}, "flag"),
+    ({"answer_flag": "CTF{real}"}, "answer_flag"),
+    ({"solution": {"key": "flag{nested}"}}, "solution.key"),
+    ({"flags": ["flag{one}", "flag{two}"]}, "flags[0]"),
+])
+def test_a_flag_shaped_value_is_detected_wherever_it_hides(payload, path_hint) -> None:
+    """The point of checking the value rather than the field name: an answer key
+    under a name `_sanitized_metadata` does not pop must still be caught."""
+    from backend.sandbox import _find_flag_literal
+
+    found = _find_flag_literal(payload)
+    assert found is not None
+    assert path_hint in found
+
+
+def test_prose_and_hex_and_urls_are_not_flag_literals() -> None:
+    from backend.sandbox import _find_flag_literal
+
+    for benign in (
+        {"description": "read the flag from the PNG's IHDR chunk"},
+        {"connection_info": "nc localhost 31337"},
+        {"hint": "the offset is 0x7f8a1c000000"},
+        {"url": "https://example.com/a/b"},
+        {"empty_braces": "{}"},
+    ):
+        assert _find_flag_literal(benign) is None, benign
+
+
+def test_unsanitizable_metadata_is_not_mounted(tmp_path, monkeypatch) -> None:
+    """The fail-safe direction. The previous fallback returned the ORIGINAL path, so
+    a failed write put the answer key inside the solver's sandbox after one warning
+    line — and in offline mode a solver could then `cat /challenge/metadata.yml`,
+    silently invalidating the entire benchmark run."""
+    from backend.sandbox import DockerSandbox
+
+    root = tmp_path / "chal"
+    root.mkdir()
+    meta = _write(root / "metadata.yml", UTF8_METADATA)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    sb = DockerSandbox(image="x", challenge_dir=str(root), workspace_dir=str(ws))
+
+    # Make the sanitized write fail (e.g. a full disk or a permissions error).
+    def _boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(Path, "write_text", _boom)
+
+    assert sb._sanitized_metadata(str(meta)) is None, (
+        "must refuse to mount rather than fall back to the file containing the flag"
+    )
+
+
+def test_a_surviving_answer_key_blocks_the_mount(tmp_path) -> None:
+    """Covers the rename case: an answer key under a field name the pop list does not
+    know about must be caught by the value check, not shipped into the sandbox."""
+    from backend.sandbox import DockerSandbox
+
+    root = tmp_path / "chal"
+    root.mkdir()
+    meta = _write(root / "metadata.yml",
+                  'name: renamed-key\ncategory: misc\nvalue: 10\n'
+                  'description: "find it"\nanswer: "flag{should_not_leak}"\n')
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    sb = DockerSandbox(image="x", challenge_dir=str(root), workspace_dir=str(ws))
+
+    assert sb._sanitized_metadata(str(meta)) is None
+
+
+def test_binds_omit_metadata_when_sanitization_fails(tmp_path, monkeypatch) -> None:
+    """End to end: the mount list must not contain a metadata.yml entry at all, so
+    there is no path by which the original file reaches the container."""
+    from backend.sandbox import DockerSandbox
+
+    root = tmp_path / "chal"
+    root.mkdir()
+    _write(root / "metadata.yml", UTF8_METADATA)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    sb = DockerSandbox(image="x", challenge_dir=str(root), workspace_dir=str(ws))
+    monkeypatch.setattr(sb, "_sanitized_metadata", lambda meta_yml: None)
+
+    binds = sb._prepare_binds()
+
+    assert not any("/challenge/metadata.yml" in b for b in binds), binds
+    assert any("/challenge/workspace" in b for b in binds), "the workspace must still mount"

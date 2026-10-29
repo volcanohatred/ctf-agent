@@ -256,6 +256,26 @@ class ChallengeMessageBus:
         """A solver raises a knowledge-gap help request for the human operator."""
         await self.post(model, question, kind=KIND_HELP)
 
+    async def established_keys(self, keys: set[str]) -> set[str]:
+        """Which of `keys` already appear on the board at FACT or VERIFIED tier.
+
+        Needed because the swarm's authorship ledger is bounded and evicts oldest
+        first. Once a key is evicted, the next solver to report that line looks like
+        a first-time asserter, and posting it as a fresh ⚠ claim would put the SAME
+        statement on the board at two trust levels — the exact invariant
+        `promote_claims` exists to maintain, broken from the other direction. It also
+        re-enqueues an already-settled statement for a probe, and a later REFUTED
+        would then sit beside a standing ✓.
+        """
+        if not keys:
+            return set()
+        async with self._lock:
+            return {
+                key for key in keys
+                if any(f.kind in (KIND_FACT, KIND_VERIFIED) and normalize(f.content) == key
+                       for f in self.findings)
+            }
+
     async def post_advice(self, model: str, content: str) -> None:
         """Drop guidance addressed to ONE running solver (mid-run pickup)."""
         content = (content or "").strip()

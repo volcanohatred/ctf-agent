@@ -83,6 +83,8 @@ def collect_challenge_data(
             "unverified_claims": sum(1 for f in feed if f["kind"] == KIND_CLAIM),
             "probe_refuted": getattr(swarm, "_probe_refuted", 0),
             "contradictions": getattr(swarm, "_contradictions", 0),
+            "audit_failures": getattr(swarm, "_audit_failures", 0),
+            "strategist_failures": getattr(swarm, "_strategist_failures", 0),
             "agents": agents,
             "shared_feed": feed,
             "archived": False,
@@ -109,6 +111,8 @@ def collect_challenge_data(
         "unverified_claims": archived.get("unverified_claims", 0),
         "probe_refuted": archived.get("probe_refuted", 0),
         "contradictions": archived.get("contradictions", 0),
+        "audit_failures": archived.get("audit_failures", 0),
+        "strategist_failures": archived.get("strategist_failures", 0),
         "agents": archived.get("agents", {}),
         "shared_feed": archived.get("shared_feed", []),
         "archived": True,
@@ -151,6 +155,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"　⛔ 熔断 {report.get('stale_breaks', 0)} 次"
             f"　🧭 战略家 PIVOT {report.get('strategist_pivots', 0)} 次"
         )
+        # A zero here is ambiguous unless the failure counts are shown next to it:
+        # "no contradictions found" and "the audit never ran" lead an operator to
+        # opposite conclusions about whether the team's beliefs were ever checked.
+        strat_failed = report.get("strategist_failures", 0)
+        audit_failed = report.get("audit_failures", 0)
+        if strat_failed or audit_failed:
+            add(
+                f"- ⚠ **机制未生效**: 战略家调用失败 {strat_failed} 次、矛盾审计失败 "
+                f"{audit_failed} 次。上面的 0 值可能意味着「检查过且没问题」，也可能意味着"
+                "「根本没检查」——复盘时不要当成前者。"
+            )
         if claims_n > (facts_n + verified_n) * 3 and claims_n >= 6:
             add(
                 "- ⚠ **本题大部分\"已知信息\"从未被第二个模型证实、也从未被探针实测**。"

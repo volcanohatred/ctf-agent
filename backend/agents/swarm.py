@@ -270,6 +270,9 @@ class ChallengeSwarm:
     # conflict produced a fresh broadcast, a fresh priority-10 enqueue and a fresh
     # 300s sandbox round per round, indefinitely.
     _seen_contradictions: set[frozenset] = field(init=False, default_factory=set)
+    # Audit calls that produced no answer. Kept apart from `contradictions` because
+    # "0 conflicts found" and "the audit never ran" must not read the same.
+    _audit_failures: int = field(init=False, default=0)
     # Swarm-wide distilled state, recomputed at most once per bump generation and
     # shared by every solver restarting in that generation.
     _team_digest: str = field(init=False, default="")
@@ -918,8 +921,28 @@ class ChallengeSwarm:
                 else:
                     display, is_confirmed = f'DRY RUN — would submit "{normalized}"', False
             else:
-                from backend.tools.core import do_submit_flag
-                display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
+                from backend.tools.core import FlagSubmissionError, do_submit_flag
+                try:
+                    display, is_confirmed = await do_submit_flag(
+                        self.ctfd, self.meta.name, flag)
+                except FlagSubmissionError as e:
+                    # The flag was never judged, so this is not a wrong answer.
+                    # Counting it here walked the solver up SUBMISSION_COOLDOWNS to a
+                    # 10-minute lockout because CTFd was unreachable — punishing the
+                    # model for the network. The flag is also released from
+                    # `_submitted_flags` so a retry after the outage is not rejected
+                    # as "already tried this exact flag".
+                    self._submitted_flags.discard(normalized)
+                    logger.warning(
+                        f"[{self.meta.name}/{model_spec}] submission did not reach CTFd "
+                        f"({e}) — not counted as a wrong answer"
+                    )
+                    return (
+                        f"SUBMISSION FAILED — CTFd did not answer ({e}). Your flag was "
+                        "NOT judged, so it is not counted as a wrong attempt. Retry "
+                        "shortly; do not change the flag because of this.",
+                        False,
+                    )
             if is_confirmed:
                 self.confirmed_flag = normalized
                 logger.info(f"[{self.meta.name}] Flag CONFIRMED via {model_spec}")
@@ -977,7 +1000,7 @@ class ChallengeSwarm:
     MAX_CLAIM_KEYS = 2000
 
     def _classify_claims(
-        self, model_spec: str, facts: list[str]
+        self, model_spec: str, facts: list[str], established: set[str] | None = None
     ) -> tuple[list[str], list[str], bool]:
         """Split asserted fact lines into corroborated vs single-source.
 
@@ -992,8 +1015,16 @@ class ChallengeSwarm:
             hallucination simply by surviving a restart and repeating it;
           * a line already corroborated by an earlier pair is skipped, so a third
             agreement does not post the same fact to the board a second time.
+
+        `established` carries the keys already on the board at ✓/✅ tier. The
+        authorship ledger is bounded and evicts oldest-first, so after an eviction a
+        long-settled statement looks like a first-time assertion again; without this
+        check it would be re-posted as a fresh ⚠ claim, putting one statement on the
+        board at two trust levels and re-enqueuing it for a probe whose REFUTED
+        verdict would then sit beside a standing ✓.
         """
         corroborate = bool_setting(self.settings, "corroborate_facts")
+        established = established or set()
         corroborated: list[str] = []
         claims: list[str] = []
         novel = False
@@ -1001,6 +1032,11 @@ class ChallengeSwarm:
         for line in dedup_lines(facts):
             key = normalize(line)
             if not key:
+                continue
+            if key in established:
+                # Already on the board at a stronger tier. Keep the authorship record
+                # so a later eviction does not resurface it as new, but post nothing.
+                self._claim_sources.setdefault(key, set()).add(model_spec)
                 continue
             sources = self._claim_sources.get(key)
             first_time = sources is None
@@ -1077,6 +1113,12 @@ class ChallengeSwarm:
             # and holding a board lock across one would serialise every solver's
             # publishing behind a slow call.
             summaries = {u: await self._summarize_for_board(u.strip()) for u in units if u.strip()}
+            # Computed outside the lock (it takes the bus lock itself). A stale read
+            # is benign: the worst case is one duplicate claim that the next promote
+            # reconciles, whereas holding both locks nested would risk ordering.
+            established = await self.message_bus.established_keys(
+                {normalize(u.strip()) for u in units if u.strip()}
+            )
             async with self._board_lock:
                 # classify -> promote -> post must be one critical section. Split
                 # across awaits, two solvers reporting the same line in the same
@@ -1086,7 +1128,8 @@ class ChallengeSwarm:
                 # ⚠ CLAIM at once. The ⚠ copy is the one keyed for probing, so a
                 # refutation flipped only that one and the ✓ copy survived as
                 # "two models agree" on a premise a probe had just disproved.
-                corroborated, claims, fact_novel = self._classify_claims(model_spec, units)
+                corroborated, claims, fact_novel = self._classify_claims(
+                    model_spec, units, established)
                 novel = novel or fact_novel
                 statements.extend(corroborated)
                 statements.extend(claims)
@@ -1166,7 +1209,25 @@ class ChallengeSwarm:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — the audit must never break a round
-            logger.debug(f"[{self.meta.name}] contradiction audit failed: {e}")
+            self._audit_failures += 1
+            logger.warning(
+                f"[{self.meta.name}] contradiction audit raised ({type(e).__name__}: {e}) "
+                f"— failure #{self._audit_failures}; the board was NOT checked this round"
+            )
+            return
+
+        if found is None:
+            # Distinguished from `[]` on purpose. A gateway that is down, timing out,
+            # or truncating returns nothing, and reading that as "the team is
+            # consistent" is the same silent death the Strategist and the Verifier's
+            # triage each shipped once already.
+            self._audit_failures += 1
+            logger.warning(
+                f"[{self.meta.name}] contradiction audit got NO answer (gateway "
+                f"unreachable, timeout or truncated) — failure #{self._audit_failures}. "
+                "The board was not checked this round; if this repeats, check "
+                "AUDIT_TIMEOUT_S / AUDIT_MAX_TOKENS / AUDIT_MODEL."
+            )
             return
 
         for conflict in found:
@@ -2069,6 +2130,7 @@ class ChallengeSwarm:
             ),
             "probe_refuted": self._probe_refuted,
             "contradictions": self._contradictions,
+            "audit_failures": self._audit_failures,
             "claims_queued": len(self._claim_queue),
             # Verifier health, not just its verdicts. Without these a fully dead
             # verifier is indistinguishable from a healthy idle one: every verdict

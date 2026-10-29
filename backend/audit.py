@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from backend.config import float_setting, int_setting
+
 logger = logging.getLogger(__name__)
 
 # Reasoning models spend most of their completion budget thinking before they
@@ -112,21 +114,20 @@ async def find_contradictions(
     agent_name: str = "",
     model: str = "",
     max_tokens: int | None = None,
-) -> list[Contradiction]:
+) -> list[Contradiction] | None:
     """One audit pass. `existing` is a list of (kind, content) board entries.
 
-    Returns [] on any failure or when there is nothing to compare. Never raises:
-    this sits on the publish path, and an audit that can take down a round would be
-    a far worse defect than the contradictions it fails to find.
+    Returns **None when no answer was obtained** — gateway unreachable, timeout,
+    truncation, empty reply — as distinct from `[]` for "the model looked and found
+    no conflict". Conflating the two is how the Strategist shipped dead once already:
+    `_call_gateway` swallows every failure and returns "", so a broken audit read
+    exactly like a perfectly consistent team, at debug level, with no counter. The
+    caller tracks None in `_audit_failures` and surfaces it next to
+    `strategist_failures`, because an operator reading `contradictions: 0` deserves to
+    know whether that means "no conflicts" or "nobody checked".
 
-    Runs on a REASONING model, not the summarizer. Measured against a live gateway
-    on an unambiguous pair — "FileOutputStream wrote /tmp/x successfully" against a
-    recorded "FileOutputStream is blocked by the allowlist, 422 in three nested
-    forms" — the flash summarizer answered NONE at both 900 and 4000 max_tokens with
-    finish_reason=stop, so it was not truncation: it could not see the conflict. A
-    reasoning model found it in 8.7s with a correct explanation. Spotting that two
-    statements cannot both hold is reasoning, and this call fails silently, so a
-    weak model here does not degrade the audit — it deletes it.
+    Never raises: this sits on the publish path, and an audit that can take down a
+    round would be a far worse defect than the contradictions it fails to find.
     """
     new = [s.strip() for s in new_statements if s and s.strip()]
     if not new or not existing:
@@ -136,20 +137,20 @@ async def find_contradictions(
     from backend.round_summary import _call_gateway
 
     if max_tokens is None:
-        max_tokens = int(getattr(settings, "audit_max_tokens", 0) or DEFAULT_AUDIT_MAX_TOKENS)
+        max_tokens = int_setting(settings, "audit_max_tokens")
     prompt = _AUDIT_PROMPT.format(
         new=_render(new, 20),
         existing=_render([f"[{kind}] {content}" for kind, content in existing],
                          limit_existing),
     )
+    resolved = model or resolve_reasoning_model(settings, getattr(settings, "audit_model", ""))
     raw = await _call_gateway(
-        prompt, settings,
-        model or resolve_reasoning_model(settings, getattr(settings, "audit_model", "")),
-        timeout_s=float(getattr(settings, "audit_timeout_s", 0) or DEFAULT_AUDIT_TIMEOUT_S),
+        prompt, settings, resolved,
+        timeout_s=float_setting(settings, "audit_timeout_s"),
         cost_tracker=cost_tracker, agent_name=agent_name, max_tokens=max_tokens,
     )
     if not raw:
-        return []
+        return None
     found = parse_contradictions(raw)
     if found:
         logger.info("contradiction audit found %d conflict(s)", len(found))

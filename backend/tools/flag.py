@@ -3,7 +3,7 @@
 from pydantic_ai import RunContext
 
 from backend.deps import SolverDeps
-from backend.tools.core import do_submit_flag
+from backend.tools.core import FlagSubmissionError, do_submit_flag
 
 
 async def submit_flag(ctx: RunContext[SolverDeps], flag: str) -> str:
@@ -19,7 +19,17 @@ async def submit_flag(ctx: RunContext[SolverDeps], flag: str) -> str:
     elif ctx.deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" but --no-submit is set.'
     else:
-        display, is_confirmed = await do_submit_flag(ctx.deps.ctfd, ctx.deps.challenge_name, flag)
+        try:
+            display, is_confirmed = await do_submit_flag(
+                ctx.deps.ctfd, ctx.deps.challenge_name, flag)
+        except FlagSubmissionError as e:
+            # An undelivered submission is not a wrong answer. Saying INCORRECT here
+            # would send the model off to "fix" a flag that was never judged.
+            return (
+                f"SUBMISSION FAILED — CTFd did not answer ({e}). Your flag was NOT "
+                "judged and this does not count as a wrong attempt. Retry shortly; do "
+                "not change the flag because of this."
+            )
     if is_confirmed:
         ctx.deps.confirmed_flag = flag.strip()
     return display

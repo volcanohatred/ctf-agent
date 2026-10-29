@@ -578,6 +578,200 @@ def test_pydantic_backend_uses_the_same_window() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mid-turn injection: advice and blackboard findings must not crowd each other out
+# ---------------------------------------------------------------------------
+
+class _FakeBus:
+    """Records what was drained and hands back canned advice/findings."""
+
+    def __init__(self, advice: list[str], findings_text: str) -> None:
+        self._advice = advice
+        self._findings_text = findings_text
+        self.advice_calls = 0
+        self.findings_calls = 0
+
+    async def check_advice(self, model: str):
+        self.advice_calls += 1
+        out, self._advice = self._advice, []
+        return out
+
+    async def check(self, model: str):
+        self.findings_calls += 1
+        return [SimpleNamespace(model="other", content="x", kind="fact", summary="")]
+
+    def format_unread(self, findings):
+        return self._findings_text
+
+
+def _hook_solver(bus) -> ClaudeSolver:
+    s = make_solver(FakeClient())
+    s.message_bus = bus
+    s.model_spec = "claude-sdk/kimi-k3"
+    return s
+
+
+def _post_tool_event(step: int) -> dict:
+    return {"hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_response": "ok", "tool_use_id": f"call-{step}"}
+
+
+@pytest.mark.asyncio
+async def test_advice_and_findings_are_both_delivered_on_a_shared_step() -> None:
+    """Advice is drained every 3 steps, findings every 5. Both branches used to
+    `return` immediately, so on any step divisible by 15 the advice branch won and
+    that round's blackboard check never ran.
+
+    That is not a cosmetic ordering issue: the messages most likely to land there are
+    exactly the urgent ones — a ⛔ prune notice after a refutation, or a ⚡
+    contradiction — and deferring them to the next multiple of five is deferring the
+    one thing that stops a solver from building on a disproved premise.
+    """
+    bus = _FakeBus(["stop what you are doing"], "**Findings:** something new")
+    s = _hook_solver(bus)
+    s._step_count = 15
+
+    out = await s._trace_post_tool_inner(_post_tool_event(15))
+
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "stop what you are doing" in context, "advice missing"
+    assert "something new" in context, "findings were crowded out by the advice"
+    assert bus.advice_calls == 1 and bus.findings_calls == 1
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_advice_alone_still_delivers_on_its_own_step() -> None:
+    bus = _FakeBus(["a nudge"], "**Findings:** something new")
+    s = _hook_solver(bus)
+    s._step_count = 9                      # divisible by 3, not by 5
+
+    out = await s._trace_post_tool_inner(_post_tool_event(9))
+
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "a nudge" in context
+    assert "something new" not in context
+    assert bus.findings_calls == 0, "the findings channel must not fire off-cycle"
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_findings_alone_still_delivers_on_its_own_step() -> None:
+    bus = _FakeBus([], "**Findings:** something new")
+    s = _hook_solver(bus)
+    s._step_count = 10                     # divisible by 5, not by 3
+
+    out = await s._trace_post_tool_inner(_post_tool_event(10))
+
+    assert "something new" in out["hookSpecificOutput"]["additionalContext"]
+    assert bus.advice_calls == 0
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_nothing_to_inject_returns_an_empty_hook_response() -> None:
+    """An empty additionalContext would still be injected as a tool result and burn
+    the model's attention for nothing."""
+    bus = _FakeBus([], "No new findings from other agents.")
+    s = _hook_solver(bus)
+    s._step_count = 15
+
+    assert await s._trace_post_tool_inner(_post_tool_event(15)) == {}
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_the_conclude_phase_injects_nothing() -> None:
+    """Phase 2 is tools-denied and text-only by construction; a mid-turn injection
+    there would compete with the verdict the solver is being asked to produce."""
+    bus = _FakeBus(["a nudge"], "**Findings:** something new")
+    s = _hook_solver(bus)
+    s._concluding = True
+    s._step_count = 15
+
+    assert await s._trace_post_tool_inner(_post_tool_event(15)) == {}
+    assert bus.advice_calls == 0
+    s.tracer.close()
+
+
+# ---------------------------------------------------------------------------
+# Teardown order — the container is the thing that leaks
+# ---------------------------------------------------------------------------
+
+class _RecordingSandbox:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _CancellingClient:
+    """Stands in for an SDK client whose __aexit__ is interrupted by a cancel."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aexit__(self, *exc) -> None:
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_the_sandbox_is_destroyed_even_when_client_teardown_is_cancelled() -> None:
+    """`stop()` awaited `_drop_client()` BEFORE `sandbox.stop()`, and `_drop_client`
+    catches Exception but not CancelledError. A second cancel landing during the SDK
+    client's `__aexit__` therefore propagated out and the container was never
+    destroyed.
+
+    That cancel is not hypothetical: `asyncio.run`'s shutdown cancels all tasks, a
+    bench `--time-limit` fires `wait_for`, and `_wind_down` cancels stragglers after
+    its grace period — each can land on a task already inside its finally-block stop.
+    `DockerSandbox.stop()` shields its own teardown, so the exposure was purely the
+    await sitting in front of it.
+    """
+    s = make_solver(FakeClient())
+    sandbox = _RecordingSandbox()
+    s.sandbox = sandbox
+    s._owns_sandbox = True
+    s._client = _CancellingClient()
+
+    with pytest.raises(asyncio.CancelledError):
+        await s.stop()
+
+    assert sandbox.stopped, "the container must be destroyed before the client is dropped"
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_destroys_the_sandbox_on_the_happy_path_too() -> None:
+    s = make_solver(FakeClient())
+    sandbox = _RecordingSandbox()
+    s.sandbox = sandbox
+    s._owns_sandbox = True
+
+    await s.stop()
+
+    assert sandbox.stopped
+    s.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_detached_sandbox_is_left_running_by_stop() -> None:
+    """The quota-fallback handover depends on this: `detach_sandbox()` clears
+    ownership so the old solver's stop() does not destroy the container the
+    replacement is about to reuse."""
+    s = make_solver(FakeClient())
+    sandbox = _RecordingSandbox()
+    s.sandbox = sandbox
+    s._owns_sandbox = True
+
+    assert s.detach_sandbox() is sandbox
+    await s.stop()
+
+    assert not sandbox.stopped, "a handed-over container must survive its old owner"
+    s.tracer.close()
+
+
+# ---------------------------------------------------------------------------
 # Context overflow — the default backend used to misclassify it as a dead gateway
 # ---------------------------------------------------------------------------
 

@@ -297,6 +297,12 @@ class VerificationRunner:
                 self.queue.release(claim.key)
                 return
             claim.probe_hint = triage.probe_hint or claim.probe_hint
+            # Re-check after triage: that call can take 25s, and starting a sandbox
+            # for a swarm that was killed while we waited leaves teardown dependent on
+            # whoever eventually awaits run()'s finally.
+            if swarm.cancel_event.is_set():
+                self.queue.release(claim.key)
+                return
 
         solver = await self._ensure_solver(prefer_not=claim.source)
         if solver is None:

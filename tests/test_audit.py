@@ -160,14 +160,17 @@ async def test_a_conflict_is_parsed_out_of_the_reply(patch_client) -> None:
     assert "X worked for me" in seen[0] and "allowlist blocks X" in seen[0]
 
 
-async def test_no_gateway_is_a_silent_noop() -> None:
+async def test_no_gateway_returns_none_not_an_empty_result() -> None:
+    """None means "no answer was obtained"; [] means "the model looked and found no
+    conflict". Collapsing them is how the Strategist shipped dead once already —
+    `contradictions: 0` then reads as "the team is consistent" when nobody checked."""
     assert await find_contradictions(
         new_statements=["a"], existing=[("fact", "b")],
         settings=_gateway_settings(gateway_base_url="", gateway_api_key=""),
-    ) == []
+    ) is None
 
 
-async def test_a_gateway_failure_returns_empty_and_never_raises(patch_client) -> None:
+async def test_a_gateway_failure_returns_none_and_never_raises(patch_client) -> None:
     """This sits on the publish path. An audit that can take down a round would be
     a far worse defect than the contradictions it fails to find."""
     import httpx
@@ -179,7 +182,17 @@ async def test_a_gateway_failure_returns_empty_and_never_raises(patch_client) ->
 
     assert await find_contradictions(
         new_statements=["a"], existing=[("fact", "b")], settings=_gateway_settings(),
-    ) == []
+    ) is None
+
+
+async def test_nothing_to_compare_is_an_empty_result_not_a_failure() -> None:
+    """The distinction runs both ways: an empty board is a real answer ("there is
+    nothing to contradict"), not a broken audit, and must not inflate the failure
+    counter."""
+    assert await find_contradictions(new_statements=[], existing=[("fact", "x")],
+                                     settings=_gateway_settings()) == []
+    assert await find_contradictions(new_statements=["x"], existing=[],
+                                     settings=_gateway_settings()) == []
 
 
 # ---------------------------------------------------------------------------

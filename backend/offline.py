@@ -82,6 +82,8 @@ class BenchResult:
     unverified_claims: int = 0     # findings still resting on one solver's word
     probe_refuted: int = 0         # premises a probe DISPROVED — these were believed
     contradictions: int = 0        # mutually exclusive statement pairs detected
+    audit_failures: int = 0        # audit calls that returned no answer at all
+    strategist_failures: int = 0   # strategist consults that produced no verdict
 
 
 def _write_report(out: str, payload: str) -> None:
@@ -179,6 +181,8 @@ async def _solve_one(
         result.unverified_claims = int(status.get("unverified_claims", 0) or 0)
         result.probe_refuted = int(status.get("probe_refuted", 0) or 0)
         result.contradictions = int(status.get("contradictions", 0) or 0)
+        result.audit_failures = int(status.get("audit_failures", 0) or 0)
+        result.strategist_failures = int(status.get("strategist_failures", 0) or 0)
         await ctfd.close()
     return result
 
@@ -327,6 +331,8 @@ async def run_benchmark(
                 "unverified_claims": r.unverified_claims,
                 "probe_refuted": r.probe_refuted,
                 "contradictions": r.contradictions,
+                "audit_failures": r.audit_failures,
+                "strategist_failures": r.strategist_failures,
             }
             for r in results
         ],

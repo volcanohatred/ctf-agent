@@ -448,9 +448,22 @@ class ClaudeSolver:
         elif self.no_submit:
             display, confirmed = f'DRY RUN  — would submit "{candidate}"', False
         else:
-            from backend.tools.core import do_submit_flag
+            from backend.tools.core import FlagSubmissionError, do_submit_flag
 
-            display, confirmed = await do_submit_flag(self.ctfd, self.meta.name, candidate)
+            try:
+                display, confirmed = await do_submit_flag(
+                    self.ctfd, self.meta.name, candidate)
+            except FlagSubmissionError as e:
+                # Never judged, so never "REJECTED" — recording it that way would send
+                # the model off to fix a flag that was correct as far as anyone knows.
+                display = (
+                    f"SUBMISSION FAILED — CTFd did not answer ({e}). The flag was NOT "
+                    "judged and this is not a wrong attempt."
+                )
+                self._add_finding(display)
+                self.tracer.event("submit_undelivered", flag=candidate[:200],
+                                  detail=str(e)[:200])
+                return display, False
         if confirmed:
             self._confirmed = True
             self._flag = candidate
@@ -472,20 +485,23 @@ class ClaudeSolver:
         if self._concluding or not self.message_bus:
             return {}
 
+        # Both channels are collected and returned as ONE additionalContext. They used
+        # to early-return, so on any step divisible by both 3 and 5 the advice branch
+        # won and that round's blackboard findings were never checked — the cursor is
+        # only advanced by `check()`, so they were not lost, just deferred to the next
+        # multiple-of-5 step. A prune notice or a refutation arriving on a %15 step is
+        # exactly the message that must not wait.
+        parts: list[str] = []
+
         # Fast mailbox: coordinator advice picked up mid-run (every 3 steps)
         if self._step_count % 3 == 0:
             advice = await self.message_bus.check_advice(self.model_spec)
             if advice:
                 self.tracer.event("advice_picked", count=len(advice))
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": (
-                            "📨 **Guidance from your coordinator (read now, it overrides "
-                            "your current plan if relevant):**\n\n" + "\n\n".join(advice)
-                        ),
-                    }
-                }
+                parts.append(
+                    "📨 **Guidance from your coordinator (read now, it overrides "
+                    "your current plan if relevant):**\n\n" + "\n\n".join(advice)
+                )
 
         if self._step_count % 5 == 0:
             from backend.tools.core import do_check_findings
@@ -493,13 +509,16 @@ class ClaudeSolver:
             findings = await do_check_findings(self.message_bus, self.model_spec)
             if findings and "No new findings" not in findings:
                 self.tracer.event("findings_injected", step=self._step_count)
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": findings,
-                    }
-                }
-        return {}
+                parts.append(findings)
+
+        if not parts:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "\n\n".join(parts),
+            }
+        }
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -979,6 +998,13 @@ class ClaudeSolver:
     async def stop(self) -> None:
         self.tracer.event("stop", step_count=self._step_count, tool_calls=self._tool_calls)
         self.tracer.close()
-        await self._drop_client()
+        # Sandbox FIRST, client second. `_drop_client` catches Exception but not
+        # CancelledError, and the SDK client's `__aexit__` awaits — so a second cancel
+        # landing there (asyncio.run's shutdown, a bench time-limit, `_wind_down`
+        # cancelling a straggler) propagated out before the container was destroyed.
+        # `DockerSandbox.stop()` shields its own teardown, so once we reach it the
+        # cleanup completes; the exposure was purely the await in front of it. The
+        # Pydantic backend already had this order.
         if self._owns_sandbox and self.sandbox:
             await self.sandbox.stop()
+        await self._drop_client()

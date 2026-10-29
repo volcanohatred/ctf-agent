@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import shlex
 import sys
 import tarfile
@@ -29,6 +30,36 @@ CONTAINER_LABEL = "ctf-agent"
 RUN_ID = uuid.uuid4().hex[:8]
 RUN_LABEL = "ctf-agent-run"
 WORKSPACE_PREFIX = "ctf-workspace-"
+
+# A flag-shaped literal: `word{...}`. Used to verify the answer key really left the
+# sanitized metadata before it is bind-mounted into a solver's sandbox. Deliberately
+# narrow — matching the word "flag" anywhere would reject every challenge whose
+# description mentions recovering one.
+_FLAG_LITERAL_RE = re.compile(r"\b[A-Za-z0-9_]{2,32}\{[^}\n]{1,200}\}")
+
+
+def _find_flag_literal(data: Any, path: str = "") -> str | None:
+    """Return the key path of the first flag-shaped value in a parsed YAML tree.
+
+    Recurses through mappings and sequences so an answer key nested under something
+    other than a top-level `flag:`/`flags:` is still caught — which is the whole
+    point of checking the value rather than the field name.
+    """
+    if isinstance(data, dict):
+        for key, value in data.items():
+            found = _find_flag_literal(value, f"{path}.{key}" if path else str(key))
+            if found:
+                return found
+        return None
+    if isinstance(data, (list, tuple)):
+        for i, value in enumerate(data):
+            found = _find_flag_literal(value, f"{path}[{i}]")
+            if found:
+                return found
+        return None
+    if isinstance(data, str) and _FLAG_LITERAL_RE.search(data):
+        return path or "<root>"
+    return None
 # Workspaces older than this are considered leaked (a live solver refreshes its
 # directory mtime by writing into it, and a round is bounded by the time budget).
 WORKSPACE_MAX_AGE_S = 12 * 3600
@@ -289,8 +320,22 @@ class DockerSandbox:
             return str(ws)
         return tempfile.mkdtemp(prefix=WORKSPACE_PREFIX)
 
-    def _sanitized_metadata(self, meta_yml: str) -> str:
-        """Copy metadata.yml into the workspace dir without flag/flags keys."""
+    def _sanitized_metadata(self, meta_yml: str) -> str | None:
+        """Copy metadata.yml into the workspace dir without flag/flags keys.
+
+        Returns None when sanitization could not be completed, meaning "do not mount
+        anything". The previous fallback returned the ORIGINAL path, so a failed
+        write — a full disk, a permissions error, an unparseable YAML — put the answer
+        key inside the solver's sandbox after one warning line. In offline/bench mode
+        that silently invalidates the whole run: a solver can `cat
+        /challenge/metadata.yml` and read the flag, and the reported solve rate then
+        measures nothing.
+
+        Omitting the mount is a graceful degradation by comparison: the challenge
+        description is already in the solver's system prompt (build_prompt renders it
+        from ChallengeMeta), so the file inside the sandbox is a convenience, not the
+        only copy. Losing a convenience beats leaking the answer.
+        """
         try:
             import yaml
 
@@ -299,10 +344,36 @@ class DockerSandbox:
             data.pop("flags", None)
             dest = Path(self.workspace_dir) / ".metadata.sanitized.yml"
             dest.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-            return str(dest)
-        except Exception as e:  # noqa: BLE001 — fall back to the original file
-            logger.warning("Could not sanitize metadata (%s) — mounting original", e)
-            return meta_yml
+        except Exception as e:  # noqa: BLE001 — must not mount the original instead
+            logger.error(
+                "Could not sanitize metadata (%s: %s) — NOT mounting it. The answer key "
+                "would otherwise be readable from inside the sandbox, which invalidates "
+                "offline scoring. The solver still has the description in its prompt.",
+                type(e).__name__, e,
+            )
+            return None
+        # Verify the key really is gone before mounting. A future edit that renames
+        # the answer-key field would otherwise leak it silently, and this is the one
+        # check whose failure mode is "the benchmark result is meaningless".
+        #
+        # The check inspects VALUES for a flag-shaped literal, not the document text
+        # for the word "flag": challenge descriptions legitimately discuss flags
+        # ("recover the flag from the PNG"), and a substring test rejected those
+        # challenges outright, which is a worse failure than the leak it guards.
+        try:
+            sanitized_data = yaml.safe_load(dest.read_text(encoding="utf-8")) or {}
+        except Exception as e:  # noqa: BLE001 — unreadable or unparseable
+            logger.error("Sanitized metadata unreadable (%s) — not mounting it", e)
+            return None
+        leaked = _find_flag_literal(sanitized_data)
+        if leaked is not None:
+            logger.error(
+                "Sanitized metadata still contains a flag-shaped value (%s) — not "
+                "mounting it. The answer-key field name is probably not `flag`/`flags`; "
+                "add it to the pop list in _sanitized_metadata().", leaked,
+            )
+            return None
+        return str(dest)
 
     def _build_config(self, binds: list[str], env: list[str], with_devices: bool) -> dict:
         host_config: dict[str, Any] = {
@@ -353,8 +424,10 @@ class DockerSandbox:
         if Path(meta_yml).exists():
             # Mount a SANITIZED copy: strip answer-key fields (flag/flags)
             # so offline solvers can't read the solution from the sandbox.
+            # None means sanitization failed — mount nothing rather than leak the key.
             sanitized = self._sanitized_metadata(meta_yml)
-            binds.append(f"{self._to_host(str(sanitized))}:/challenge/metadata.yml:ro")
+            if sanitized is not None:
+                binds.append(f"{self._to_host(str(sanitized))}:/challenge/metadata.yml:ro")
         if self.skills_host_dir:
             binds.append(f"{self.skills_host_dir}:/skills:ro")
         return binds

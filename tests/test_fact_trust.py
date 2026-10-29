@@ -33,6 +33,7 @@ from backend.message_bus import (
     Finding,
     strip_trust_markers,
 )
+from backend.verifier import VERIFIED, Verdict
 
 
 def _settings(**over) -> SimpleNamespace:
@@ -462,6 +463,78 @@ async def test_a_new_reader_still_sees_the_surviving_board() -> None:
 
     unread = await bus.check("m2")
     assert len(unread) == 4
+
+
+# ---------------------------------------------------------------------------
+# An established statement must not resurface as a fresh claim
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_established_keys_reports_only_the_stronger_tiers() -> None:
+    from backend.dedup import normalize
+
+    bus = ChallengeMessageBus()
+    await bus.post("m1", "a probe-verified finding", kind=KIND_VERIFIED)
+    await bus.post("m1", "a corroborated finding", kind=KIND_FACT)
+    await bus.post("m1", "a lone assertion", kind=KIND_CLAIM)
+    await bus.post("m1", "a dead end", kind=KIND_EXCLUDED)
+
+    keys = {normalize(t) for t in ("a probe-verified finding", "a corroborated finding",
+                                   "a lone assertion", "a dead end")}
+    established = await bus.established_keys(keys)
+
+    assert established == {normalize("a probe-verified finding"),
+                           normalize("a corroborated finding")}
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_authorship_record_does_not_demote_an_established_fact() -> None:
+    """The authorship ledger is bounded and evicts oldest-first. Once a key is gone,
+    the next solver to report that line looks like a first-time asserter — and without
+    the board check it was re-posted as a fresh ⚠ claim, putting ONE statement on the
+    board at two trust levels and re-enqueuing it for a probe whose REFUTED verdict
+    would then sit beside a standing ✓.
+    """
+    swarm = _swarm()
+    line = "[fact] the migrate endpoint returns 422 for blocked class names"
+
+    # Two solvers establish it.
+    await swarm._publish_harvest("m1", line)
+    await swarm._publish_harvest("m2", line)
+    assert _kinds(swarm).get(KIND_FACT)
+    facts_before = len(_kinds(swarm)[KIND_FACT])
+
+    # Simulate the ledger evicting that key, as it would on a long run.
+    swarm._claim_sources.clear()
+
+    # A third solver reports the same thing.
+    await swarm._publish_harvest("m3", line)
+
+    kinds = _kinds(swarm)
+    assert not kinds.get(KIND_CLAIM), (
+        "an already-established statement was re-posted as an unverified claim"
+    )
+    assert len(kinds[KIND_FACT]) == facts_before, "and duplicated at the fact tier"
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_record_does_not_requeue_an_already_probed_claim() -> None:
+    """Re-enqueueing costs a sandbox round and a strong-model call to re-test
+    something already settled — and a second verdict could contradict the first."""
+    swarm = _swarm()
+    line = "[fact] the uploaded JAR is loaded by the migrator process"
+
+    await swarm._publish_harvest("m1", line)
+    assert len(swarm._claim_queue) == 1
+    await swarm._claim_queue.pop(timeout=0.05)          # the probe ran
+    await swarm._on_verdict(Verdict(VERIFIED, "HTTP 200 and the marker file appeared",
+                                    "the uploaded JAR is loaded by the migrator process", "m1"))
+    assert _kinds(swarm).get(KIND_VERIFIED)
+
+    swarm._claim_sources.clear()                        # ledger evicted it
+    await swarm._publish_harvest("m2", line)
+
+    assert len(swarm._claim_queue) == 0, "a probe-verified statement must not be re-queued"
 
 
 # ---------------------------------------------------------------------------

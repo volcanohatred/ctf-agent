@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # instead of being logged and thrown away.
 TurnFn = Callable[[str], Coroutine[Any, Any, float]]
 
+# Consecutive failed patrol scans before the coordinator is told the patrol is
+# effectively disabled. A single transient failure is noise; three in a row at a
+# 120s interval means stuck-solver detection has been blind for six minutes.
+PATROL_FAILURE_ALERT = 3
+
 # Consecutive failed/timed-out turns before the loop backs off instead of
 # spinning against a stalling gateway.
 TURN_FAILURE_BACKOFF = 5
@@ -453,14 +458,37 @@ async def _patrol_loop(deps: CoordinatorDeps, interval_s: int, stuck_quiet_s: in
     """
     reported: set[str] = set()  # solver keys currently in a reported-stuck episode
     loop = asyncio.get_running_loop()
+    consecutive_failures = 0
+    alerted = False
     while True:
         try:
             await asyncio.sleep(interval_s)
             await asyncio.to_thread(_patrol_scan, deps, stuck_quiet_s, reported, loop)
+            consecutive_failures = 0
+            alerted = False
         except asyncio.CancelledError:
             return
         except Exception as e:  # noqa: BLE001 — the patrol must never die
-            logger.debug("patrol loop error: %s", e)
+            # Warning, not debug, and escalated to the coordinator once. A
+            # deterministic failure here (a trace_read bug, a closed loop in
+            # `_schedule`, an unexpected swarm shape) previously repeated every
+            # interval at debug level with no operator-visible signal at all — while
+            # the patrol's own docstring says its absence is exactly how a benchmark
+            # once ground through 40 empty rounds per challenge "while the patrol
+            # reported everything healthy". A safety mechanism that can die silently
+            # is worse than not having it, because it is believed to be running.
+            consecutive_failures += 1
+            logger.warning(
+                "patrol scan failed (%d consecutive): %s: %s",
+                consecutive_failures, type(e).__name__, e,
+            )
+            if consecutive_failures >= PATROL_FAILURE_ALERT and not alerted:
+                alerted = True
+                _enqueue(deps.coordinator_inbox,
+                         f"PATROL DISABLED: stuck-solver detection has failed "
+                         f"{consecutive_failures} scans in a row ({type(e).__name__}: {e}). "
+                         "Solvers are no longer being watched for silence, spinning or "
+                         "looping — check them manually.")
 
 
 def _patrol_scan(deps: CoordinatorDeps, stuck_quiet_s: int, reported: set[str],

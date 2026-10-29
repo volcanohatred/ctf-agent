@@ -77,18 +77,35 @@ async def do_list_files(sandbox, path: str = "/challenge/distfiles") -> str:
     return out or f"{path} is empty."
 
 
+class FlagSubmissionError(RuntimeError):
+    """The submission never reached CTFd, so the flag was never judged.
+
+    Distinct from an incorrect flag on purpose. `do_submit_flag` used to return
+    `("submit_flag error: ...", False)` for both, and `try_submit_flag` could only
+    see the False — so a CTFd outage incremented the solver's wrong-submission count
+    and walked it up SUBMISSION_COOLDOWNS to a 10-minute lockout. The model was
+    punished for the network, and the operator saw nothing because `_submit_count`
+    is not in get_status().
+    """
+
+
 async def do_submit_flag(ctfd, challenge_name: str, flag: str) -> tuple[str, bool]:
-    """Submit a flag. Returns (display_message, is_confirmed)."""
+    """Submit a flag. Returns (display_message, is_confirmed).
+
+    Raises FlagSubmissionError when the submission could not be delivered, so callers
+    can avoid penalising the solver for an outage. An incorrect flag is a normal
+    (message, False) return.
+    """
     flag = flag.strip()
     if not flag:
         return "Empty flag — nothing to submit.", False
 
     try:
         result = await ctfd.submit_flag(challenge_name, flag)
-        is_confirmed = result.status in ("correct", "already_solved")
-        return result.display, is_confirmed
-    except Exception as e:
-        return f"submit_flag error: {e}", False
+    except Exception as e:  # noqa: BLE001 — surfaced as a distinct outcome, not a wrong answer
+        raise FlagSubmissionError(f"{type(e).__name__}: {e}") from e
+    is_confirmed = result.status in ("correct", "already_solved")
+    return result.display, is_confirmed
 
 
 def _ip_is_forbidden(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:

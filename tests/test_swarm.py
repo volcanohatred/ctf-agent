@@ -226,6 +226,93 @@ async def test_try_submit_flag_is_the_only_confirmation_path() -> None:
 
 
 # ---------------------------------------------------------------------------
+# An undelivered submission is not a wrong answer
+# ---------------------------------------------------------------------------
+
+class _OutageCtfd:
+    """A CTFd that cannot be reached — as opposed to one that says INCORRECT."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def submit_flag(self, challenge_name: str, flag: str):
+        self.calls += 1
+        raise OSError("Connection refused")
+
+
+@pytest.mark.asyncio
+async def test_a_ctfd_outage_does_not_count_as_a_wrong_submission() -> None:
+    """The defect: `do_submit_flag` returned ("submit_flag error: ...", False) for
+    both an outage and a wrong flag, and `try_submit_flag` could only see the False.
+    So an unreachable CTFd walked the solver up SUBMISSION_COOLDOWNS to a 10-minute
+    lockout — punishing the model for the network, with nothing in get_status() to
+    show the operator why submissions had stopped.
+    """
+    ctfd = _OutageCtfd()
+    swarm = _swarm({})
+    # `_swarm` hardcodes no_submit=True (offline answer-key mode). The CTFd path is
+    # what is under test here, so flip it explicitly — passing no_submit as a kwarg
+    # would be swallowed into settings_over and the test would silently exercise the
+    # answer-key branch instead.
+    swarm.no_submit = False
+    swarm.ctfd = ctfd
+
+    for _ in range(3):
+        display, confirmed = await swarm.try_submit_flag("flag{maybe}", "m1")
+        assert confirmed is False
+        assert "NOT" in display and "judged" in display
+
+    assert ctfd.calls == 3, "each attempt must actually reach the submission path"
+    assert swarm._submit_count.get("m1", 0) == 0, "an outage must not increment the counter"
+    assert swarm._last_submit_time.get("m1") is None, "and must not start a cooldown"
+
+
+@pytest.mark.asyncio
+async def test_a_flag_can_be_retried_after_an_outage() -> None:
+    """`_submitted_flags` dedups exact flags, so without releasing it on a delivery
+    failure the flag would be rejected as "already tried" forever — the outage would
+    permanently burn a possibly-correct answer."""
+    ctfd = _OutageCtfd()
+    swarm = _swarm({})
+    swarm.no_submit = False
+    swarm.ctfd = ctfd
+
+    await swarm.try_submit_flag("flag{maybe}", "m1")
+
+    # Now CTFd recovers and the same flag is correct.
+    swarm.ctfd = SimpleNamespace(submit_flag=_correct_submit)
+    display, confirmed = await swarm.try_submit_flag("flag{maybe}", "m1")
+
+    assert confirmed is True, display
+    assert swarm.confirmed_flag == "flag{maybe}"
+
+
+async def _correct_submit(challenge_name: str, flag: str):
+    return SimpleNamespace(status="correct", display="CORRECT")
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_wrong_flag_still_counts_and_cools_down() -> None:
+    """The fix must not stop real rejections from being penalised — the cooldown
+    exists to stop a model burning submissions on guesses."""
+    async def _wrong(challenge_name: str, flag: str):
+        return SimpleNamespace(status="incorrect", display="INCORRECT")
+
+    swarm = _swarm({})
+    swarm.no_submit = False
+    swarm.ctfd = SimpleNamespace(submit_flag=_wrong)
+
+    display, confirmed = await swarm.try_submit_flag("flag{guess}", "m1")
+
+    assert confirmed is False
+    assert "INCORRECT" in display
+    assert swarm._submit_count["m1"] == 1
+    # The exact flag is remembered as tried.
+    retry, _ = await swarm.try_submit_flag("flag{guess}", "m1")
+    assert "already tried" in retry
+
+
+# ---------------------------------------------------------------------------
 # Round cap — the infinite-loop fix
 # ---------------------------------------------------------------------------
 

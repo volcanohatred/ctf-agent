@@ -59,6 +59,8 @@ def _archive_swarm(deps: CoordinatorDeps, name: str, swarm) -> None:
             "unverified_claims": sum(1 for f in feed if f["kind"] == KIND_CLAIM),
             "probe_refuted": getattr(swarm, "_probe_refuted", 0),
             "contradictions": getattr(swarm, "_contradictions", 0),
+            "audit_failures": getattr(swarm, "_audit_failures", 0),
+            "strategist_failures": getattr(swarm, "_strategist_failures", 0),
             "agents": agents_hist,
             "shared_feed": feed,
             "finished_at": time.time(),

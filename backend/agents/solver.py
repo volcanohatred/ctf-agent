@@ -442,11 +442,23 @@ class Solver:
             elif self.deps.no_submit:
                 display, confirmed = f'DRY RUN — would submit "{candidate}"', False
             else:
-                from backend.tools.core import do_submit_flag
+                from backend.tools.core import FlagSubmissionError, do_submit_flag
 
-                display, confirmed = await do_submit_flag(
-                    self.ctfd, self.meta.name, candidate
-                )
+                try:
+                    display, confirmed = await do_submit_flag(
+                        self.ctfd, self.meta.name, candidate
+                    )
+                except FlagSubmissionError as e:
+                    # Never judged, so not a rejection. Recording it as one would send
+                    # the model off to "fix" a flag that may well have been correct.
+                    display = (
+                        f"SUBMISSION FAILED — CTFd did not answer ({e}). The flag was "
+                        "NOT judged and this is not a wrong attempt."
+                    )
+                    self._add_finding(display)
+                    self.tracer.event("submit_undelivered", flag=candidate[:200],
+                                      detail=str(e)[:200])
+                    return
             self.tracer.event("structured_flag_verified", flag=candidate[:200],
                               confirmed=confirmed, detail=display[:200])
             if confirmed:

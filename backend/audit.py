@@ -19,6 +19,7 @@ being logged.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from backend.config import float_setting, int_setting
@@ -50,7 +51,10 @@ _AUDIT_PROMPT = (
     "NONE"
 )
 
-_PREFIX = "CONTRADICTION:"
+# Compiled rather than a literal prefix + `upper().startswith(...)`: `str.upper()` is
+# not length-preserving for every codepoint, so slicing the original string by the
+# length of an uppercased match can shift the cut and mangle the first statement.
+_PREFIX_RE = re.compile(r"(?i)CONTRADICTION\s*:")
 
 
 @dataclass(frozen=True)
@@ -90,10 +94,25 @@ def parse_contradictions(raw: str) -> list[Contradiction]:
     out: list[Contradiction] = []
     for line in (raw or "").splitlines():
         stripped = line.strip()
-        if not stripped.upper().startswith(_PREFIX):
+        # Match case-insensitively but slice on the ORIGINAL text, using the compiled
+        # pattern's own end offset rather than a constant prefix length.
+        prefix_match = _PREFIX_RE.match(stripped)
+        if not prefix_match:
             continue
-        parts = [p.strip() for p in stripped[len(_PREFIX):].split("||")]
-        if len(parts) < 3 or not all(parts[:3]):
+        body = stripped[prefix_match.end():]
+        # Split from the RIGHT, at most twice. `||` inside a statement is common —
+        # the two statements are quotes of board entries, which are full of shell
+        # one-liners (`cmd1 || cmd2`) and log excerpts — while `why` is the model's
+        # own prose and almost never contains one. Splitting from the left and taking
+        # parts[2] silently discarded the real explanation whenever the first
+        # statement contained a pipe, reporting the conflict with the wrong reasoning.
+        #
+        # This is not fully unambiguous: a `||` inside the SECOND statement still
+        # mis-assigns, and nothing short of a structured output format fixes that.
+        # Right-splitting is strictly better than left-splitting because it can never
+        # lose the explanation, and the explanation is the part an operator reads.
+        parts = [p.strip() for p in body.rsplit("||", 2)]
+        if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
             logger.debug("dropping malformed contradiction line: %.120s", stripped)
             continue
         out.append(Contradiction(a=parts[0], b=parts[1], why=parts[2]))

@@ -68,11 +68,53 @@ def test_multiple_contradictions_are_all_returned() -> None:
     "CONTRADICTION: a ||  || why",                # empty middle
     "CONTRADICTION:|||",
     "contradiction without the marker: a || b || c",
+    "CONTRADICTION: a long statement || another long statement ||   ",
 ])
 def test_malformed_lines_are_dropped_not_guessed_at(raw: str) -> None:
     """A contradiction accuses two agents of being wrong about something, so a
     mis-parse is worse than a miss — the miss just leaves the board as it was."""
     assert parse_contradictions(raw) == []
+
+
+def test_a_statement_containing_a_pipe_pair_keeps_its_explanation() -> None:
+    """Shell one-liners (`cmd1 || cmd2`) and log excerpts are exactly the material a
+    contradiction audit quotes, so `||` inside a statement is common. Splitting from
+    the left and taking parts[2] discarded the real `why` and kept a fragment of the
+    second statement in its place — the conflict was reported with the wrong
+    reasoning, which is the part an operator actually reads.
+
+    Splitting from the right is not fully unambiguous either (a `||` inside the
+    SECOND statement still mis-assigns), but it can never lose the explanation, and
+    the first statement is the one that usually carries a shell pipeline.
+    """
+    raw = ("CONTRADICTION: `curl -f http://x/migrate || echo blocked` succeeded || "
+           "the same one-liner returned 422 || a command cannot both succeed and 422")
+    found = parse_contradictions(raw)
+
+    assert len(found) == 1
+    assert found[0].why == "a command cannot both succeed and 422"
+    assert found[0].a == "`curl -f http://x/migrate || echo blocked` succeeded"
+    assert found[0].b == "the same one-liner returned 422"
+
+
+def test_the_prefix_match_is_case_insensitive_and_tolerates_spacing() -> None:
+    for raw in ("CONTRADICTION: a || b || why",
+                "contradiction: a || b || why",
+                "Contradiction :  a || b || why"):
+        assert len(parse_contradictions(raw)) == 1, raw
+
+
+def test_a_non_ascii_statement_is_not_shifted_by_the_prefix_slice() -> None:
+    """`str.upper()` is not length-preserving for every codepoint ('ß'.upper() is
+    'SS'), so slicing the original string by a constant prefix length after an
+    upper() test could cut one character into the first statement. The match offset
+    is taken from the pattern instead.
+    """
+    raw = "CONTRADICTION: straße is reachable || straße is filtered || both cannot hold"
+    found = parse_contradictions(raw)
+
+    assert len(found) == 1
+    assert found[0].a == "straße is reachable", f"first statement mangled: {found[0].a!r}"
 
 
 def test_the_broadcast_never_says_which_side_is_right() -> None:

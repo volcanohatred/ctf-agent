@@ -450,8 +450,13 @@ then separates (3) from (2). Both switches are checked in `_next_approach` and
 `_skill_hint` themselves, not only at construction, so the invariant holds even if
 something populates the queue later.
 
-Note `SKILL_AFTER_BUMPS=0` does **not** disable hints — the level formula is
-`1 + (bump - N)`, so 0 injects from bump 0.
+`SKILL_AFTER_BUMPS` gates the hint **text** only, and `0` disables it — matching the
+sibling knob `ESCALATE_AFTER_BUMPS`. It used to mean the opposite: the gate was
+`bump_count < N`, which can never fire at 0, and the level formula `1 + (bump - N)`
+then started at L2, so 0 injected the *heaviest* tier from the very first retry.
+Because it gates text and not rotation, `SKILL_AFTER_BUMPS=0` with
+`SKILL_ROTATE_APPROACHES=true` is a valid arm: assign a direction each retry, inject
+no handbook excerpt.
 
 Note also that `SKILLS_DIR` cannot serve as the off switch: `docker-compose.yml`
 pins it to `/skills` (the in-container mount point) and compose's `environment:`
@@ -493,20 +498,23 @@ Docker:
 
 ```bash
 # arm 1: all active                        (current default)
-SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=true   SKILLS_HOST_DIR=/host/path
+SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=true   SKILL_AFTER_BUMPS=1  SKILLS_HOST_DIR=/host/path
 # arm 2: injection only — solver keeps its own line of attack
-SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=false  SKILLS_HOST_DIR=/host/path
-# arm 3: passive library — mounted, never pushed
-SKILL_HINTS=false                                SKILLS_HOST_DIR=/host/path
-# arm 4: no library at all                   (baseline)
-SKILL_HINTS=false                                SKILLS_HOST_DIR=
+SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=false  SKILL_AFTER_BUMPS=1  SKILLS_HOST_DIR=/host/path
+# arm 3: rotation only — a direction per retry, no handbook text
+SKILL_HINTS=true   SKILL_ROTATE_APPROACHES=true   SKILL_AFTER_BUMPS=0  SKILLS_HOST_DIR=/host/path
+# arm 4: passive library — mounted, never pushed
+SKILL_HINTS=false                                                            SKILLS_HOST_DIR=/host/path
+# arm 5: no library at all                 (baseline)
+SKILL_HINTS=false                                                            SKILLS_HOST_DIR=
 
 ctf-bench --challenges-dir challenges --concurrency 2 --time-limit 1800 \
           --models <same list every arm> --output logs/ab-arm1.json
 ```
 
-arm1-vs-2 isolates rotation, 2-vs-3 isolates injection, 3-vs-4 asks whether a library
-the model may read unprompted is worth anything at all.
+arm1-vs-2 isolates rotation, 1-vs-3 isolates the handbook text, 3-vs-4 asks whether
+being assigned a direction at all is worth anything, and 4-vs-5 asks whether a library
+the model may read unprompted is worth anything.
 
 Two cautions. Per-challenge variance on a 10-challenge set is large enough that a
 single run's difference is often noise — repeat arms if you can afford it, and read
@@ -545,7 +553,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 622 tests, no Docker / no LLM / no network
+uv run pytest -q             # 630 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports
@@ -589,7 +597,7 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `MAX_ATTEMPTS_PER_CHALLENGE` | `12` | Hard cap on retry rounds per solver. 0 = unlimited. Must be ≥ `2×FRESH_RESTART_ROUNDS+1` for two merge cycles |
 | `MAX_INFRA_FAILURES` | `3` | Consecutive infra failures before a swarm retires itself |
 | `SKILL_HINTS` | `true` | Master switch for triage + hint injection + rotation. `false` leaves `/skills` mounted but stops pushing it. Works under Docker, unlike `SKILLS_DIR` |
-| `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts. **0 does not disable** (level = 1+bump−N) |
+| `SKILL_AFTER_BUMPS` | `1` | Inject skill hint **text** after N failed attempts. **0 disables** (matches `ESCALATE_AFTER_BUMPS`). Gates text only, not rotation |
 | `SKILL_ROTATE_APPROACHES` | `true` | Assign the next handbook each retry. Separate switch from injection so the two can be A/B'd — see *Skill Library* |
 | `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
 | `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |

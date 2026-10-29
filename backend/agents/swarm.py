@@ -466,13 +466,28 @@ class ChallengeSwarm:
         return self._raw_sibling_fallback(exclude_model)
 
     def _skill_hint(self, bump_count: int) -> str:
-        """Escalating knowledge-base hint, activated after repeated failures."""
+        """Escalating knowledge-base hint, activated after repeated failures.
+
+        `0` disables injection entirely. That is a deliberate semantic choice and
+        matches the sibling knob ESCALATE_AFTER_BUMPS, whose 0 also means "off" —
+        the old behaviour was the opposite, where the gate `bump_count < threshold`
+        could never fire at 0 and the level formula `1 + (bump - 0)` started at L2,
+        so 0 meant "inject the heaviest tier from the very first retry". Nobody
+        wants that, and it made 0 the one value that could not express the most
+        common intent.
+
+        Rotation is NOT gated here: SKILL_AFTER_BUMPS=0 with
+        SKILL_ROTATE_APPROACHES=true is a real configuration (assign a direction,
+        inject no handbook text), and it is one of the arms worth measuring.
+        """
         # Checked explicitly rather than relying on __post_init__ having left
         # _skill_pack_ids empty: the switch that measures this mechanism has to hold
         # even if pack ids are populated from somewhere else later.
         if not bool(getattr(self.settings, "skill_hints", True)):
             return ""
-        threshold = getattr(self.settings, "skill_after_bumps", 1)
+        threshold = int(getattr(self.settings, "skill_after_bumps", 1) or 0)
+        if threshold <= 0:
+            return ""
         if not self._skill_pack_ids or bump_count < threshold:
             return ""
         level = min(1 + (bump_count - threshold), 3)

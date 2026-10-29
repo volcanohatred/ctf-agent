@@ -315,6 +315,115 @@ def test_an_empty_queue_assigns_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SKILL_AFTER_BUMPS — 0 means off
+# ---------------------------------------------------------------------------
+
+def _spy_swarm(**settings_over):
+    """A swarm whose skill router records every render_hint call and its level.
+
+    A spy rather than a real library: SkillRouter.render_hint returns "" when the
+    router is disabled, so asserting on the return value cannot tell "the threshold
+    gated it off" from "there was no library to render". The call is the evidence.
+    """
+    swarm = _swarm(**settings_over)
+    swarm._skill_pack_ids = ["ctf-pwn"]
+    calls: list[int] = []
+
+    def _render_hint(pack_ids, level=1, keywords=None):
+        calls.append(level)
+        return f"HINT-L{level}"
+
+    swarm.skill_router = SimpleNamespace(enabled=True, render_hint=_render_hint)
+    return swarm, calls
+
+
+def test_zero_disables_hint_injection_entirely() -> None:
+    """The requested semantics, and the opposite of what 0 used to do.
+
+    The old gate was `bump_count < threshold`, which can never fire at 0, and the
+    level formula `1 + (bump - 0)` then started at L2 — so 0 injected the HEAVIEST
+    tier from the very first retry. It was the one value that could not express the
+    most common intent.
+    """
+    swarm, calls = _spy_swarm(skill_after_bumps=0)
+
+    for bump in range(0, 12):
+        assert swarm._skill_hint(bump) == "", f"bump {bump} must inject nothing"
+    assert calls == [], "the router must not even be consulted"
+
+
+def test_negative_also_disables() -> None:
+    """A negative threshold is nonsense; treating it as "off" beats letting the level
+    formula produce a tier index below L1."""
+    swarm, calls = _spy_swarm(skill_after_bumps=-1)
+
+    assert swarm._skill_hint(5) == ""
+    assert calls == []
+
+
+def test_one_injects_from_the_first_retry_at_level_one() -> None:
+    swarm, calls = _spy_swarm(skill_after_bumps=1)
+
+    assert swarm._skill_hint(1) == "HINT-L1"
+    assert calls == [1], "the first retry gets the cheap pointer, not the full menu"
+
+
+def test_the_ladder_escalates_from_the_configured_threshold() -> None:
+    swarm, calls = _spy_swarm(skill_after_bumps=3)
+
+    assert swarm._skill_hint(1) == ""
+    assert swarm._skill_hint(2) == ""
+    assert calls == [], "nothing before the threshold"
+
+    assert swarm._skill_hint(3) == "HINT-L1"
+    assert swarm._skill_hint(4) == "HINT-L2"
+    assert swarm._skill_hint(5) == "HINT-L3"
+    # Capped: a 12-round run must not keep escalating past the heaviest tier.
+    assert swarm._skill_hint(11) == "HINT-L3"
+    assert calls == [1, 2, 3, 3]
+
+
+def test_a_later_threshold_delays_the_heavy_tiers() -> None:
+    """The point of the knob: let a solver work alone for its first few retries,
+    which is exactly what a strong model wants and what the old 0 made impossible."""
+    early, early_calls = _spy_swarm(skill_after_bumps=1)
+    late, late_calls = _spy_swarm(skill_after_bumps=4)
+
+    assert early._skill_hint(2) == "HINT-L2"
+    assert late._skill_hint(2) == ""
+    assert late._skill_hint(4) == "HINT-L1"
+    assert early_calls == [2] and late_calls == [1]
+
+
+def test_zero_still_allows_rotation() -> None:
+    """The two switches are independent, and that separation is measurable: assign a
+    direction each retry, inject no handbook text."""
+    swarm, calls = _spy_swarm(skill_after_bumps=0, skill_rotate_approaches=True)
+
+    assert swarm._next_approach("m1", APPROACH_FAILED) is QUEUE[0]
+    assert swarm._skill_hint(5) == ""
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_zero_produces_a_bump_payload_with_a_direction_but_no_hint() -> None:
+    swarm, calls = _spy_swarm(skill_after_bumps=0)
+
+    payload = await swarm._build_bump_payload("m1", "no flag", 5, APPROACH_FAILED)
+
+    assert "本轮专攻新方向" in payload, "rotation is still on"
+    assert "HINT-L" not in payload and "KNOWLEDGE BASE" not in payload
+    assert calls == []
+
+
+def test_the_master_switch_still_wins_over_a_nonzero_threshold() -> None:
+    swarm, calls = _spy_swarm(skill_hints=False, skill_after_bumps=1)
+
+    assert swarm._skill_hint(5) == ""
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # What the solver is actually told
 # ---------------------------------------------------------------------------
 

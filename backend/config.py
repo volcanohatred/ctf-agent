@@ -172,8 +172,16 @@ class Settings(BaseSettings):
     quota_backoff_base_s: int = 60
     quota_backoff_max_s: int = 300
     # Start injecting skill-library hints after this many failed attempts (bumps).
-    # 1 = hints join from the first retry. Matches README / .env.example /
-    # docker-compose.
+    # 1 = hints join from the first retry, escalating L1 -> L2 -> L3 on each
+    # subsequent bump. **0 DISABLES injection entirely**, matching the sibling knob
+    # ESCALATE_AFTER_BUMPS. It used to mean the opposite — the gate
+    # `bump_count < 0` could never fire and the level formula started at L2, so 0
+    # injected the heaviest tier from the very first retry, which is the one value
+    # nobody wants and made 0 unable to express the most common intent.
+    #
+    # This gates hint TEXT only. Approach rotation has its own switch
+    # (SKILL_ROTATE_APPROACHES), so 0 + rotation is a real configuration: assign a
+    # direction, inject no handbook excerpt.
     skill_after_bumps: int = 1
     # Master switch for the agent-side skill machinery: triage, escalating hint
     # injection, and the technique-rotation queue. False leaves the library MOUNTED

@@ -327,6 +327,19 @@ async def run_event_loop(
             task.cancel()
         if deps.swarm_tasks:
             await asyncio.gather(*deps.swarm_tasks.values(), return_exceptions=True)
+        # Sandbox teardowns that outlived their caller. Cancelling the swarm tasks
+        # above is exactly what detaches them: `DockerSandbox.stop()` shields its
+        # teardown and re-raises the cancel, leaving the inner task running with
+        # nothing awaiting it. asyncio holds only a weak reference to tasks, and
+        # `asyncio.run`'s shutdown cancels everything pending — so without this the
+        # delete could be destroyed between removing the container and closing the
+        # client, or before the workspace rmtree, leaking one of each per sandbox.
+        try:
+            from backend.sandbox import await_detached_teardowns
+
+            await await_detached_teardowns()
+        except Exception as e:  # noqa: BLE001 — shutdown must still finish
+            logger.warning("could not await detached sandbox teardowns: %s", e)
         cost_tracker.log_summary()
         with contextlib.suppress(Exception):
             await ctfd.close()

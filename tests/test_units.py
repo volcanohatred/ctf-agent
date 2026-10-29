@@ -384,6 +384,138 @@ def test_host_path_translation() -> None:
     assert to_host_path("/app/x", None) == "/app/x"
 
 
+# ---------------------------------------------------------------------------
+# Detached sandbox teardowns
+#
+# `DockerSandbox.stop()` shields its teardown and re-raises the caller's cancel, so
+# the inner task keeps running with nothing awaiting it. asyncio holds only a WEAK
+# reference to tasks, so an unregistered one can be garbage collected mid-
+# `container.delete()`, and `asyncio.run`'s shutdown cancels everything pending —
+# destroying it between deleting the container and closing the client, or before the
+# workspace rmtree. One leaked container and workspace per occurrence.
+# ---------------------------------------------------------------------------
+
+def test_a_detached_teardown_is_registered_and_awaited() -> None:
+    import asyncio
+
+    from backend.sandbox import _DETACHED_TEARDOWNS, _register_detached, await_detached_teardowns
+
+    async def _run() -> None:
+        finished = []
+
+        async def _teardown():
+            await asyncio.sleep(0.05)
+            finished.append(True)
+
+        task = asyncio.create_task(_teardown())
+        _register_detached(task)
+        assert task in _DETACHED_TEARDOWNS
+
+        # Simulate the caller having been cancelled: nobody awaits `task` directly,
+        # only the shutdown path does.
+        count = await await_detached_teardowns(timeout=5)
+
+        assert count == 1
+        assert finished == [True], "the teardown must actually have completed"
+        assert task not in _DETACHED_TEARDOWNS, "the registry must not grow forever"
+
+    asyncio.run(_run())
+
+
+def test_await_detached_teardowns_is_a_noop_when_nothing_is_pending() -> None:
+    import asyncio
+    import inspect
+
+    from backend.sandbox import await_detached_teardowns
+
+    async def _run() -> None:
+        assert await await_detached_teardowns(timeout=1) == 0
+
+    asyncio.run(_run())
+    # Giving up here is what leaks a container, so the default bound must stay generous.
+    default = inspect.signature(await_detached_teardowns).parameters["timeout"].default
+    assert default >= 15, f"the default teardown wait shrank to {default}s"
+
+
+def test_a_wedged_teardown_does_not_hang_shutdown() -> None:
+    """The bound exists because a stuck Docker daemon must not hang shutdown forever
+    — but it has to be generous, since giving up here is what leaks a container."""
+    import asyncio
+
+    from backend.sandbox import _register_detached, await_detached_teardowns
+
+    async def _run() -> None:
+        release = asyncio.Event()
+
+        async def _wedged():
+            await release.wait()
+
+        task = asyncio.create_task(_wedged())
+        _register_detached(task)
+
+        count = await await_detached_teardowns(timeout=0.05)
+
+        assert count == 1, "it was pending, and that must be reported"
+        assert not task.done()
+        release.set()
+        await task
+
+    asyncio.run(_run())
+
+
+def test_a_failing_teardown_is_reported_not_swallowed_silently() -> None:
+    import asyncio
+
+    from backend.sandbox import _register_detached, await_detached_teardowns
+
+    async def _run() -> None:
+        async def _boom():
+            raise RuntimeError("docker daemon went away")
+
+        task = asyncio.create_task(_boom())
+        _register_detached(task)
+
+        # Must not raise out of the shutdown path.
+        assert await await_detached_teardowns(timeout=5) == 1
+        assert task.done()
+
+    asyncio.run(_run())
+
+
+def test_sandbox_stop_registers_its_shielded_inner_task() -> None:
+    """The registry only helps if `stop()` actually uses it. Verified by source
+    inspection because exercising the real path needs a live Docker daemon."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "backend" / "sandbox.py").read_text(
+        encoding="utf-8")
+    stop_src = src.split("async def stop(self)")[1].split("async def _stop_inner")[0]
+
+    assert "_register_detached" in stop_src, "stop() must register the inner task"
+    assert "asyncio.shield(inner)" in stop_src, "and still shield it from the cancel"
+    assert "ensure_future" in stop_src, (
+        "the task must be created explicitly — `shield(coro)` gives no handle to "
+        "register, which is how it was untracked in the first place"
+    )
+
+
+def test_the_coordinator_awaits_detached_teardowns_on_shutdown() -> None:
+    """Cancelling the swarm tasks is exactly what detaches the teardowns, so the
+    await has to come after that and before the loop closes."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "backend" / "agents" / "coordinator_loop.py").read_text(encoding="utf-8")
+
+    cancel_at = src.index("task.cancel()")
+    await_at = src.index("await_detached_teardowns()")
+    close_at = src.index("await ctfd.close()")
+    assert cancel_at < await_at < close_at, (
+        "detached teardowns must be awaited after the swarm tasks are cancelled and "
+        "before the event loop is allowed to close"
+    )
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

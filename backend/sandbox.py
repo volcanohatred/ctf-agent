@@ -106,6 +106,45 @@ _start_semaphore: asyncio.Semaphore | None = None
 _active_count: int = 0
 _count_lock = asyncio.Lock()
 
+# Detached teardown tasks: a `stop()` whose caller was cancelled leaves its shielded
+# inner task running, and asyncio holds only a WEAK reference to tasks. Without this
+# registry such a task could be garbage collected mid-`container.delete()`, and
+# `asyncio.run`'s shutdown cancels all pending tasks — destroying it between deleting
+# the container and closing the client, or before the workspace rmtree. The
+# coordinator awaits these before its loop closes.
+_DETACHED_TEARDOWNS: set[asyncio.Task] = set()
+
+
+def _register_detached(task: asyncio.Task) -> None:
+    """Hold a strong reference until the teardown finishes."""
+    _DETACHED_TEARDOWNS.add(task)
+    task.add_done_callback(_DETACHED_TEARDOWNS.discard)
+
+
+async def await_detached_teardowns(timeout: float = 30.0) -> int:
+    """Wait for teardowns that outlived their caller. Returns how many were pending.
+
+    Called from the coordinator's shutdown path, after the swarms are cancelled but
+    before the loop closes. Bounded, because a wedged Docker daemon must not hang
+    shutdown forever — but the bound is generous, since abandoning a teardown here is
+    precisely what leaks a container.
+    """
+    pending = {t for t in _DETACHED_TEARDOWNS if not t.done()}
+    if not pending:
+        return 0
+    logger.info("awaiting %d detached sandbox teardown(s)", len(pending))
+    _done, still = await asyncio.wait(pending, timeout=timeout)
+    if still:
+        logger.warning(
+            "%d sandbox teardown(s) did not finish within %.0fs — those containers "
+            "may be orphaned and will need the startup sweep", len(still), timeout,
+        )
+    for task in _done:
+        if not task.cancelled() and task.exception() is not None:
+            logger.debug("detached teardown raised: %s", task.exception())
+    return len(pending)
+
+
 _WARN_THRESHOLDS = {100, 200, 500}
 
 
@@ -615,12 +654,25 @@ class DockerSandbox:
         if self._stopping:
             return
         self._stopping = True
+        # Created explicitly rather than letting `shield()` wrap the coroutine, so
+        # there is a handle to register. asyncio holds only a WEAK reference to
+        # tasks: a shielded inner task whose caller was cancelled had nothing
+        # referencing it, so it could be garbage collected mid-`container.delete()`,
+        # and `asyncio.run`'s shutdown cancels all pending tasks — destroying it
+        # between deleting the container and closing the client, or before the
+        # workspace rmtree. Registering it keeps it alive and lets the coordinator
+        # await outstanding teardowns before the loop closes.
+        inner = asyncio.ensure_future(self._stop_inner())
+        _register_detached(inner)
         try:
-            await asyncio.shield(self._stop_inner())
+            await asyncio.shield(inner)
         except asyncio.CancelledError:
             # The shielded inner task keeps running to completion; there is
             # nothing left for this frame to do but let the cancel through.
-            logger.debug("sandbox teardown detached (caller cancelled)")
+            logger.warning(
+                "sandbox teardown detached (caller cancelled) — it will keep running "
+                "and must be awaited before the event loop closes"
+            )
             raise
 
     async def _stop_inner(self) -> None:

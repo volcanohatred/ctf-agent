@@ -36,6 +36,7 @@ from backend.message_bus import (
     KIND_FACT,
     KIND_HELP,
     KIND_VERIFIED,
+    strip_trust_markers,
 )
 from backend.models import resolve_reasoning_model
 
@@ -240,7 +241,8 @@ def build_dossier(
             note = f"{_tier_header(kind)}：仅保留最近 {len(shown)}/{len(items)} 条"
             trimmed.append(note)
             lines.append(f"（{note}）")
-        lines += [f"- [{model}] {content.strip()}" for model, content in shown]
+        lines += [f"- [{model}] {strip_trust_markers(content.strip())}"
+                  for model, content in shown]
         blocks.append((tier_priority.get(kind, _TRIM_CLAIMS), _tier_header(kind), lines))
     for kind, items in by_kind.items():
         if kind in _TIER_ORDER:

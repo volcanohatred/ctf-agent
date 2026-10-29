@@ -100,7 +100,8 @@ def test_parse_verdict_only_scans_the_tail() -> None:
 
 
 def test_the_claim_and_source_travel_with_the_verdict() -> None:
-    v = parse_verdict("VERDICT: REFUTED | x", claim="the JAR loads", source="m1")
+    v = parse_verdict("VERDICT: REFUTED | ClassNotFoundException on both runs",
+                      claim="the JAR loads", source="m1")
     assert v.claim == "the JAR loads" and v.source == "m1"
 
 
@@ -469,12 +470,72 @@ async def test_a_verdict_buried_in_the_first_pass_is_recovered() -> None:
 
 
 def test_parse_verdict_marks_whether_a_verdict_line_was_actually_found() -> None:
-    assert parse_verdict("VERDICT: INCONCLUSIVE | unreachable").explicit is True
+    assert parse_verdict("VERDICT: INCONCLUSIVE | the service is unreachable").explicit is True
+    assert parse_verdict("VERDICT: REFUTED | 422 with body 'legacy extension'").explicit is True
     assert parse_verdict("let me look at the disassembly").explicit is False
     assert parse_verdict("").explicit is False
-    # A verdict with no evidence is still an explicit answer — the model did commit,
-    # it just gave nothing usable, so re-asking would not help.
-    assert parse_verdict("VERDICT: VERIFIED").explicit is True
+
+
+def test_a_verdict_with_no_evidence_stays_retryable() -> None:
+    """explicit=False on purpose. Marking it True would suppress the forced-commit
+    pass, permanently losing a verdict the model was one line away from giving —
+    which is worse than spending one tools-denied conclude call to ask again."""
+    verdict = parse_verdict("VERDICT: VERIFIED")
+    assert verdict.verdict == INCONCLUSIVE
+    assert verdict.explicit is False
+    assert "no observable evidence" in verdict.evidence
+
+
+@pytest.mark.parametrize("text", [
+    # Ordinary prose that happens to start with a verdict word. Measured on the
+    # previous regex: parsed as VERIFIED with explicit=True, went straight onto the
+    # board at the strongest trust tier.
+    "Verified that the uploaded JAR is loaded by the worker.",
+    "refuted by nothing in particular",
+    "I verified the claim is true",
+    # The prompt's own format template echoed back — both ROLE_PROMPT and
+    # VERDICT_FORCE spell it out verbatim, so this is a likely reply.
+    "VERDICT: VERIFIED | <the observable evidence, quoting the actual output>",
+    "VERDICT: REFUTED | <与声称矛盾的观察证据>",
+    # Too short to be an observation.
+    "VERDICT: VERIFIED | 422",
+    "VERDICT: REFUTED | ok",
+])
+def test_narration_and_template_echoes_never_become_a_verdict(text: str) -> None:
+    """The single most damaging hole in the trust gate: ✅ is the tier every other
+    agent is told to build on freely, and it was reachable by prose alone."""
+    verdict = parse_verdict(text)
+    assert verdict.verdict == INCONCLUSIVE, text
+    assert not verdict.is_verdict
+
+
+@pytest.mark.parametrize("text,expected,evidence_has", [
+    ("VERDICT: VERIFIED | HTTP 200 and the marker file appeared at /tmp/x",
+     VERIFIED, "marker file"),
+    ("VERDICT: REFUTED | ClassNotFoundException: com.evil.Marker on both runs",
+     REFUTED, "ClassNotFoundException"),
+    ("VERIFIED | write(1, notes[i]) never reached, size is 0", VERIFIED, "never reached"),
+    ("verdict: refuted | 422 with body 'legacy extension not permitted'",
+     REFUTED, "legacy extension"),
+])
+def test_a_real_verdict_with_real_evidence_is_accepted(text, expected, evidence_has) -> None:
+    """The hardening must not over-correct into refusing everything, or the
+    verifier becomes decorative in the other direction."""
+    verdict = parse_verdict(text)
+    assert verdict.verdict == expected
+    assert verdict.explicit is True
+    assert evidence_has in verdict.evidence
+
+
+def test_evidence_on_the_following_line_is_recovered() -> None:
+    """`(.*)` cannot span lines. Losing the verdict here used to be permanent —
+    it was also marked explicit, which suppressed the one retry that could have
+    supplied the evidence."""
+    verdict = parse_verdict(
+        "VERDICT: VERIFIED\nthe marker file appeared at /tmp/x with size 41 bytes")
+    assert verdict.verdict == VERIFIED
+    assert verdict.explicit is True
+    assert "marker file" in verdict.evidence
 
 
 async def test_the_sandbox_is_created_lazily_on_the_first_claim() -> None:
@@ -592,7 +653,7 @@ async def test_a_failing_triage_verifies_anyway(monkeypatch) -> None:
     monkeypatch.setattr(verifier_mod, "triage_claim", _boom)
 
     seen = VerdictCollector()
-    solver = FakeVerifierSolver(script=["VERDICT: REFUTED | 422"])
+    solver = FakeVerifierSolver(script=["VERDICT: REFUTED | 422 with body 'legacy extension'"])
     swarm = _fake_swarm(solver, verifier_triage=True)
     runner = VerificationRunner(swarm, ClaimQueue(), seen)
     runner.queue.push(_claim("the JAR loads", key="k1"))
@@ -635,7 +696,10 @@ async def test_each_claim_gets_a_fresh_context() -> None:
     starts answering from memory of the last claim — which looks like verification
     and is not."""
     seen = VerdictCollector(want=2)
-    solver = FakeVerifierSolver(script=["VERDICT: VERIFIED | a", "VERDICT: REFUTED | b"])
+    solver = FakeVerifierSolver(script=[
+        "VERDICT: VERIFIED | marker file appeared at /tmp/x",
+        "VERDICT: REFUTED | ClassNotFoundException on both runs",
+    ])
     swarm = _fake_swarm(solver)
     runner = VerificationRunner(swarm, ClaimQueue(), seen)
     runner.queue.push(_claim("claim one", key="k1"))
@@ -661,7 +725,7 @@ async def test_stop_tears_the_sandbox_down_even_with_no_claims() -> None:
     """The verifier owns a container nothing else tracks. Every exit path has to
     destroy it or it leaks one container and one workspace per challenge."""
     seen = VerdictCollector()
-    solver = FakeVerifierSolver(script=["VERDICT: VERIFIED | a"])
+    solver = FakeVerifierSolver(script=["VERDICT: VERIFIED | marker file appeared at /tmp/x"])
     swarm = _fake_swarm(solver)
     runner = VerificationRunner(swarm, ClaimQueue(), seen)
     runner.queue.push(_claim("c", key="k"))

@@ -202,38 +202,89 @@ _VERDICT_RE = re.compile(
     r"VERDICT\s*[:：]\s*(VERIFIED|REFUTED|INCONCLUSIVE)\s*[|\-–—:]?\s*(.*)",
     re.IGNORECASE,
 )
-_BARE_VERDICT_RE = re.compile(r"^\s*(VERIFIED|REFUTED|INCONCLUSIVE)\s*[|\-–—:]?\s*(.*)",
-                               re.IGNORECASE)
+# The bare form REQUIRES a separator. An optional one let ordinary prose through:
+# measured on the live regex, "Verified that the uploaded JAR is loaded by the
+# worker." parsed as VERIFIED and "refuted by nothing in particular" parsed as
+# REFUTED — both explicit, so both suppressed the forced-commit retry and both went
+# straight onto the board, the first at the strongest trust tier. Narration is not a
+# verdict, and a separator the prompt always asks for costs nothing to require.
+_BARE_VERDICT_RE = re.compile(r"^\s*(VERIFIED|REFUTED|INCONCLUSIVE)\s*[|:]\s*(\S.*)$",
+                              re.IGNORECASE)
+
+# Evidence that is really the prompt's own placeholder echoed back. Both ROLE_PROMPT
+# and VERDICT_FORCE spell the required format out verbatim, and a model that repeats
+# it produced `VERDICT: VERIFIED | <the observable evidence, quoting the actual
+# output>` — which parsed as a real verdict with the template as its evidence.
+_PLACEHOLDER_MARKERS = (
+    "the observable evidence", "what specifically blocked", "quoting the actual output",
+    "你观察到的证据", "与声称矛盾的观察证据", "具体是什么阻碍", "一句话",
+)
+# A verdict whose evidence is shorter than this carries no observable content.
+MIN_EVIDENCE_CHARS = 8
 
 
-def parse_verdict(text: str, claim: str = "", source: str = "") -> Verdict:
+def _looks_like_placeholder(evidence: str) -> bool:
+    """True when the "evidence" is template text rather than an observation."""
+    text = (evidence or "").strip()
+    if not text:
+        return True
+    if text.startswith("<") and text.endswith(">"):
+        return True
+    low = text.lower()
+    return any(marker in low for marker in _PLACEHOLDER_MARKERS)
+
+
+def parse_verdict(raw: str, claim: str = "", source: str = "") -> Verdict:
     """Extract the verdict line from a verifier's output.
 
     Scans from the END: the role prompt asks for the verdict as the final line, and
-    a verifier that reasons aloud first will have discussed all three options
-    before choosing one. Matching the first occurrence would read its deliberation
-    as its conclusion.
+    a verifier that reasons aloud first will have discussed all three options before
+    choosing one. Matching the first occurrence would read its deliberation as its
+    conclusion.
 
-    Anything ambiguous resolves to INCONCLUSIVE.
+    Anything ambiguous resolves to INCONCLUSIVE with `explicit=False`, so the caller
+    can force a commit. That asymmetry is the whole design: a wrong VERIFIED makes
+    four agents build on sand and a wrong REFUTED kills the one line of attack that
+    might have worked, while INCONCLUSIVE costs one probe.
     """
-    body = (text or "").strip()
-    if not body:
+    text = (raw or "").strip()
+    if not text:
         return Verdict(INCONCLUSIVE, _FALLBACK_EVIDENCE, claim, source)
 
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    for line in reversed(lines[-15:]):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    window = lines[-15:]
+    for offset, line in enumerate(reversed(window)):
         m = _VERDICT_RE.search(line) or _BARE_VERDICT_RE.match(line)
         if not m:
             continue
         verdict = m.group(1).upper()
         evidence = (m.group(2) or "").strip().strip("|-–—: ").strip()
-        if verdict in (VERIFIED, REFUTED) and not evidence:
-            # A verdict with no observable evidence is exactly the failure mode
-            # this module exists to catch. Do not launder it onto the board.
-            logger.warning("verifier returned %s with no evidence — downgrading", verdict)
-            return Verdict(INCONCLUSIVE, f"{verdict} claimed with no observable evidence",
-                           claim, source, explicit=True)
-        return Verdict(verdict, evidence or _FALLBACK_EVIDENCE, claim, source, explicit=True)
+        if not evidence:
+            # The evidence may be on the following line — `(.*)` cannot span lines,
+            # and a model that puts the marker and its observation on separate lines
+            # is still answering. Losing that verdict permanently (the previous
+            # behaviour, which also marked it explicit and so suppressed the retry)
+            # is worse than looking one line further.
+            idx = len(window) - 1 - offset
+            following = window[idx + 1:]
+            if following and not _VERDICT_RE.search(following[0]):
+                evidence = following[0].strip()
+        if verdict in (VERIFIED, REFUTED) and (
+            len(evidence) < MIN_EVIDENCE_CHARS or _looks_like_placeholder(evidence)
+        ):
+            # A verdict with no observable evidence is exactly the failure mode this
+            # module exists to catch. Do not launder it onto the board — and leave
+            # explicit=False so the forced-commit pass gets a chance to supply the
+            # observation instead of the claim being lost outright.
+            logger.warning(
+                "verifier returned %s with unusable evidence (%r) — downgrading",
+                verdict, evidence[:80],
+            )
+            return Verdict(INCONCLUSIVE,
+                           f"{verdict} claimed with no observable evidence",
+                           claim, source)
+        return Verdict(verdict, evidence or _FALLBACK_EVIDENCE, claim, source,
+                       explicit=True)
 
     return Verdict(INCONCLUSIVE, _FALLBACK_EVIDENCE, claim, source, explicit=False)
 
@@ -274,16 +325,20 @@ def parse_triage(raw: str) -> Triage:
 async def triage_claim(
     *, claim: str, name: str, category: str, description: str,
     settings: object, cost_tracker: object | None = None, agent_name: str = "",
-) -> Triage:
+) -> Triage | None:
     """One cheap call deciding whether a probe is worth a sandbox round.
 
-    Money is not the constraint here — wall-clock and sandbox contention are. A
-    probe that cannot falsify anything still occupies the verifier for a whole
-    round while solvers wait on the answer, so filtering happens before the
-    expensive part, not after.
+    Returns **None when no answer was obtained** — gateway unreachable, timeout,
+    truncation, or an empty reply — as distinct from a Triage that says "not
+    testable". That distinction is the entire point: `_call_gateway` swallows every
+    failure and returns "", and `parse_triage("")` reads as testable=False, so a
+    dead gateway used to look exactly like "the triage model examined every claim
+    and declined all of them". Verification was silently off for the rest of the run
+    with nothing above debug level in the log.
 
-    Any failure returns "do not verify": a triage that cannot be read must not
-    silently become a queue of probes nobody asked for.
+    Money is not the constraint here — wall-clock and sandbox contention are. A probe
+    that cannot falsify anything still occupies the verifier for a whole round while
+    solvers wait on the answer, so filtering happens before the expensive part.
     """
     from backend.round_summary import _call_gateway, _model
 
@@ -295,7 +350,13 @@ async def triage_claim(
     raw = await _call_gateway(
         prompt, settings, _model(settings), timeout_s=25.0,
         cost_tracker=cost_tracker, agent_name=agent_name,
+        # Above the 900 default: a truncated reply is discarded by _call_gateway, so
+        # a tight cap here would turn into "no answer" and then into "verify
+        # everything" — the safe direction, but wasteful and worth not hitting.
+        max_tokens=1500,
     )
+    if not raw:
+        return None
     return parse_triage(raw)
 
 

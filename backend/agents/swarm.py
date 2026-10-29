@@ -22,6 +22,7 @@ from backend.message_bus import (
     KIND_TAGS,
     KIND_VERIFIED,
     ChallengeMessageBus,
+    strip_trust_markers,
 )
 from backend.models import DEFAULT_MODELS, escalation_spec, provider_from_spec
 from backend.prompts import ChallengeMeta, list_distfiles
@@ -217,6 +218,16 @@ class ChallengeSwarm:
     # is the gate that stops one model's hallucination from becoming the swarm's
     # ground truth — the blackboard is injected into every restart as such.
     _claim_sources: dict[str, set[str]] = field(init=False, default_factory=dict)
+    # Serialises classify -> promote -> post for one round's findings. The classify
+    # step is synchronous and atomic, but the board writes that follow are not:
+    # `_post_finding` awaits, and the bus has its own lock per operation. Two
+    # solvers reporting the same line in the same generation could interleave so
+    # that the second one's promote ran BEFORE the first one's claim was posted —
+    # promote matched nothing, both entries landed, and the board carried the same
+    # statement as ✓ FACT and ⚠ CLAIM at once. The ⚠ copy is the one keyed for
+    # probing, so a refutation flipped only that one and the ✓ copy survived as
+    # "two models agree" on a premise a probe had just disproved.
+    _board_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
     # Circuit breaker state. `_last_round_novel` is set by _publish_harvest and
     # consumed once per bump; `_stale_rounds` counts consecutive rounds in which a
     # solver added NOTHING new to the team (every dead end it reported was already
@@ -240,7 +251,18 @@ class ChallengeSwarm:
     _verifier: VerificationRunner | None = field(init=False, default=None)
     _probe_verified: int = field(init=False, default=0)
     _probe_refuted: int = field(init=False, default=0)
+    # Every probe that ran, decisive or not. This is what VERIFIER_MAX_PROBES
+    # budgets against: counting only verdicts made INCONCLUSIVE free, which is the
+    # common outcome against an unreachable target and the documented behaviour of a
+    # weak verifier model.
+    _probes_spent: int = field(init=False, default=0)
     _contradictions: int = field(init=False, default=0)
+    # Contradictions already acted on, keyed by the unordered pair of normalized
+    # statements. Without this the same unresolved conflict is re-detected on every
+    # publish — the audit has no memory and neither side leaves the board — so one
+    # conflict produced a fresh broadcast, a fresh priority-10 enqueue and a fresh
+    # 300s sandbox round per round, indefinitely.
+    _seen_contradictions: set[frozenset] = field(init=False, default_factory=set)
     # Swarm-wide distilled state, recomputed at most once per bump generation and
     # shared by every solver restarting in that generation.
     _team_digest: str = field(init=False, default="")
@@ -372,7 +394,7 @@ class ChallengeSwarm:
                 role_prompt=role_prompt,
                 conclude_prompt=VERDICT_FORCE,
             )
-        return Solver(
+        solver = Solver(
             model_spec=model_spec,
             challenge_dir=self.challenge_dir,
             meta=self.meta,
@@ -383,6 +405,18 @@ class ChallengeSwarm:
             role_prompt=role_prompt,
             conclude_prompt=VERDICT_FORCE,
         )
+        # The Pydantic backend takes these through `deps`, not the constructor — so
+        # the claude branch's `no_submit=True` had no counterpart here and the
+        # docstring's promise was false on this path. With deps.no_submit left at its
+        # default False and submit_fn None, both the `submit_flag` tool and the
+        # FlagFound structured-output path fell through to `do_submit_flag(ctfd, ...)`:
+        # a real scoreboard submission from the one role forbidden from solving,
+        # bypassing try_submit_flag's dedup, escalating cooldown and offline
+        # answer-key check, and firing even under --no-submit.
+        solver.deps.no_submit = True
+        solver.deps.submit_fn = None
+        solver.deps.message_bus = None
+        return solver
 
     def _collect_team_reports(self) -> list[str]:
         """Raw material for the team digest: the whole blackboard, grouped.
@@ -396,8 +430,12 @@ class ChallengeSwarm:
         for f in self.message_bus.findings:
             if not publishable(f.content):
                 continue
-            tag = KIND_TAGS.get(f.kind, KIND_TAGS[KIND_FACT])
-            grouped.setdefault(f.model, []).append(f"{tag} {f.content.strip()}")
+            tag = KIND_TAGS.get(f.kind, KIND_TAGS[KIND_CLAIM])
+            # Strip markers the model wrote itself, so a claim cannot arrive in the
+            # digest wearing a ✅ the system never awarded it.
+            grouped.setdefault(f.model, []).append(
+                f"{tag} {strip_trust_markers(f.content.strip())}"
+            )
         return [
             f"[{model}]\n" + "\n".join(items)
             for model, items in grouped.items()
@@ -856,28 +894,42 @@ class ChallengeSwarm:
                 )
             return display, is_confirmed
 
-    async def _post_finding(self, model_spec: str, content: str, kind: str) -> None:
+    async def _summarize_for_board(self, content: str) -> str:
+        """LLM key-info summary for a long finding ("" when none is needed).
+
+        Split out of `_post_finding` so the caller can do this BEFORE taking the
+        board lock: it is a gateway round-trip, and holding a lock across it would
+        serialise every solver's publishing behind one slow call.
+        """
+        threshold = int(getattr(self.settings, "summarize_threshold_chars", 900) or 900)
+        if len(content) <= threshold:
+            return ""
+        try:
+            from backend.summarize import summarize_for_siblings
+            summary = await summarize_for_siblings(
+                content, self.settings,
+                cost_tracker=self.cost_tracker,
+                agent_name=f"{self.meta.name}/summarizer",
+            )
+            # A summary that came back unchanged is not a summary.
+            return "" if summary.strip() == content else summary
+        except Exception as e:  # noqa: BLE001 — summarizing is best-effort
+            logger.debug(f"[{self.meta.name}] summarize failed: {e}")
+            return ""
+
+    async def _post_finding(self, model_spec: str, content: str, kind: str,
+                            summary: str | None = None) -> None:
         """Post a finding to the blackboard; LLM-summarize long ones so siblings
-        get the key info (never truncated) without the verbose process log."""
+        get the key info (never truncated) without the verbose process log.
+
+        `summary` may be pre-computed by the caller (see `_summarize_for_board`) so
+        the gateway call happens outside the board lock.
+        """
         content = (content or "").strip()
         if not content or not publishable(content):
             return
-        summary = ""
-        threshold = int(getattr(self.settings, "summarize_threshold_chars", 900) or 900)
-        if len(content) > threshold:
-            try:
-                from backend.summarize import summarize_for_siblings
-                summary = await summarize_for_siblings(
-                    content, self.settings,
-                    cost_tracker=self.cost_tracker,
-                    agent_name=f"{self.meta.name}/summarizer",
-                )
-                # A summary that came back unchanged is not a summary.
-                if summary.strip() == content:
-                    summary = ""
-            except Exception as e:  # noqa: BLE001 — summarizing is best-effort
-                logger.debug(f"[{self.meta.name}] summarize failed: {e}")
-                summary = ""
+        if summary is None:
+            summary = await self._summarize_for_board(content)
         await self.message_bus.post(model_spec, content, kind=kind, summary=summary)
 
     # Bound on the authorship ledger. Keys are short normalized lines, so this is
@@ -983,30 +1035,45 @@ class ChallengeSwarm:
             # same summary after a session wipe cannot grow the board with it.
             tagged = any(_match_tag(line.strip()) for line in text.splitlines())
             units = facts if tagged else ["\n".join(f.strip() for f in facts if f.strip())]
-            corroborated, claims, fact_novel = self._classify_claims(model_spec, units)
-            novel = novel or fact_novel
-            statements.extend(corroborated)
-            statements.extend(claims)
-            if corroborated:
-                keys = {normalize(line) for line in corroborated}
-                # Promote the ORIGINAL claim too, so the board never carries the
-                # same statement at two trust levels.
-                promoted = await self.message_bus.promote_claims(keys)
-                if promoted:
-                    logger.info(
-                        f"[{self.meta.name}] {promoted} single-source claim(s) "
-                        f"corroborated by {model_spec} → promoted to fact"
-                    )
-                for line in corroborated:
-                    await self._post_finding(model_spec, line, KIND_FACT)
-                posted = True
-            # One finding per claim: promotion flips a whole finding, so a
-            # multi-line blob could never be promoted without dragging its
-            # still-unverified neighbours along with it.
-            for line in claims:
-                await self._post_finding(model_spec, line, KIND_CLAIM)
-                posted = True
-                self._enqueue_for_verification(line, model_spec)
+            # Summaries are computed BEFORE the lock: they are gateway round-trips,
+            # and holding a board lock across one would serialise every solver's
+            # publishing behind a slow call.
+            summaries = {u: await self._summarize_for_board(u.strip()) for u in units if u.strip()}
+            async with self._board_lock:
+                # classify -> promote -> post must be one critical section. Split
+                # across awaits, two solvers reporting the same line in the same
+                # generation could interleave so the second one's promote ran before
+                # the first one's claim was posted: promote matched nothing, both
+                # entries landed, and the board carried one statement as ✓ FACT and
+                # ⚠ CLAIM at once. The ⚠ copy is the one keyed for probing, so a
+                # refutation flipped only that one and the ✓ copy survived as
+                # "two models agree" on a premise a probe had just disproved.
+                corroborated, claims, fact_novel = self._classify_claims(model_spec, units)
+                novel = novel or fact_novel
+                statements.extend(corroborated)
+                statements.extend(claims)
+                if corroborated:
+                    keys = {normalize(line) for line in corroborated}
+                    # Promote the ORIGINAL claim too, so the board never carries the
+                    # same statement at two trust levels.
+                    promoted = await self.message_bus.promote_claims(keys)
+                    if promoted:
+                        logger.info(
+                            f"[{self.meta.name}] {promoted} single-source claim(s) "
+                            f"corroborated by {model_spec} → promoted to fact"
+                        )
+                    for line in corroborated:
+                        await self._post_finding(model_spec, line, KIND_FACT,
+                                                 summary=summaries.get(line, ""))
+                    posted = True
+                # One finding per claim: promotion flips a whole finding, so a
+                # multi-line blob could never be promoted without dragging its
+                # still-unverified neighbours along with it.
+                for line in claims:
+                    await self._post_finding(model_spec, line, KIND_CLAIM,
+                                             summary=summaries.get(line, ""))
+                    posted = True
+                    self._enqueue_for_verification(line, model_spec)
             if not corroborated and not claims:
                 logger.debug(
                     f"[{self.meta.name}/{model_spec}] every reported finding was "
@@ -1056,6 +1123,18 @@ class ChallengeSwarm:
             return
 
         for conflict in found:
+            # De-duplicate on the unordered pair. The audit has no memory and neither
+            # side of an unresolved conflict leaves the board, so without this the same
+            # conflict was re-detected on EVERY publish: a fresh ⚡ broadcast, a fresh
+            # priority-10 enqueue and a fresh 300s sandbox round, every round, forever.
+            # Two consequences besides the cost — `_contradictions` inflated into the
+            # hundreds for one conflict, and the broadcast spam hit MAX_FINDINGS, whose
+            # blind FIFO trim then evicted the oldest ✅/✗ entries the briefing
+            # promises are never cut.
+            pair = frozenset((normalize(conflict.a), normalize(conflict.b)))
+            if len(pair) < 2 or pair in self._seen_contradictions:
+                continue
+            self._seen_contradictions.add(pair)
             self._contradictions += 1
             logger.warning(
                 f"[{self.meta.name}] CONTRADICTION between {model_spec}'s report and the "
@@ -1089,14 +1168,24 @@ class ChallengeSwarm:
         """
         if not bool(getattr(self.settings, "verify_claims", True)):
             return
+        if self._probe_budget_exhausted():
+            return
         text = self._board_original(statement) or (statement or "").strip()
         if not text:
             return
-        key = normalize(text)
+        # Truncate FIRST, then derive the key from the truncated text. The reverse
+        # order broke refutation: the key came from the full entry while
+        # PendingClaim.content was capped at 1500 chars, and since Verdict.claim is
+        # built from content, _on_verdict re-normalized a DIFFERENT string and
+        # refute_claims matched nothing. The probe would run, return REFUTED, and
+        # leave the original claim sitting un-refuted on the board next to a
+        # separately-posted refutation with no link between them.
+        content = text[:1500]
+        key = normalize(content)
         if not key:
             return
         if not self._claim_queue.push(PendingClaim(
-            content=text[:1500], source=source, key=key, priority=10,
+            content=content, source=source, key=key, priority=10,
             enqueued_at=time.time(),
         )):
             # Already queued — a conflict is the strongest possible reason to test
@@ -1140,6 +1229,20 @@ class ChallengeSwarm:
     # flag") and a probe would just burn a sandbox round on noise.
     MIN_TESTABLE_CLAIM_CHARS = 16
 
+    def _probe_budget_exhausted(self) -> bool:
+        """True when VERIFIER_MAX_PROBES has been reached.
+
+        Counts every probe that ran, not just the decisive ones. The old check
+        compared against `_probe_verified + _probe_refuted`, so INCONCLUSIVE — the
+        documented behaviour of a weak verifier model and the normal outcome against
+        an unreachable target — was free, and the knob an operator sets to cap cost
+        capped nothing. It also only ran on the ordinary enqueue path, leaving
+        contradiction-driven probes (priority 10, the most expensive kind) entirely
+        unbudgeted.
+        """
+        budget = int(getattr(self.settings, "verifier_max_probes", 0) or 0)
+        return budget > 0 and self._probes_spent >= budget
+
     def _enqueue_for_verification(self, claim: str, source: str) -> None:
         """Queue a single-source claim for an active probe.
 
@@ -1154,8 +1257,7 @@ class ChallengeSwarm:
         text = (claim or "").strip()
         if not text or "\n" in text or len(text) < self.MIN_TESTABLE_CLAIM_CHARS:
             return
-        budget = int(getattr(self.settings, "verifier_max_probes", 0) or 0)
-        if budget > 0 and self._probe_verified + self._probe_refuted >= budget:
+        if self._probe_budget_exhausted():
             return
         key = normalize(text)
         if not key:
@@ -1188,6 +1290,10 @@ class ChallengeSwarm:
         from backend.verifier import INCONCLUSIVE, VERIFIED
 
         key = normalize(verdict.claim)
+        # Counted before the INCONCLUSIVE early-return: a probe that ran cost a
+        # sandbox round and a strong-model call whatever it concluded, and
+        # VERIFIER_MAX_PROBES has to bound cost, not only outcomes.
+        self._probes_spent += 1
         if verdict.verdict == INCONCLUSIVE:
             return
 
@@ -1847,6 +1953,17 @@ class ChallengeSwarm:
             "probe_refuted": self._probe_refuted,
             "contradictions": self._contradictions,
             "claims_queued": len(self._claim_queue),
+            # Verifier health, not just its verdicts. Without these a fully dead
+            # verifier is indistinguishable from a healthy idle one: every verdict
+            # counter reads 0, `claims_queued` drains to 0, and the audit block in
+            # the briefing reports a swarm that was simply consistent. `triage_failures`
+            # nonzero means the pre-filter is not filtering; a high `forced_commits`
+            # means the role prompt is not landing.
+            "probes_run": getattr(self._verifier, "probes_run", 0),
+            "probes_inconclusive": getattr(self._verifier, "inconclusive", 0),
+            "probes_filtered": getattr(self._verifier, "filtered", 0),
+            "probes_forced_commits": getattr(self._verifier, "forced_commits", 0),
+            "triage_failures": getattr(self._verifier, "triage_failures", 0),
             "agents": {
                 spec: {
                     "findings": self.findings.get(spec, ""),

@@ -19,6 +19,7 @@ from backend.verifier import (
     ROLE_PROMPT,
     ClaimQueue,
     PendingClaim,
+    Triage,
     Verdict,
     build_claim_task,
     parse_verdict,
@@ -34,6 +35,18 @@ def _joined(*texts: str) -> str:
     different slices of what the model said, and a verdict line can land in either.
     """
     return "\n".join(t for t in texts if t and t.strip())
+
+
+def _base_model(spec: str) -> str:
+    """Strip the provider and any effort suffix, so the same weights reached by two
+    routes are recognised as one adjudicator.
+
+    This matters because the quota fallback rebinds a solver mid-run
+    (`claude-sdk/kimi-k3` -> `gateway/kimi-k3`); comparing full specs would treat
+    those as two independent models when they are the same one.
+    """
+    parts = (spec or "").split("/")
+    return parts[1] if len(parts) >= 2 else (spec or "")
 
 
 class VerificationRunner:
@@ -58,6 +71,11 @@ class VerificationRunner:
         self.inconclusive = 0
         # Claims triaged out before any sandbox time was spent on them.
         self.filtered = 0
+        # Triage calls that produced no usable answer. Distinct from `filtered`:
+        # these claims WERE verified, and a nonzero count means the pre-filter is
+        # not actually filtering. Neither counter was exported anywhere, which is
+        # how a fully dead verifier came to look like an idle healthy one.
+        self.triage_failures = 0
         # Probes that ended a turn without a verdict and needed the forced-commit
         # round. A high count means the role prompt is not landing, which is worth
         # seeing rather than hiding behind INCONCLUSIVE.
@@ -130,58 +148,124 @@ class VerificationRunner:
     # One probe
     # ------------------------------------------------------------------
 
-    def _resolve_spec(self) -> str:
+    def _resolve_spec(self, prefer_not: str = "") -> str:
         """Which model verifies. Explicit knob wins, else the strongest solver in
         the lineup — verification is judgement-heavy and a weak model returns
-        INCONCLUSIVE for everything, which is safe but useless."""
+        INCONCLUSIVE for everything, which is safe but useless.
+
+        `prefer_not` is the spec that asserted the claim currently being probed. A
+        probe is empirical, so the same model running a real command is far better
+        than the same model merely agreeing with itself — but it still shares the
+        failure mode that matters here: designing a non-discriminating test and then
+        misreading its output in the same way twice. With the default
+        `VERIFIER_MODEL` unset and `specs[0]` as the fallback, the most prolific
+        claimant was also the adjudicator of its own claims, and a ✅ is the tier
+        every other agent is told to build on freely. Picking a different model when
+        one is available costs nothing.
+        """
         configured = str(getattr(self.swarm.settings, "verifier_model", "") or "").strip()
         if configured:
             return configured
         specs = list(getattr(self.swarm, "_all_specs", None) or self.swarm.model_specs)
-        return specs[0] if specs else ""
+        if not specs:
+            return ""
+        avoid = _base_model(prefer_not)
+        if avoid:
+            for spec in specs:
+                if _base_model(spec) != avoid:
+                    return spec
+        return specs[0]
 
-    async def _ensure_solver(self):
-        """Create the verifier solver + sandbox on first use."""
+    async def _ensure_solver(self, prefer_not: str = ""):
+        """Create the verifier solver + sandbox on first use.
+
+        `prefer_not` only influences the FIRST claim, since one sandbox is then
+        reused for the whole swarm by design. That is a deliberate trade: spinning up
+        a container per claim to guarantee adjudicator independence would cost more
+        wall-clock than the residual risk it removes, and a probe is empirical
+        evidence rather than a second opinion.
+
+        `self._solver` is assigned BEFORE `start()` and torn down on any failure.
+        Both backends bring the container up first and then await more work
+        (`sandbox.exec("uname -m")`, `resolve_model`, the SDK client handshake), so
+        a raise or a cancel in that window leaves a live container that nothing can
+        reach: `stop()` bails out on `self._solver is None`, and because `_loop`
+        catches the error and moves to the next claim, a persistent cause — a typo'd
+        VERIFIER_MODEL, a spec that will not resolve — leaked one container and one
+        workspace per claim for the life of the swarm.
+        """
         async with self._lock:
             if self._solver is not None:
                 return self._solver
-            spec = self._resolve_spec()
+            spec = self._resolve_spec(prefer_not)
             if not spec:
                 return None
             self._spec = spec
             solver = self.swarm.create_verifier(spec, ROLE_PROMPT)
-            await solver.start()
+            # Publish first so a concurrent stop() can still find and tear it down.
             self._solver = solver
+            try:
+                await solver.start()
+            except BaseException:
+                self._solver = None
+                try:
+                    await solver.stop()
+                except Exception as e:  # noqa: BLE001 — already failing; do not mask
+                    logger.warning(
+                        f"[{self.swarm.meta.name}] verifier start failed AND its "
+                        f"sandbox could not be torn down (possible leak): {e}"
+                    )
+                raise
             logger.info(f"[{self.swarm.meta.name}] Verifier online ({spec})")
             return solver
 
-    async def _triage(self, claim: PendingClaim):
+    async def _triage(self, claim: PendingClaim) -> Triage:
         """Cheap pre-filter: is this claim testable AND load-bearing?
 
-        Any failure resolves to "still verify". That is the opposite of the usual
-        fail-safe direction here, and deliberate: triage is an optimisation, and an
-        optimisation that silently disables verification when the gateway hiccups
-        would remove the one mechanism that can catch a false premise. Skipping a
-        probe costs one sandbox round; skipping verification costs the run.
+        Both a raise and a None return resolve to "still verify". That is the
+        opposite of the usual fail-safe direction here, and deliberate: triage is an
+        optimisation, and one that silently disabled verification whenever the
+        gateway hiccuped would remove the only mechanism that can catch a false
+        premise. Skipping a probe costs one sandbox round; skipping verification
+        costs the run.
+
+        The None case is the one that matters in production. `_call_gateway`
+        swallows every transport failure and returns "", which `parse_triage` reads
+        as "not testable" — so a dead gateway used to look exactly like a triage
+        model that had examined every claim and declined all of them, with the only
+        counter (`filtered`) exported nowhere.
         """
-        from backend.verifier import Triage, triage_claim
+        from backend.verifier import triage_claim
 
         meta = self.swarm.meta
+        name = getattr(meta, "name", "") or "chal"
         try:
-            return await triage_claim(
+            triage = await triage_claim(
                 claim=claim.content,
-                name=getattr(meta, "name", ""),
+                name=name,
                 category=getattr(meta, "category", ""),
                 description=getattr(meta, "description", ""),
                 settings=self.swarm.settings,
                 cost_tracker=self.swarm.cost_tracker,
-                agent_name=f"{getattr(meta, 'name', 'chal')}/triage",
+                agent_name=f"{name}/triage",
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — triage is an optimisation
-            logger.debug(f"[{getattr(meta, 'name', '')}] triage failed, verifying anyway: {e}")
+            logger.warning(
+                f"[{name}] triage raised, verifying anyway: {type(e).__name__}: {e}"
+            )
+            self.triage_failures += 1
             return Triage(testable=True, load_bearing=True, probe_hint="")
+        if triage is None:
+            self.triage_failures += 1
+            logger.warning(
+                f"[{name}] triage returned NO answer (gateway unreachable, timeout or "
+                f"truncated) — verifying the claim anyway: {claim.content[:70]!r}. "
+                "If this repeats, verification is running unfiltered; check the gateway."
+            )
+            return Triage(testable=True, load_bearing=True, probe_hint="")
+        return triage
 
     async def _verify_one(self, claim: PendingClaim) -> None:
         swarm = self.swarm
@@ -203,10 +287,17 @@ class VerificationRunner:
                     f"(testable={triage.testable}, load_bearing={triage.load_bearing}): "
                     f"{claim.content[:60]!r}"
                 )
+                # Release the key. `pop()` deliberately leaves it reserved so a claim
+                # cannot be re-queued while pending, but this one is no longer
+                # pending — and without the release a later CONTRADICTION on the same
+                # statement could never be probed: push() returns False on the
+                # reserved key, bump_priority() then finds nothing in _items, and the
+                # strongest signal in the whole design is dropped without a log line.
+                self.queue.release(claim.key)
                 return
             claim.probe_hint = triage.probe_hint or claim.probe_hint
 
-        solver = await self._ensure_solver()
+        solver = await self._ensure_solver(prefer_not=claim.source)
         if solver is None:
             self.queue.release(claim.key)
             return
@@ -276,11 +367,22 @@ class VerificationRunner:
             )
             try:
                 commit_text = await solver.conclude(max(30, budget // 3))
-                # conclude() appends its answer to the solver's accumulated
-                # findings, so scan that too — it is the fullest text available.
-                retry = parse_verdict(
-                    _joined(commit_text, getattr(solver, "findings", ""), text),
-                    claim.content, claim.source)
+                # Parse the commit answer ALONE first. parse_verdict only scans the
+                # last 15 lines, so concatenating commit_text ahead of a full
+                # transcript pushes it out of the window — measured: a correct
+                # "VERDICT: REFUTED | 422 blocked" followed by 30 lines of narration
+                # parsed as INCONCLUSIVE, so the recovery billed a strong-model
+                # conclude call and then threw the answer away. That is worse than
+                # not retrying, because `forced_commits` rose while nothing was
+                # recovered and the premise stayed ⚠ on the board.
+                retry = parse_verdict(commit_text or "", claim.content, claim.source)
+                if not retry.explicit:
+                    # Fall back to everything: conclude() also appends its answer to
+                    # the solver's accumulated findings, and a verdict may sit in the
+                    # first round's output rather than the second's.
+                    retry = parse_verdict(
+                        _joined(getattr(solver, "findings", ""), text, commit_text or ""),
+                        claim.content, claim.source)
                 if retry.explicit:
                     verdict = retry
             except asyncio.CancelledError:

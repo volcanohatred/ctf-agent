@@ -415,11 +415,68 @@ async def test_verification_can_be_disabled() -> None:
 
 async def test_the_probe_budget_is_respected() -> None:
     swarm = _swarm(verifier_max_probes=1)
-    swarm._probe_refuted = 1
+    swarm._probes_spent = 1
 
     await swarm._publish_harvest("m1", "[fact] the uploaded JAR gets loaded by the migrator")
 
     assert len(swarm._claim_queue) == 0
+
+
+async def test_inconclusive_probes_count_against_the_budget() -> None:
+    """The knob caps COST, and a probe that ran cost a sandbox round and a
+    strong-model call whatever it concluded. The old check compared against
+    `_probe_verified + _probe_refuted`, so INCONCLUSIVE was free — and that is the
+    common outcome against an unreachable target and the documented behaviour of a
+    weak verifier model, i.e. exactly the case an operator sets the cap for."""
+    swarm = _swarm(verifier_max_probes=2)
+    claim = "[fact] the uploaded JAR gets loaded by the migrator"
+
+    await swarm._publish_harvest("m1", claim)
+    await swarm._on_verdict(Verdict(INCONCLUSIVE, "target unreachable", 
+                                    "the uploaded JAR gets loaded by the migrator", "m1"))
+    assert swarm._probes_spent == 1
+
+    await swarm._publish_harvest("m2", "[fact] a different claim about the migrator")
+    await swarm._on_verdict(Verdict(INCONCLUSIVE, "target unreachable",
+                                    "a different claim about the migrator", "m2"))
+    assert swarm._probes_spent == 2
+
+    queued_before = len(swarm._claim_queue)
+    await swarm._publish_harvest("m3", "[fact] yet another claim about the migrator")
+    assert len(swarm._claim_queue) == queued_before, (
+        "budget exhausted — the third claim must not be enqueued (the two already "
+        "queued before the budget ran out are unaffected)"
+    )
+    pending = []
+    while len(swarm._claim_queue):
+        item = await swarm._claim_queue.pop(timeout=0.05)
+        if item is None:
+            break
+        pending.append(item.content)
+    assert not any("yet another claim" in c for c in pending)
+
+
+async def test_the_budget_also_bounds_contradiction_probes(monkeypatch) -> None:
+    """Contradiction-driven probes are priority 10 and the most expensive kind, so
+    they are the last thing an operator wants left unbudgeted."""
+    import backend.audit as audit_mod
+
+    async def _found(**kwargs):
+        del kwargs
+        return [Contradiction(a="the allowlist rejects FileOutputStream",
+                              b="FileOutputStream worked in my payload",
+                              why="cannot be both")]
+
+    monkeypatch.setattr(audit_mod, "find_contradictions", _found)
+    swarm = _swarm(audit_contradictions=True, verifier_max_probes=1)
+    swarm._probes_spent = 1
+    await swarm.message_bus.post("m2", "the allowlist rejects FileOutputStream",
+                                 kind=KIND_EXCLUDED)
+
+    await swarm._publish_harvest("m1", "[fact] FileOutputStream worked in my payload")
+
+    assert swarm._contradictions == 1, "the conflict is still detected and broadcast"
+    assert len(swarm._claim_queue) == 0, "but no probe is queued past the budget"
 
 
 # ---------------------------------------------------------------------------

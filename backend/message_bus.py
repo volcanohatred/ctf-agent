@@ -62,9 +62,75 @@ class Finding:
     # LLM-generated key-info summary (for long findings) — used when injecting
     # into sibling prompts. The full `content` is NEVER truncated.
     summary: str = ""
+    # Monotonic sequence assigned by the bus. Per-model cursors track THIS rather
+    # than a list index, which is what makes non-FIFO eviction possible: an index
+    # cursor silently points at the wrong finding the moment an item is removed from
+    # anywhere other than the front.
+    seq: int = 0
 
 
 MAX_FINDINGS = 200
+
+# Eviction order when the board exceeds MAX_FINDINGS — lowest number goes first,
+# oldest within a tier. This used to be blind FIFO, which evicted the OLDEST
+# entries regardless of value: on a long run the ⚡/⛔/🧭 broadcast traffic pushed out
+# the earliest ✅ probe-verified facts and ✗ dead ends, i.e. precisely the two tiers
+# `briefing.build_dossier` marks NEVER_TRIM and a restarted solver most needs. Dead
+# ends rank above claims because a lost dead end gets re-explored, while a lost
+# unverified claim costs nothing.
+TRIM_PRIORITY = {
+    KIND_BROADCAST: 0,
+    KIND_HELP: 1,
+    KIND_CLAIM: 2,
+    KIND_FACT: 3,
+    KIND_EXCLUDED: 4,
+    KIND_VERIFIED: 5,
+}
+
+# Markers the system itself uses to denote trust level, plus the briefing's
+# operator-facing block header. Stripped from the START of model-authored content at
+# every render site, because a solver that writes "[fact] ✅ 已实证：the JAR is loaded"
+# would otherwise appear inside the ⚠ section wearing a ✅ — and the marker system is
+# the only code-level enforcement the trust tiers have. Everything else about it is
+# prose in a prompt.
+#
+# Rendering-only: the stored `content` is never modified, so the audit trail still
+# shows exactly what the model claimed.
+TRUST_MARKERS = "✅✓⚠✗📢⛔⚡🔬🧭❓"
+
+# Leading phrases the system itself uses to assert a trust level. Stripping only the
+# emoji is not enough: "✅ 已实证：X" renders as "已实证：X" inside the ⚠ section and
+# still reads as probe-verified to both a human and the briefing model. Found by a
+# test — the emoji-only version passed its own marker assertion while leaving the
+# forged label intact.
+TRUST_LABELS = (
+    "【建议指令】", "已实证", "已证伪", "探针观察", "探针实证", "未能判定",
+    "检测到矛盾", "剪枝通知", "战略家介入", "战略家复核", "已排除", "未经证实",
+    "仅单一模型声称", "双模型证实", "未证实声称",
+)
+# Decoration that can sit between a marker and the content it is faking authority over.
+_TRUST_DECOR = "*「」【】：: \t"
+
+
+def strip_trust_markers(text: str) -> str:
+    """Remove leading trust markers and trust-label phrases a model put in its own
+    content, so it cannot wear an authority level the system never awarded it.
+
+    Only the leading run is stripped. A marker mid-sentence is ordinary prose
+    ("the ✗ entries are the dead ends") and removing it would corrupt meaning.
+    """
+    out = (text or "").lstrip()
+    while out:
+        if out[0] in TRUST_MARKERS or out[0] in _TRUST_DECOR:
+            out = out[1:].lstrip()
+            continue
+        for label in TRUST_LABELS:
+            if out.startswith(label):
+                out = out[len(label):].lstrip()
+                break
+        else:
+            break
+    return out
 
 
 @dataclass
@@ -81,6 +147,7 @@ class ChallengeMessageBus:
     cursors: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _advice: dict[str, list[str]] = field(default_factory=dict)
+    _next_seq: int = field(default=1)
     max_findings: int = MAX_FINDINGS
     max_advice_per_model: int = 10
 
@@ -88,22 +155,37 @@ class ChallengeMessageBus:
         """Post a finding from a solver. `summary` (optional) is the LLM
         key-info extraction used when injecting into siblings."""
         async with self._lock:
-            self.findings.append(Finding(model=model, content=content, kind=kind, summary=summary))
+            self.findings.append(Finding(model=model, content=content, kind=kind,
+                                         summary=summary, seq=self._next_seq))
+            self._next_seq += 1
             if len(self.findings) > self.max_findings:
-                trim = len(self.findings) - self.max_findings
-                self.findings = self.findings[trim:]
-                self.cursors = {k: max(0, v - trim) for k, v in self.cursors.items()}
-                # Cursors for models that have not polled in a while are now
-                # stale; drop them so they re-read from the start of the list
-                # rather than holding a reference into trimmed history.
-                self.cursors = {k: v for k, v in self.cursors.items() if v >= 0}
+                self._evict(len(self.findings) - self.max_findings)
+
+    def _evict(self, count: int) -> None:
+        """Drop the `count` least valuable findings. Caller holds the lock.
+
+        Cursors need no adjustment: they track `seq`, not position, so removing an
+        item from the middle cannot make one point at the wrong finding. A cursor
+        below the oldest surviving seq simply re-reads from the start, which is the
+        intended recovery.
+        """
+        for _ in range(count):
+            if not self.findings:
+                return
+            worst = min(
+                range(len(self.findings)),
+                key=lambda i: (TRIM_PRIORITY.get(self.findings[i].kind, 1), i),
+            )
+            del self.findings[worst]
 
     async def check(self, model: str) -> list[Finding]:
         """Get unread findings from other models. Advances the cursor."""
         async with self._lock:
             cursor = self.cursors.get(model, 0)
-            unread = [f for f in self.findings[cursor:] if f.model != model]
-            self.cursors[model] = len(self.findings)
+            unread = [f for f in self.findings if f.seq > cursor and f.model != model]
+            # Advance to the highest seq seen, not to len(findings): with eviction the
+            # list length no longer corresponds to any seq.
+            self.cursors[model] = max([f.seq for f in self.findings] or [0], default=0)
             return unread
 
     async def broadcast(self, content: str, source: str = "coordinator") -> None:
@@ -205,7 +287,7 @@ class ChallengeMessageBus:
             return ""
 
         def render(f: Finding) -> str:
-            body = (f.summary or f.content).strip()
+            body = strip_trust_markers((f.summary or f.content).strip())
             return f"- [{f.model}] {body}"
 
         excluded = [f for f in findings if f.kind == KIND_EXCLUDED]

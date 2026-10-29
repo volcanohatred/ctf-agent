@@ -1,4 +1,4 @@
-"""The fresh-restart retry loop — the original design, pinned down.
+﻿"""The fresh-restart retry loop — the original design, pinned down.
 
 The intended mechanism:
   1. after a GAVE_UP, distil that round's attempts and findings into one entry
@@ -16,11 +16,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from test_swarm import DEFAULT_CAP, ScriptedSolver, _flag, _gave_up, _swarm
 
 import backend.round_summary as rs
-from backend.round_summary import SummaryResult
+import backend.summarize as summarize_mod
+import backend.verifier as verifier_mod
+from backend.round_summary import SummaryResult, _call_gateway
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -507,3 +510,118 @@ async def test_default_cap_allows_exactly_one_merge_cycle(monkeypatch) -> None:
     assert solver.rounds == 6
     assert len(rec.meta_calls) == 1
     assert "round cap" in swarm.retire_reason
+
+
+# ---------------------------------------------------------------------------
+# Summarizer budget — measured on a live run, not chosen by taste
+# ---------------------------------------------------------------------------
+# A 13-minute run on a 500-point crypto challenge logged
+# `summarizer truncated at max_tokens=900 ... discarding the reply` five times.
+# The journal merge the tests above depend on is only as good as the distillation
+# feeding it, and the distillation was running on a budget it did not fit.
+
+
+def _gw_settings(**over):
+    base = {"gateway_base_url": "http://gw.test/v1", "gateway_api_key": "k",
+            "summarizer_model": "sum-model",
+            "summarizer_max_tokens": 2500, "summarizer_timeout_s": 60.0,
+            "verifier_triage_max_tokens": 4000, "verifier_triage_timeout_s": 60.0}
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+class _Capture:
+    """MockTransport patch that records the request bodies and client kwargs."""
+
+    def __init__(self, monkeypatch, reply: dict):
+        self.bodies: list[dict] = []
+        self.client_kwargs: list[dict] = []
+        outer = self
+
+        def handler(request):
+            import json as _json
+            outer.bodies.append(_json.loads(request.content))
+            return httpx.Response(200, json=reply)
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.AsyncClient
+
+        class PatchedClient(real):  # type: ignore[misc,valid-type]
+            def __init__(self, *args, **kwargs):
+                outer.client_kwargs.append(kwargs)
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", PatchedClient)
+
+
+def _reply(content: str, finish: str = "stop") -> dict:
+    return {"choices": [{"message": {"content": content}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10}}
+
+
+@pytest.mark.asyncio
+async def test_the_summarizer_budget_comes_from_settings_not_a_literal(monkeypatch) -> None:
+    cap = _Capture(monkeypatch, _reply("distilled"))
+    await _call_gateway("p", _gw_settings(summarizer_max_tokens=2500), "sum-model")
+    assert cap.bodies[0]["max_tokens"] == 2500
+    assert cap.client_kwargs[0]["timeout"] == 60.0
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_budget_still_wins_over_the_summarizer_default(monkeypatch) -> None:
+    """audit / strategist / briefing / triage pass their own measured budget."""
+    cap = _Capture(monkeypatch, _reply("x"))
+    await _call_gateway("p", _gw_settings(), "m", timeout_s=300.0, max_tokens=8000)
+    assert cap.bodies[0]["max_tokens"] == 8000
+    assert cap.client_kwargs[0]["timeout"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_distillation_puts_raw_text_in_the_journal(monkeypatch) -> None:
+    """Pins the degraded-but-lossless behaviour, and why the budget matters.
+
+    `summarize_round` returns `out or text`, so a discarded reply does NOT drop the
+    round — it puts the UNDISTILLED round output in the journal instead. The state
+    stays bounded (meta_summarize falls back to `unique[-N:]`), but five raw blobs
+    replace one merged state card, which is what inflates the restart payload.
+    """
+    _Capture(monkeypatch, _reply("partial reasoning that never finished", finish="length"))
+    raw = "x" * 1200
+    out = await rs.summarize_round(raw, _gw_settings())
+    assert out == raw, "the raw text must survive, not a half-distilled one"
+    assert len(out) > 1000, "and it is the undistilled blob that lands in the journal"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_finding_summary_returns_the_full_text(monkeypatch) -> None:
+    """The board must never carry half a finding labelled as the whole thing.
+
+    `summarize_for_siblings` used to return `choices[0].message.content` with no
+    finish_reason check, so a 700-token cap silently published a truncated summary
+    — and `_summarize_for_board` accepts anything that differs from the input, so
+    the loss was invisible downstream.
+    """
+    _Capture(monkeypatch, _reply("the first half of a long finding", finish="length"))
+    text = "a long finding " * 200
+    assert await summarize_mod.summarize_for_siblings(text, _gw_settings()) == text.strip()
+
+
+@pytest.mark.asyncio
+async def test_finding_summary_uses_the_configured_budget(monkeypatch) -> None:
+    cap = _Capture(monkeypatch, _reply("short"))
+    await summarize_mod.summarize_for_siblings("t" * 3000, _gw_settings(
+        summarizer_max_tokens=2500))
+    assert cap.bodies[0]["max_tokens"] == 2500, "the hardcoded 700 is back"
+
+
+@pytest.mark.asyncio
+async def test_triage_uses_the_configured_budget(monkeypatch) -> None:
+    """A truncated triage means the verifier probes blind, spending the decisive
+    probes VERIFIER_MAX_PROBES exists to ration."""
+    cap = _Capture(monkeypatch, _reply("TESTABLE: yes\nLOAD_BEARING: yes\nWHY: w"))
+    await verifier_mod.triage_claim(
+        claim="q is 286 bits", name="c", category="crypto", description="d",
+        settings=_gw_settings(verifier_triage_max_tokens=4000))
+    assert cap.bodies[0]["max_tokens"] == 4000, "the hardcoded 1500 is back"
+    assert cap.client_kwargs[0]["timeout"] == 60.0, "the hardcoded 25s is back"

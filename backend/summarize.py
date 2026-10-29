@@ -13,6 +13,8 @@ import time
 
 import httpx
 
+from backend.config import float_setting, int_setting
+
 logger = logging.getLogger(__name__)
 
 # Keep it cheap+fast: summarize with a small/fast gateway model by default.
@@ -31,7 +33,7 @@ async def summarize_for_siblings(
     settings: object,
     model: str | None = None,
     max_chars_in: int = 20000,
-    timeout_s: float = 25.0,
+    timeout_s: float | None = None,
     cost_tracker: object | None = None,
     agent_name: str = "",
 ) -> str:
@@ -41,10 +43,18 @@ async def summarize_for_siblings(
     text unchanged (never truncates — a summary failure must not lose info).
     Callers that need to tell "summarized" from "fell back" should compare the
     result against the input.
+
+    A reply cut off by `max_tokens` counts as a failure and returns the original
+    text too. It used to be returned as though complete, so the blackboard could
+    carry the first 700 tokens of a long finding while every reader — including
+    the verifier deciding what to probe — believed it held the whole thing.
     """
     text = text.strip()
     if not text:
         return text
+    if timeout_s is None:
+        timeout_s = float_setting(settings, "summarizer_timeout_s")
+    max_tokens = int_setting(settings, "summarizer_max_tokens")
     base_url = getattr(settings, "gateway_base_url", "") or ""
     api_key = getattr(settings, "gateway_api_key", "") or ""
     if not base_url or not api_key:
@@ -54,7 +64,7 @@ async def summarize_for_siblings(
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": _SUMMARIZE_PROMPT.format(text=text[:max_chars_in])}],
-        "max_tokens": 700,
+        "max_tokens": max_tokens,
         "temperature": 0.2,
     }
     t0 = time.monotonic()
@@ -68,8 +78,15 @@ async def summarize_for_siblings(
             resp.raise_for_status()
             data = resp.json()
             _record(cost_tracker, agent_name, model, data, time.monotonic() - t0)
-            summary = ((data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                       or "").strip()
+            choice = (data.get("choices") or [{}])[0]
+            if str(choice.get("finish_reason", "") or "") == "length":
+                logger.warning(
+                    "%s truncated at max_tokens=%s on %s — keeping the full text "
+                    "rather than publishing half a finding as though it were whole",
+                    agent_name or "summarizer", max_tokens, model,
+                )
+                return text
+            summary = (choice.get("message", {}).get("content", "") or "").strip()
             return summary or text
     except Exception as e:  # noqa: BLE001 — summarizing is always best-effort
         logger.debug("summarize_for_siblings failed (%s) — keeping full text", e)

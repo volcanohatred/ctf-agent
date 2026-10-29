@@ -340,6 +340,7 @@ async def triage_claim(
     that cannot falsify anything still occupies the verifier for a whole round while
     solvers wait on the answer, so filtering happens before the expensive part.
     """
+    from backend.config import float_setting, int_setting
     from backend.round_summary import _call_gateway, _model
 
     prompt = _TRIAGE_PROMPT.format(
@@ -348,12 +349,14 @@ async def triage_claim(
         claim=(claim or "").strip()[:1500],
     )
     raw = await _call_gateway(
-        prompt, settings, _model(settings), timeout_s=25.0,
+        prompt, settings, _model(settings),
+        timeout_s=float_setting(settings, "verifier_triage_timeout_s"),
         cost_tracker=cost_tracker, agent_name=agent_name,
-        # Above the 900 default: a truncated reply is discarded by _call_gateway, so
-        # a tight cap here would turn into "no answer" and then into "verify
-        # everything" — the safe direction, but wasteful and worth not hitting.
-        max_tokens=1500,
+        # A truncated reply is discarded by _call_gateway, so a tight cap here turns
+        # into "no answer" and then into probing blind — the safe direction, but it
+        # spends the decisive probes `verifier_max_probes` exists to ration. The
+        # hardcoded 1500/25s this replaces was observed doing exactly that live.
+        max_tokens=int_setting(settings, "verifier_triage_max_tokens"),
     )
     if not raw:
         return None

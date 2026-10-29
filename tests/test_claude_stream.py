@@ -896,3 +896,66 @@ def test_an_overflow_exception_is_also_recognised() -> None:
     FakeTimeout.__name__ = "APITimeoutError"
     assert classify_exception(FakeTimeout("x")) == INFRA_ERROR
     s.tracer.close()
+
+
+# ── pseudo-command argument parsing ───────────────────────────────────────────
+# Found by a real run, not by reading code: a solver on a 500-point crypto
+# challenge recovered the correct key and submitted it as
+# `submit_flag 'flag{...}'; echo "---"`. The old pattern anchored a non-greedy
+# `(.+?)` to end-of-line, so the payload became `flag{...}'; echo "---` and the
+# answer key rejected a correct solve. The run reported "No flag found".
+
+
+def test_a_chained_command_does_not_pollute_the_flag() -> None:
+    """The exact string observed in the rejected submission."""
+    got = cs._pseudo_arg(
+        "submit_flag 'flag{ca651cdb35a467acf263}'; echo \"---\"", "submit_flag")
+    assert got == "flag{ca651cdb35a467acf263}"
+
+
+def test_quoting_styles_and_separators_all_yield_the_bare_argument() -> None:
+    cases = {
+        "submit_flag flag{plain}": "flag{plain}",
+        "submit_flag 'flag{sq}'": "flag{sq}",
+        'submit_flag "flag{dq}"': "flag{dq}",
+        "submit_flag 'flag{with space inside}'": "flag{with space inside}",
+        "submit_flag 'flag{x}' && echo done": "flag{x}",
+        "submit_flag flag{x}|tee out": "flag{x}",
+        "submit_flag   'flag{x}'   ": "flag{x}",
+    }
+    for cmd, want in cases.items():
+        assert cs._pseudo_arg(cmd, "submit_flag") == want, cmd
+
+
+def test_unbalanced_quoting_falls_back_rather_than_dropping_the_submit() -> None:
+    """A dirty flag can still match the key; a lost submission never can."""
+    assert cs._pseudo_arg("submit_flag 'flag{unbalanced}", "submit_flag") == "flag{unbalanced}"
+
+
+def test_a_missing_or_separator_only_argument_is_no_submission_at_all() -> None:
+    for cmd in ("submit_flag", "submit_flag   ", "submit_flag ; echo hi", "submit_flag |"):
+        assert cs._pseudo_arg(cmd, "submit_flag") is None, cmd
+
+
+def test_a_command_that_merely_starts_with_the_name_is_not_intercepted() -> None:
+    """`submit_flagged` must fall through to the sandbox, not be eaten."""
+    assert cs._pseudo_arg("submit_flagged something", "submit_flag") is None
+    assert cs._pseudo_arg("echo submit_flag 'x'", "submit_flag") is None
+
+
+def test_all_three_pseudo_commands_route_through_the_same_parser() -> None:
+    """Guard against the regex being reintroduced at one call site only."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "backend" / "agents" / "claude_solver.py").read_text(encoding="utf-8")
+    for name in ("submit_flag", "notify_coordinator", "request_help"):
+        assert f'_pseudo_arg(command, "{name}")' in src, f"{name} is not using the shared parser"
+    assert r"(.+?)['\"]?\s*$" not in src, "the end-of-line capture pattern is back"
+
+
+def test_the_notify_and_help_payloads_are_not_polluted_either() -> None:
+    assert cs._pseudo_arg(
+        "notify_coordinator 'q divides p-1?'; grep x", "notify_coordinator") == "q divides p-1?"
+    assert cs._pseudo_arg(
+        "request_help 'stuck on LLL' && ls", "request_help") == "stuck on LLL"

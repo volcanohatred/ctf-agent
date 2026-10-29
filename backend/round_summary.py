@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from backend.config import float_setting, int_setting
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SUMMARIZER_MODEL = "deepseek-v4-flash"
@@ -84,10 +86,10 @@ async def _call_gateway(
     prompt: str,
     settings: object,
     model: str,
-    timeout_s: float = 25.0,
+    timeout_s: float | None = None,
     cost_tracker: object | None = None,
     agent_name: str = "",
-    max_tokens: int = 900,
+    max_tokens: int | None = None,
 ) -> str:
     """One OpenAI-compatible chat completion. Returns "" on any failure.
 
@@ -99,6 +101,16 @@ async def _call_gateway(
     reply that was heading for PIVOT being reported as CONTINUE, which is worse than
     no answer because the swarm then keeps doing the thing that was failing.
     """
+    # None means "this is a summarizer-class call" — resolve the shared budget from
+    # settings. Callers with their own measured budget (audit, strategist, briefing,
+    # triage) pass an explicit value and are unaffected. The previous literals were
+    # 900 tokens / 25s, which a live run showed the summarizer hitting repeatedly;
+    # because a truncated reply is discarded below, every hit silently cost that
+    # round its summary.
+    if max_tokens is None:
+        max_tokens = int_setting(settings, "summarizer_max_tokens")
+    if timeout_s is None:
+        timeout_s = float_setting(settings, "summarizer_timeout_s")
     base_url = getattr(settings, "gateway_base_url", "") or ""
     api_key = getattr(settings, "gateway_api_key", "") or ""
     if not base_url or not api_key:

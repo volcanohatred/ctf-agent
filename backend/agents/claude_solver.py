@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import shlex
 import time
 from collections import deque
@@ -83,6 +82,39 @@ MAX_FINDING_CHARS = 24_000
 BUMP_TRACE_CHARS = 16_000
 
 _STREAM_END = object()
+
+# shlex's default punctuation set, used to tell "no argument at all"
+# (`submit_flag ; echo hi`) apart from a real payload.
+_SHELL_PUNCT = "();<>|&"
+
+
+def _pseudo_arg(command: str, name: str) -> str | None:
+    """Extract the argument of a `name <arg>` bash pseudo-command, or None.
+
+    Tokenised with shlex instead of matched to end-of-line, because a solver that
+    chains commands — `submit_flag 'flag{x}'; echo "---"` — used to get the rest
+    of the command line appended to its flag. The old pattern anchored a
+    non-greedy `(.+?)` to `$`, so it could only ever capture through the final
+    optional quote: the payload became `flag{x}'; echo "---`, which no longer
+    matched the answer key, and a correct solve was discarded as a rejection.
+
+    Unbalanced quoting falls back to the stripped remainder rather than dropping
+    the submission — a slightly dirty flag can still match, a lost one cannot.
+    """
+    if not command.startswith(name):
+        return None
+    rest = command[len(name):]
+    if not rest[:1].isspace():
+        return None
+    try:
+        lex = shlex.shlex(rest, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return rest.strip().strip("'\"") or None
+    if not tokens or not tokens[0].strip(_SHELL_PUNCT):
+        return None
+    return tokens[0]
 
 
 class ClaudeSolver:
@@ -387,23 +419,23 @@ class ClaudeSolver:
         if tool_name == "Bash":
             command = (tool_input.get("command") or "").strip()
 
-            flag_match = re.match(r"submit_flag\s+['\"]?(.+?)['\"]?\s*$", command)
-            if flag_match:
-                return await self._handle_submit(flag_match.group(1).strip(), tool_input)
+            flag_arg = _pseudo_arg(command, "submit_flag")
+            if flag_arg is not None:
+                return await self._handle_submit(flag_arg, tool_input)
 
-            notify_match = re.match(r"notify_coordinator\s+['\"]?(.+?)['\"]?\s*$", command)
-            if notify_match:
+            notify_arg = _pseudo_arg(command, "notify_coordinator")
+            if notify_arg is not None:
                 if not self.notify_coordinator:
                     return self._allow(tool_input, "echo 'No coordinator connected.'")
-                await self.notify_coordinator(notify_match.group(1).strip())
+                await self.notify_coordinator(notify_arg)
                 return self._allow(tool_input, "echo 'Message sent to coordinator.'")
 
-            help_match = re.match(r"request_help\s+['\"]?(.+?)['\"]?\s*$", command)
-            if help_match:
+            help_arg = _pseudo_arg(command, "request_help")
+            if help_arg is not None:
                 from backend.tools.core import do_request_help
 
                 result_msg = await do_request_help(
-                    self.message_bus, self.model_spec, help_match.group(1).strip(),
+                    self.message_bus, self.model_spec, help_arg,
                     notify_coordinator=self.notify_coordinator,
                 )
                 return self._allow(tool_input, f"echo {shlex.quote(result_msg)}")

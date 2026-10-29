@@ -246,6 +246,14 @@ class Settings(BaseSettings):
     sibling_digest_refresh_bumps: int = 1
     # Model used for blackboard summarization (fast/cheap gateway model).
     summarizer_model: str = "deepseek-v4-flash"
+    # Summarizer-class call budget. Measured on a real run: the 900-token default
+    # `_call_gateway` used was hit repeatedly and every truncated reply is
+    # DISCARDED, so those rounds published no summary at all and the swarm fell
+    # back to raw sibling text. 2500 leaves room for a real digest; the timeout
+    # rises with it because a longer completion on the same model takes longer,
+    # and a budget that only the fastest rounds fit is a budget that is usually off.
+    summarizer_max_tokens: int = 2500
+    summarizer_timeout_s: float = 60.0
     # Fact trust gate. A finding one solver asserts is posted as an UNVERIFIED
     # CLAIM; it is promoted to a corroborated FACT only when a DIFFERENT solver
     # independently reports the same thing. This is what stops one model's
@@ -275,6 +283,13 @@ class Settings(BaseSettings):
     # skipped. This is not a cost control, it is a wall-clock control: a probe that
     # cannot falsify anything still occupies the verifier for a whole round.
     verifier_triage: bool = True
+    # Triage call budget. The hardcoded 1500 tokens / 25s it replaced was observed
+    # truncating on a live run: the reply was discarded, triage returned no answer,
+    # and the verifier fell back to probing blind. That is the safe direction but it
+    # spends a decisive probe on claims that were never worth testing, which is the
+    # one resource `verifier_max_probes` exists to protect.
+    verifier_triage_max_tokens: int = 4000
+    verifier_triage_timeout_s: float = 60.0
     # Hard cap on decisive probes per challenge. 0 = unlimited (the claim queue is
     # bounded regardless). Raise it if you want an exhaustive audit and do not care
     # how long it takes.
@@ -315,10 +330,12 @@ class Settings(BaseSettings):
     # the mechanism meant to save the run. 0 disables the interval.
     strategist_min_interval_s: float = 120.0
     # Contradiction audit overrides. Empty/0 = use REASONING_MODEL and the
-    # module defaults.
+    # module defaults. The numeric defaults are duplicated in backend/audit.py
+    # (which imports this module, so it cannot be the other way round);
+    # test_audit.py asserts the two agree.
     audit_model: str = ""
-    audit_timeout_s: float = 120.0
-    audit_max_tokens: int = 4000
+    audit_timeout_s: float = 300.0
+    audit_max_tokens: int = 8000
     # Command-centre chat ("what is the progress on X?"). Summarises a challenge's
     # entire live state — blackboard, per-solver traces, dead ends, audit counters —
     # for an operator who cannot read four hours of logs. Also a reasoning task: it

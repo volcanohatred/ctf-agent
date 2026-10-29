@@ -30,8 +30,19 @@ logger = logging.getLogger(__name__)
 # answer. At the 900 tokens `_call_gateway` used for summarization a reasoning
 # model can be cut off before it emits a single CONTRADICTION line, which reads
 # exactly like "no conflicts found".
-DEFAULT_AUDIT_MAX_TOKENS = 4000
-DEFAULT_AUDIT_TIMEOUT_S = 120.0
+#
+# 4000 was still too tight: a real run on a 500-point crypto challenge emitted
+# 4.6k output tokens on the one audit that succeeded, so the cap was clipping the
+# answer out of the calls that ran longest. 8000 matches STRATEGIST_MAX_TOKENS,
+# which is the same class of task on the same models.
+DEFAULT_AUDIT_MAX_TOKENS = 8000
+# Measured on a real run: the single successful audit took 115.5s against a 120s
+# ceiling, and the other six timed out. The board grows as the run progresses, so
+# audit latency grows with it — a ceiling that only just fits an early round
+# silently disables the audit for the rest of the run, which is worse than not
+# having it: the swarm keeps building on premises nobody is checking. 300s is the
+# bound already validated for the strategist on the same reasoning models.
+DEFAULT_AUDIT_TIMEOUT_S = 300.0
 
 _AUDIT_PROMPT = (
     "你在审计一个 CTF 多智能体队伍的共享黑板。下面是**新写入的陈述**和**板上已有的陈述**。\n"

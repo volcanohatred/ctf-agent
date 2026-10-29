@@ -448,7 +448,7 @@ def test_the_bookkeeping_set_matches_the_claude_backends_interceptions() -> None
 
     Each bookkeeping tool must be one of:
       * intercepted as a bash pseudo-command on the Claude side (matched by its
-        regex form, `r"submit_flag\\s+..."`, not a quoted literal), or
+        structural form, `_pseudo_arg(command, "<name>")`, not a quoted literal), or
       * absent from that backend entirely, like `check_findings`, which ClaudeSolver
         has no equivalent of because it injects board findings from a PostToolUse
         hook every 5 steps instead of exposing a tool.
@@ -461,11 +461,11 @@ def test_the_bookkeeping_set_matches_the_claude_backends_interceptions() -> None
     claude_src = (Path(__file__).resolve().parent.parent
                   / "backend" / "agents" / "claude_solver.py").read_text(encoding="utf-8")
 
-    # A pseudo-command is intercepted iff a regex matches it AND the match returns
-    # before the counter increment. Assert the increment comes after all three.
+    # A pseudo-command is intercepted iff it is parsed AND the parse returns before
+    # the counter increment. Assert the increment comes after all three.
     increment_at = claude_src.index("self._tool_calls += 1")
     for name in BOOKKEEPING_TOOLS:
-        pattern = re.compile(r're\.match\(r"' + re.escape(name) + r"\\s\+")
+        pattern = re.compile(r'_pseudo_arg\(command,\s*"' + re.escape(name) + r'"\)')
         match = pattern.search(claude_src)
         if match is None:
             # Not a pseudo-command there; it must not exist as a tool at all, or it

@@ -884,3 +884,29 @@ async def test_a_probe_result_finds_its_claim_despite_a_volatile_literal() -> No
     kinds = _kinds(swarm)
     assert kinds.get(KIND_VERIFIED), "the claim must have been found and promoted"
     assert not kinds.get(KIND_CLAIM)
+
+
+def test_settings_defaults_agree_with_the_audit_module_defaults() -> None:
+    """Two modules define the same numbers and neither can import the other
+    (audit.py reads Settings, so config.py cannot import audit.py). A real run
+    showed why the values matter: the one audit that succeeded took 115.5s
+    against a 120s ceiling and the other six timed out, so the contradiction
+    audit was silently dead for most of the run. If one side is retuned and the
+    other is not, the drift is invisible until a run stops checking the board.
+    """
+    from backend import audit
+    from backend.config import Settings
+
+    s = Settings()
+    assert s.audit_timeout_s == audit.DEFAULT_AUDIT_TIMEOUT_S
+    assert s.audit_max_tokens == audit.DEFAULT_AUDIT_MAX_TOKENS
+
+
+def test_the_audit_ceiling_fits_a_measured_real_round() -> None:
+    """Regression guard on the measurement itself: the successful audit on a
+    500-point crypto challenge took 115.5s and emitted 4.6k output tokens.
+    A ceiling below either figure turns a working audit into a timeout."""
+    from backend import audit
+
+    assert audit.DEFAULT_AUDIT_TIMEOUT_S > 115.5
+    assert audit.DEFAULT_AUDIT_MAX_TOKENS > 4600

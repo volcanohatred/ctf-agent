@@ -20,6 +20,25 @@ logger = logging.getLogger(__name__)
 MAX_SWARMS_HISTORY = 200
 
 
+def _counter(solver, name: str) -> int:
+    """Read a solver's step/tool counter as an int, whatever the backend stores.
+
+    Prefers the typed public property; falls back to the private attribute (which is
+    a one-element list on the Pydantic backend) so an older or partial solver object
+    still yields a number rather than a list that silently breaks downstream
+    comparisons.
+    """
+    value = getattr(solver, name, None)
+    if value is None:
+        value = getattr(solver, f"_{name}", 0)
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if value else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _archive_swarm(deps: CoordinatorDeps, name: str, swarm) -> None:
     """Snapshot a finished swarm into deps.swarms_history (bounded)."""
     try:
@@ -35,8 +54,12 @@ def _archive_swarm(deps: CoordinatorDeps, name: str, swarm) -> None:
             agents_hist[spec] = {
                 "status": "finished",
                 "findings": swarm.findings.get(spec, ""),
-                "steps": getattr(solver, "_step_count", 0),
-                "tool_calls": getattr(solver, "_tool_calls", 0),
+                # Typed properties, not the private attributes: those are a plain int
+                # on the Claude backend and a one-element LIST on the Pydantic one, so
+                # a raw getattr archived `[0]` for half the lineup and the dashboard's
+                # `!a.tool_calls` zero-work check never fired for them.
+                "steps": _counter(solver, "step_count"),
+                "tool_calls": _counter(solver, "tool_calls"),
             }
         entry = {
             "challenge": name,

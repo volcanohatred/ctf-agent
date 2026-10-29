@@ -313,6 +313,75 @@ async def test_a_genuinely_wrong_flag_still_counts_and_cools_down() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Child-task registry — escalations must be wound down too
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_tasks_are_tracked_and_awaited_on_cancel() -> None:
+    """`run()` used to wind down a snapshot of its loop variable, taken at the START
+    of the iteration. Escalation solvers were added to `pending` mid-iteration, so a
+    cancel landing during the FLAG_FOUND wind-down re-wound-down the stale set and
+    never awaited them — and each escalation owns a container, whose teardown lives in
+    a finally block that an unawaited task is not guaranteed to run.
+    """
+    winner = ScriptedSolver("m1", [_gave_up(), _flag()])
+    slow = ScriptedSolver("m2", [_gave_up()])
+    swarm = _swarm({"m1": winner, "m2": slow}, escalate_after_bumps=1)
+
+    # Queue an escalation as the loop would mid-iteration.
+    swarm._pending_extra.append("claude-sdk/escalated")
+    escalated = ScriptedSolver("escalated", [_gave_up()])
+    real_create = swarm._create_solver
+    swarm._create_solver = lambda spec: (  # type: ignore[method-assign]
+        escalated if spec == "claude-sdk/escalated" else real_create(spec)
+    )
+
+    result = await swarm.run()
+
+    assert result is not None and result.status == FLAG_FOUND
+    assert not swarm._child_tasks, "every child task must be finished and discarded"
+    assert winner.stopped and slow.stopped
+    assert escalated.stopped, "the escalation solver's container must be torn down"
+
+
+@pytest.mark.asyncio
+async def test_child_tasks_are_discarded_as_they_finish() -> None:
+    """The registry must not grow for the life of the swarm. Removal is via a
+    done-callback because a task can finish while run() awaits something else."""
+    a = ScriptedSolver("m1", [_flag()])
+    b = ScriptedSolver("m2", [_gave_up(), _flag()])
+    swarm = _swarm({"m1": a, "m2": b})
+
+    await swarm.run()
+
+    assert swarm._child_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_track_child_keeps_a_strong_reference() -> None:
+    """asyncio holds only a weak reference to tasks, so an untracked one can be
+    collected mid-run — the registry is what keeps it alive as well as wind-down-able."""
+    swarm = _swarm({})
+
+    async def _noop() -> None:
+        return None
+
+    task = asyncio.create_task(_noop())
+    assert swarm._track_child(task) is task
+    assert task in swarm._child_tasks
+
+    await task
+    await asyncio.sleep(0)          # let the done-callback run
+    assert task not in swarm._child_tasks
+
+
+@pytest.mark.asyncio
+async def test_wind_down_with_no_children_is_a_noop() -> None:
+    swarm = _swarm({})
+    await swarm._wind_down()        # must not raise on an empty registry
+
+
+# ---------------------------------------------------------------------------
 # Round cap — the infinite-loop fix
 # ---------------------------------------------------------------------------
 

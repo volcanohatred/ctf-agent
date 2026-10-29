@@ -490,6 +490,139 @@ async def test_verification_can_be_disabled() -> None:
     assert swarm._verifier is None
 
 
+async def test_a_probe_that_overturns_a_refutation_retracts_the_dead_end() -> None:
+    """A refutation is one probe's conclusion, and a better-designed probe can
+    contradict it. Without retraction the board ends up saying ✅ while the dead-end
+    ledger still says ✗ — and the ledger is what feeds `new_lines` (which would keep
+    suppressing the statement as already ruled out) and the Strategist (which would
+    keep being told it is excluded). Every restarting solver would be told both.
+    """
+    swarm = _swarm()
+    claim = "the uploaded JAR is loaded by the migrator"
+
+    await swarm._publish_harvest("m1", f"[fact] {claim}")
+    await swarm._on_verdict(Verdict(REFUTED, "ClassNotFoundException on the first probe",
+                                    claim, "m1"))
+    assert any("证伪" in d for d in swarm._seen_dead_ends)
+
+    # A second, better probe overturns it.
+    await swarm._on_verdict(Verdict(VERIFIED, "marker file written; the first probe "
+                                              "used a class the loader skips",
+                                    claim, "m1"))
+
+    kinds = _kinds(swarm)
+    assert kinds.get(KIND_VERIFIED), "the statement must now be probe-verified"
+    assert not [f for f in kinds.get(KIND_EXCLUDED, []) if "证伪" in f.content], (
+        "the refuted entry must be overturned, not left beside its own correction"
+    )
+    assert not any("证伪" in d for d in swarm._seen_dead_ends), (
+        "the dead-end ledger must be retracted or new_lines keeps suppressing it"
+    )
+
+
+async def test_an_overturned_refutation_broadcasts_a_correction() -> None:
+    """Solvers that abandoned the line when it was refuted need to hear that it is
+    live again — otherwise the retraction only helps whoever restarts afterwards."""
+    swarm = _swarm()
+    claim = "the artifact path is resolved before the allowlist runs"
+
+    await swarm._publish_harvest("m1", f"[fact] {claim}")
+    await swarm._on_verdict(Verdict(REFUTED, "422 on the first probe", claim, "m1"))
+    before = len([f for f in swarm.message_bus.findings if f.kind == "broadcast"])
+
+    await swarm._on_verdict(Verdict(VERIFIED, "200 with the marker written", claim, "m1"))
+
+    corrections = [f for f in swarm.message_bus.findings
+                   if f.kind == "broadcast" and "更正通知" in f.content]
+    assert len(corrections) == 1
+    assert len([f for f in swarm.message_bus.findings if f.kind == "broadcast"]) == before + 1
+
+
+async def test_a_plain_verification_does_not_broadcast_a_correction() -> None:
+    """Retraction is for overturning a refutation. Announcing a "correction" when
+    nothing was corrected is noise that trains solvers to ignore the channel."""
+    swarm = _swarm()
+    claim = "the migrate endpoint returns 422 for blocked class names"
+
+    await swarm._publish_harvest("m1", f"[fact] {claim}")
+    await swarm._on_verdict(Verdict(VERIFIED, "422 observed on three blocked classes",
+                                    claim, "m1"))
+
+    assert _kinds(swarm).get(KIND_VERIFIED)
+    assert not [f for f in swarm.message_bus.findings
+                if f.kind == "broadcast" and "更正通知" in f.content]
+
+
+async def test_an_overturn_invalidates_the_team_digest() -> None:
+    """Same reason a refutation does: the digest was computed while the statement was
+    believed dead, and would otherwise re-seed every restarting solver with that."""
+    swarm = _swarm()
+    claim = "the worker keeps FD 12-48 open across exec"
+
+    await swarm._publish_harvest("m1", f"[fact] {claim}")
+    await swarm._on_verdict(Verdict(REFUTED, "fds closed on the first probe", claim, "m1"))
+    swarm._team_digest = "【队友已排除】the worker keeps FD 12-48 open"
+    swarm._team_digest_gen = 4
+
+    await swarm._on_verdict(Verdict(VERIFIED, "fds 12-48 present in /proc/self/fd",
+                                    claim, "m1"))
+
+    assert swarm._team_digest == ""
+    assert swarm._team_digest_gen == -1
+
+
+async def test_the_dead_end_ledger_is_bounded() -> None:
+    """Every other per-challenge ledger has a cap, but this one grew on every publish
+    AND every refutation. In coordinator mode MAX_ATTEMPTS_PER_CHALLENGE=0 means
+    unlimited rounds, so a multi-day run grew it without bound — and `new_lines`
+    rebuilds a normalized key set plus a sorted join over the whole ledger on every
+    harvest, so the cost was per-round, not just memory."""
+    swarm = _swarm()
+
+    for i in range(swarm.MAX_DEAD_ENDS + 300):
+        await swarm._publish_harvest("m1", f"[excluded] dead end number {i} is unique")
+
+    assert len(swarm._seen_dead_ends) == swarm.MAX_DEAD_ENDS
+
+
+async def test_ledger_trimming_drops_the_oldest_and_keeps_the_newest() -> None:
+    """The Strategist only ever sees the newest 60, and a very old dead end being
+    restated costs a duplicate entry rather than a wrong conclusion — so the old end
+    is the correct one to trim."""
+    swarm = _swarm()
+
+    for i in range(swarm.MAX_DEAD_ENDS + 5):
+        await swarm._publish_harvest("m1", f"[excluded] unique dead end record {i}")
+
+    ledger = "\n".join(swarm._seen_dead_ends)
+    assert f"record {swarm.MAX_DEAD_ENDS + 4}" in ledger, "the newest must survive"
+    assert "unique dead end record 0\n" not in ledger + "\n", "the oldest is what goes"
+
+
+async def test_recording_the_same_dead_end_twice_does_not_grow_the_ledger() -> None:
+    swarm = _swarm()
+
+    await swarm._publish_harvest("m1", "[excluded] the $ref chain is blocked")
+    first = len(swarm._seen_dead_ends)
+    await swarm._publish_harvest("m2", "[excluded] the $ref chain is blocked")
+
+    assert len(swarm._seen_dead_ends) == first
+
+
+async def test_a_refutation_also_goes_through_the_bounded_ledger() -> None:
+    """Refutations append too, so they must be capped by the same path — otherwise
+    the bound only holds for solver-reported dead ends."""
+    swarm = _swarm()
+    swarm._seen_dead_ends.extend([f"filler {i}" for i in range(swarm.MAX_DEAD_ENDS)])
+
+    await swarm._publish_harvest("m1", "[fact] the uploaded JAR gets loaded by the worker")
+    await swarm._on_verdict(Verdict(REFUTED, "ClassNotFoundException on both runs",
+                                    "the uploaded JAR gets loaded by the worker", "m1"))
+
+    assert len(swarm._seen_dead_ends) <= swarm.MAX_DEAD_ENDS
+    assert any("证伪" in d for d in swarm._seen_dead_ends), "the refutation must be recorded"
+
+
 async def test_the_probe_budget_is_respected() -> None:
     swarm = _swarm(verifier_max_probes=1)
     swarm._probes_spent = 1

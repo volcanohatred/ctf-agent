@@ -127,6 +127,30 @@ def split_tagged(text: str) -> tuple[list[str], list[str]]:
     return excluded, facts
 
 
+def _solver_counter(solver, name: str) -> int:
+    """Read a solver's step/tool counter as an int, whatever the backend stores.
+
+    `_step_count` and `_tool_calls` are a plain int on the Claude backend but a
+    one-element LIST on the Pydantic one (which shares the mutable reference with its
+    TracingToolset). A raw `getattr` therefore archived `[0]` for half the lineup, and
+    the dashboard's `!a.tool_calls` zero-work check is false for `[0]` — so the "this
+    agent ran no tools at all" red flag never fired for a Pydantic agent, which is the
+    symptom that once let a benchmark grind through 40 empty rounds per challenge
+    while everything reported healthy.
+    """
+    if solver is None:
+        return 0
+    value = getattr(solver, name, None)
+    if value is None:
+        value = getattr(solver, f"_{name}", 0)
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if value else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def publishable(text: str) -> bool:
     """False for content that must never reach the blackboard."""
     stripped = (text or "").strip()
@@ -202,6 +226,11 @@ class ChallengeSwarm:
     _escalated: bool = field(init=False, default=False)
     _escalation_exhausted: bool = field(init=False, default=False)
     _pending_extra: list[str] = field(init=False, default_factory=list)  # escalation specs to spawn
+    # Every solver task this swarm has spawned, including escalations, kept live
+    # until it finishes. `run()` used to wind down a snapshot of its loop variable,
+    # which missed escalations created mid-iteration — so a cancel arriving during
+    # the FLAG_FOUND wind-down never awaited them, and each owns a container.
+    _child_tasks: set[asyncio.Task] = field(init=False, default_factory=set)
     _journals: dict[str, list[str]] = field(init=False, default_factory=dict)  # per-solver distilled rounds
     # Every spec this swarm has run, including escalations. `model_specs` alone
     # hid escalated solvers from get_status(), the dashboard and the export.
@@ -1065,6 +1094,32 @@ class ChallengeSwarm:
             self._claim_sources.pop(next(iter(self._claim_sources)), None)
         return corroborated, claims, novel
 
+    # Bound on the dead-end ledger. See `_record_dead_ends` for why this exists and
+    # why the oldest entries are the ones dropped.
+    MAX_DEAD_ENDS = 2000
+
+    def _record_dead_ends(self, lines: list[str]) -> None:
+        """Append to the dead-end ledger, keeping it bounded.
+
+        Every other per-challenge ledger has a cap (`_claim_sources` at
+        MAX_CLAIM_KEYS, the bus at MAX_FINDINGS, `_journals` via the merge cycle) but
+        this one did not, and it grows on every publish AND every refutation. In
+        coordinator mode `MAX_ATTEMPTS_PER_CHALLENGE=0` means unlimited rounds, so a
+        multi-day run grew it without bound — and `new_lines()` rebuilds a normalized
+        key set plus a sorted join over the WHOLE ledger on every harvest, so the cost
+        was per-round, not just memory.
+
+        Oldest entries are dropped. That is the right end to trim: the Strategist
+        already only sees the newest 60, and a very old dead end being restated costs
+        a duplicate ledger entry rather than a wrong conclusion.
+        """
+        for line in lines:
+            if line not in self._seen_dead_ends:
+                self._seen_dead_ends.append(line)
+        overflow = len(self._seen_dead_ends) - self.MAX_DEAD_ENDS
+        if overflow > 0:
+            del self._seen_dead_ends[:overflow]
+
     async def _publish_harvest(self, model_spec: str, text: str) -> None:
         """Publish a round's output, routing tagged lines to the right kind.
 
@@ -1090,7 +1145,7 @@ class ChallengeSwarm:
         if excluded:
             fresh = new_lines(excluded, self._seen_dead_ends)
             if fresh:
-                self._seen_dead_ends.extend(fresh)
+                self._record_dead_ends(fresh)
                 body = "\n".join(f"- {e}" for e in fresh)
                 await self._post_finding(model_spec, body, KIND_EXCLUDED)
                 statements.extend(fresh)
@@ -1452,14 +1507,39 @@ class ChallengeSwarm:
                 # The original claim was trimmed or already reclassified; the
                 # evidence is still worth having on the board.
                 await self._post_finding("verifier", verdict.board_text, KIND_VERIFIED)
+            # Retract any dead-end record for this statement. `verify_claims` also
+            # overturns a prior ✗ on the board, but the ledger is separate and feeds
+            # both `new_lines` (which would keep suppressing the statement as already
+            # ruled out) and the Strategist (which would keep being told it is
+            # excluded). Without this a probe that overturns an earlier refutation
+            # leaves the board saying ✅ and the ledger saying ✗, and every restarting
+            # solver is told both.
+            retracted = [d for d in self._seen_dead_ends if key in normalize(d)]
+            if retracted:
+                for entry in retracted:
+                    self._seen_dead_ends.remove(entry)
+                self._team_digest_gen = -1
+                self._team_digest = ""
+                logger.warning(
+                    f"[{self.meta.name}] ✅ probe OVERTURNED an earlier refutation: "
+                    f"{verdict.claim[:90]!r} — retracted {len(retracted)} dead-end "
+                    "record(s) and broadcast a correction"
+                )
+                await self.message_bus.broadcast(
+                    "✅ **更正通知（探针实测）**：先前被判定为死路的一个前提，经更好的探针"
+                    "实测**成立**。它已从死路账本中撤销。\n"
+                    f"陈述：「{verdict.claim}」\n"
+                    f"实测证据：{verdict.evidence}\n"
+                    "如果你此前因为它被排除而放弃了这条线，现在可以重新考虑。",
+                    source="verifier",
+                )
             logger.info(f"[{self.meta.name}] ✅ probe-verified: {verdict.claim[:90]!r}")
             return
 
         self._probe_refuted += 1
         moved = await self.message_bus.refute_claims({key}, note=verdict.evidence)
         line = verdict.board_text
-        if line not in self._seen_dead_ends:
-            self._seen_dead_ends.append(line)
+        self._record_dead_ends([line])
         if not moved:
             await self._post_finding("verifier", line, KIND_EXCLUDED)
         # Invalidate the team digest: it was computed while this premise was still
@@ -1991,8 +2071,28 @@ class ChallengeSwarm:
         except TimeoutError:
             return not self.cancel_event.is_set()
 
-    async def _wind_down(self, pending: set[asyncio.Task]) -> None:
+    def _track_child(self, task: asyncio.Task) -> asyncio.Task:
+        """Register a solver task so `_wind_down` can always see it.
+
+        The strong reference in `_child_tasks` also keeps the task alive: asyncio
+        only holds a weak reference to tasks, so an untracked one can be garbage
+        collected mid-run. Removal is via a done-callback rather than the loop body,
+        because a task can finish while `run()` is awaiting something else.
+        """
+        self._child_tasks.add(task)
+        task.add_done_callback(self._child_tasks.discard)
+        return task
+
+    async def _wind_down(self) -> None:
         """Let siblings finish on their own, cancelling only stragglers.
+
+        Winds down `self._child_tasks` — the live registry — rather than a snapshot
+        passed in by the caller. The old signature took the set from `run()`'s loop
+        variable, which was the iteration's START state: escalation solvers were
+        added to `pending` mid-iteration, so a cancel landing during the FLAG_FOUND
+        wind-down re-wound-down a stale set and never awaited the escalations. Each
+        of those owns a container, and an unawaited task's finally block is not
+        guaranteed to run at loop close.
 
         Solvers already watch `cancel_event` and break out of their stream loop
         within a couple of seconds, which lets each one run its own teardown
@@ -2002,6 +2102,7 @@ class ChallengeSwarm:
         challenge. The grace period is what makes that safe; the cancel is only a
         last resort for a solver wedged inside a single long tool call.
         """
+        pending = {t for t in self._child_tasks if not t.done()}
         if not pending:
             return
         grace = float_setting(self.settings, "solver_teardown_grace_s")
@@ -2017,16 +2118,16 @@ class ChallengeSwarm:
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
-        tasks: set[asyncio.Task] = {
-            asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
-            for spec in self.model_specs
-        }
+        for spec in self.model_specs:
+            self._track_child(asyncio.create_task(self._run_solver(spec),
+                                                  name=f"solver-{spec}"))
 
         try:
-            while tasks:
+            while self._child_tasks:
                 # Timeout so escalations queued mid-run get picked up.
-                done, pending = await asyncio.wait(
-                    tasks, timeout=10, return_when=asyncio.FIRST_COMPLETED
+                done, _pending = await asyncio.wait(
+                    set(self._child_tasks), timeout=10,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
                 # Spawn any escalation solvers queued since last wake
@@ -2034,7 +2135,7 @@ class ChallengeSwarm:
                     spec = self._pending_extra.pop(0)
                     if spec not in self._all_specs:
                         self._all_specs.append(spec)
-                    pending.add(asyncio.create_task(
+                    self._track_child(asyncio.create_task(
                         self._run_escalated_solver(spec), name=f"solver-escalate-{spec}"
                     ))
 
@@ -2049,10 +2150,8 @@ class ChallengeSwarm:
                     result = task.result()
                     if result and result.status == FLAG_FOUND:
                         self.cancel_event.set()
-                        await self._wind_down(pending)
+                        await self._wind_down()
                         return result
-
-                tasks = set(pending)
 
             self.cancel_event.set()
             return self.winner
@@ -2060,12 +2159,12 @@ class ChallengeSwarm:
             # External cancellation (e.g. offline benchmark time limit) —
             # make sure child solver tasks don't linger as orphans.
             self.cancel_event.set()
-            await self._wind_down(tasks)
+            await self._wind_down()
             raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
             self.cancel_event.set()
-            await self._wind_down(tasks)
+            await self._wind_down()
             return None
         finally:
             # The verifier owns a sandbox that nothing else tracks. Every exit path
@@ -2146,7 +2245,7 @@ class ChallengeSwarm:
             "agents": {
                 spec: {
                     "findings": self.findings.get(spec, ""),
-                    "tool_calls": getattr(self.solvers.get(spec), "_tool_calls", 0),
+                    "tool_calls": _solver_counter(self.solvers.get(spec), "tool_calls"),
                     "stale_rounds": self._stale_rounds.get(spec, 0),
                     "status": (
                         "won" if (self.winner and self.winner_spec == spec)

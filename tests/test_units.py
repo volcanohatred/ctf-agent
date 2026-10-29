@@ -293,6 +293,40 @@ def test_help_request() -> None:
     asyncio.run(_run())
 
 
+def test_solver_counters_are_ints_on_both_backends() -> None:
+    """`_step_count` / `_tool_calls` are a plain int on the Claude backend but a
+    one-element LIST on the Pydantic one (which shares the mutable reference with its
+    TracingToolset). Consumers reading the private attribute archived `[0]` for half
+    the lineup, and the dashboard's `!a.tool_calls` zero-work check is FALSE for
+    `[0]` — so the "this agent ran no tools at all" red flag never fired for a
+    Pydantic agent. That is the symptom that once let a benchmark grind through 40
+    empty rounds per challenge while everything reported healthy.
+    """
+    from types import SimpleNamespace
+
+    from backend.agents.swarm import _solver_counter
+
+    claude_shaped = SimpleNamespace(step_count=7, tool_calls=5)
+    pydantic_shaped = SimpleNamespace(_step_count=[7], _tool_calls=[5])
+    zero_pydantic = SimpleNamespace(_step_count=[0], _tool_calls=[0])
+
+    assert _solver_counter(claude_shaped, "tool_calls") == 5
+    assert _solver_counter(pydantic_shaped, "tool_calls") == 5
+    assert _solver_counter(pydantic_shaped, "step_count") == 7
+    # The case that matters: a zero must be falsy so the dashboard flags it.
+    assert _solver_counter(zero_pydantic, "tool_calls") == 0
+    assert not _solver_counter(zero_pydantic, "tool_calls")
+
+
+def test_solver_counter_survives_missing_and_malformed_solvers() -> None:
+    from types import SimpleNamespace
+
+    from backend.agents.swarm import _solver_counter
+
+    assert _solver_counter(None, "tool_calls") == 0
+    assert _solver_counter(SimpleNamespace(), "tool_calls") == 0
+    assert _solver_counter(SimpleNamespace(_tool_calls=[]), "tool_calls") == 0
+    assert _solver_counter(SimpleNamespace(tool_calls="n/a"), "tool_calls") == 0
 def test_round_summary_fallback() -> None:
     """round_summary returns text unchanged when short / gateway absent (never loses info)."""
     import asyncio

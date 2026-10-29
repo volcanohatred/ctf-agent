@@ -212,8 +212,14 @@ class ChallengeMessageBus:
         the board holds ONE entry that says both what is known and how it was
         established. Posting a second "verified" finding instead would duplicate
         every probe result into the team digest.
+
+        Also overturns a prior ✗: a refutation is one probe's conclusion, and a
+        later, better-designed probe can contradict it. Leaving the excluded entry
+        in place would put ✅ and ✗ for the same statement on the board at once and
+        tell every restarting solver both.
         """
-        return await self._reclassify_claims(keys, KIND_VERIFIED, note)
+        return await self._reclassify_claims(keys, KIND_VERIFIED, note,
+                                             from_kinds=(KIND_CLAIM, KIND_EXCLUDED))
 
     async def refute_claims(self, keys: set[str], note: str = "") -> int:
         """Flip claims a probe DISPROVED into excluded dead ends.
@@ -229,12 +235,18 @@ class ChallengeMessageBus:
         """
         return await self._reclassify_claims(keys, KIND_EXCLUDED, note)
 
-    async def _reclassify_claims(self, keys: set[str], new_kind: str, note: str = "") -> int:
-        """Move matching claims to `new_kind`, optionally annotating them.
+    async def _reclassify_claims(self, keys: set[str], new_kind: str, note: str = "",
+                                 from_kinds: tuple[str, ...] = (KIND_CLAIM,)) -> int:
+        """Move matching findings from `from_kinds` to `new_kind`.
 
-        Returns how many moved, so the caller can tell "updated the board" from
-        "the claim had already been trimmed or superseded" and post a fresh entry
-        only in the second case.
+        Returns how many moved, so the caller can tell "updated the board" from "the
+        claim had already been trimmed or superseded" and post a fresh entry only in
+        the second case.
+
+        Only the listed source kinds move. By default that is claims alone: a line
+        already corroborated by two solvers or confirmed by a probe is stronger
+        evidence than one verifier's opinion, and silently downgrading it would throw
+        away work.
         """
         if not keys:
             return 0
@@ -242,10 +254,7 @@ class ChallengeMessageBus:
         async with self._lock:
             moved = 0
             for f in self.findings:
-                # Only claims move. A line already corroborated by two solvers or
-                # confirmed by a probe is stronger evidence than one verifier's
-                # opinion, and silently downgrading it would throw away work.
-                if f.kind == KIND_CLAIM and normalize(f.content) in keys:
+                if f.kind in from_kinds and normalize(f.content) in keys:
                     f.kind = new_kind
                     if note:
                         f.content = f"{f.content.rstrip()}\n  ↳ {note}"

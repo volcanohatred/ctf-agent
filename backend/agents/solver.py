@@ -152,6 +152,30 @@ def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
     return FunctionToolset(tools=tools, max_retries=4)
 
 
+def _partial_messages(exc: BaseException) -> list:
+    """Recover the interrupted round's message history from a RunTimedOut.
+
+    pydantic-ai attaches `all_messages()` to the exception, which is the only way to
+    reach the partial conversation — `Agent.run` never returned a result. Without it
+    `_messages` keeps the PREVIOUS round's history, and the conclude phase then
+    distils a state card about work that is not this round's.
+
+    Returns [] when nothing is recoverable, which the caller must treat as "no
+    harvest possible" rather than "harvest whatever is in _messages".
+    """
+    for accessor in ("all_messages", "new_messages"):
+        fn = getattr(exc, accessor, None)
+        if fn is None:
+            continue
+        try:
+            messages = list(fn())
+        except Exception:  # noqa: BLE001 — a broken accessor must not mask the timeout
+            continue
+        if messages:
+            return messages
+    return []
+
+
 class Solver:
     """A single solver: one model, one container, one challenge."""
 
@@ -205,6 +229,12 @@ class Solver:
         self._model_settings = None
         self._system_prompt = ""
         self._messages: list = []
+        # False when `_messages` does not describe the round that just ended — i.e. a
+        # timeout whose partial history could not be recovered. `conclude()` must then
+        # refuse rather than distil the PREVIOUS round (or, on a first-round timeout,
+        # invent a state card from the system prompt alone), because the swarm
+        # publishes that text to the blackboard as ground truth.
+        self._messages_current = True
         self._step_count = [0]  # mutable ref shared with TracingToolset
         self._tool_calls = [0]  # mutable ref shared with TracingToolset
         self._flag: str | None = None
@@ -217,6 +247,25 @@ class Solver:
     # ------------------------------------------------------------------
     # Findings
     # ------------------------------------------------------------------
+
+    @property
+    def step_count(self) -> int:
+        """Public, typed view of the step counter.
+
+        `_step_count` is a one-element LIST on this backend because `TracingToolset`
+        needs a mutable reference it shares with the agent, and a plain int on the
+        Claude backend. Consumers that read the private attribute directly got `[N]`
+        from one backend and `N` from the other, which leaked into the archive and
+        get_status: in the dashboard `!a.tool_calls` is false for `[0]`, so the
+        "this agent ran zero tools" red flag never fired for a Pydantic agent — the
+        exact symptom that once let a benchmark grind through 40 empty rounds.
+        """
+        return int(self._step_count[0])
+
+    @property
+    def tool_calls(self) -> int:
+        """Public, typed view of the dispatched-tool counter. See `step_count`."""
+        return int(self._tool_calls[0])
 
     @property
     def findings(self) -> str:
@@ -351,6 +400,7 @@ class Solver:
             )
 
             self._messages = result.all_messages()
+            self._messages_current = True
             self._trace_new_messages(result)
             self._maybe_compact_messages()
             await self._handle_output(result.output)
@@ -379,8 +429,26 @@ class Solver:
         if isinstance(e, RunTimedOut) or type(e).__name__ == "RunTimedOut":
             # Phase 1 budget expiry: the session survives, phase 2 can resume it.
             self._interrupted = True
-            self.tracer.event("budget_interrupt", phase="execute", error=text[:200])
-            logger.warning(f"[{self.agent_name}] Time budget hit — turn interrupted")
+            # ...but only if the history actually reflects THIS round. `_messages` is
+            # assigned on success only, so without capturing the partial messages the
+            # conclude phase would distil the PREVIOUS round — or, on a first-round
+            # timeout, nothing at all, in which case the model invents a state card
+            # from the system prompt alone. `_harvest_timeout` publishes that text to
+            # the blackboard and every sibling then treats it as ground truth, so a
+            # stale or fabricated harvest is worse than none.
+            partial = _partial_messages(e)
+            if partial:
+                self._messages = partial
+                self._messages_current = True
+                self._trace_new_messages_from(partial)
+            else:
+                self._messages_current = False
+            self.tracer.event("budget_interrupt", phase="execute", error=text[:200],
+                              partial_messages=len(partial or ()))
+            logger.warning(
+                f"[{self.agent_name}] Time budget hit — turn interrupted "
+                f"({len(partial or ())} message(s) recoverable for the conclude phase)"
+            )
             return self._result(GAVE_UP, deltas, api_error="")
 
         if type(e).__name__ == "RunCancelled" or self.cancel_event.is_set():
@@ -404,9 +472,17 @@ class Solver:
         return self._result(kind, deltas, api_error=text[:300])
 
     def _trace_new_messages(self, result) -> None:
+        self._trace_messages(result.new_messages())
+
+    def _trace_new_messages_from(self, messages) -> None:
+        """Same tracing, for a message list obtained from an exception rather than a
+        completed run."""
+        self._trace_messages(messages)
+
+    def _trace_messages(self, messages) -> None:
         from pydantic_ai.messages import ModelResponse, TextPart
 
-        for msg in result.new_messages():
+        for msg in messages:
             if isinstance(msg, ModelResponse):
                 text_parts = [p.content for p in msg.parts if isinstance(p, TextPart)]
                 text = " ".join(text_parts)
@@ -567,6 +643,20 @@ class Solver:
             self.tracer.event("conclude_skipped", budget_s=budget_s,
                               has_agent=bool(self._agent))
             return ""
+        if not self._messages_current:
+            # `_messages` describes an EARLIER round: the last turn timed out and its
+            # partial history could not be recovered from the exception. Distilling
+            # that would publish a state card about work this round never did — and on
+            # a first-round timeout there is no history at all, so the model would
+            # invent one from the system prompt alone. The swarm publishes this text
+            # to the blackboard and every sibling treats it as ground truth, which is
+            # exactly the case where "nothing" beats "plausible".
+            self.tracer.event("conclude_skipped", reason="history is from a prior round")
+            logger.warning(
+                f"[{self.agent_name}] refusing to conclude: no recoverable history for "
+                "the interrupted round, so any state card would describe the wrong work"
+            )
+            return ""
         t0 = time.monotonic()
         self.tracer.event("conclude_start", budget_s=budget_s, phase="conclude")
         try:
@@ -619,6 +709,10 @@ class Solver:
         round starts with a clean context instead of an ever-growing history.
         """
         self._messages = []
+        # After a hard reset the empty history IS the current state, so a later
+        # conclude is not refused on a stale flag. A timeout in the next round
+        # re-evaluates this from whether its partial messages were recoverable.
+        self._messages_current = True
         self._last_input_tokens = 0
         self.loop_detector.reset()
         self.tracer.event("session_forgotten")

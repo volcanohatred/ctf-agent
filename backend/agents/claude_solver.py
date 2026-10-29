@@ -179,6 +179,23 @@ class ClaudeSolver:
         return text.strip()
 
     @property
+    def step_count(self) -> int:
+        """Public, typed view of the step counter.
+
+        Both backends expose this so consumers stop reading `_step_count` /
+        `_tool_calls` directly: those are a plain int here but a one-element LIST on
+        the Pydantic backend, and the raw value leaked into the archive and
+        get_status. In the dashboard `!a.tool_calls` is false for `[0]`, so the
+        "this agent ran zero tools" red flag never fired for a Pydantic agent.
+        """
+        return int(self._step_count)
+
+    @property
+    def tool_calls(self) -> int:
+        """Public, typed view of the dispatched-tool counter. See `step_count`."""
+        return int(self._tool_calls)
+
+    @property
     def findings(self) -> str:
         """All text this solver produced in the current round."""
         return self._join_blocks(self._finding_blocks)

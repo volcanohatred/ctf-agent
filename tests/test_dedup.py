@@ -28,9 +28,49 @@ def test_normalize_ignores_case_punctuation_and_whitespace(a: str, b: str) -> No
 
 
 def test_normalize_collapses_volatile_addresses() -> None:
-    """The same finding reported with a different ASLR slide is the same finding."""
+    """The same finding reported with a different ASLR slide is the same finding.
+
+    A runtime base address necessarily differs between two observations of the same
+    truth, so collapsing it is what lets two solvers corroborate each other instead
+    of looking like they disagree.
+    """
     assert normalize("libc base at 0x7f8a1c000000") == normalize("libc base at 0x7f9b2d000000")
-    assert normalize("offset 123456 bytes") == normalize("offset 765432 bytes")
+    assert normalize("pie base 0x555555554000") == normalize("pie base 0x55f3a2b1c000")
+    assert normalize("leaked at 1700000001") == normalize("leaked at 1700000002")
+
+
+@pytest.mark.parametrize("a,b", [
+    ("offset of win() is 123456", "offset of win() is 789012"),
+    ("system() is at 0x401234", "system() is at 0x409999"),
+    ("the draft id is 100001", "the draft id is 200002"),
+    ("write(2) to fd 12", "write(2) to fd 48"),
+])
+def test_normalize_preserves_static_values_that_must_agree(a: str, b: str) -> None:
+    """The other half, and the one the blanket rule got wrong.
+
+    A static offset or address is read out of the artifact: if two solvers report
+    different values they are DISAGREEING, not confirming each other. Collapsing
+    those literals made `offset 123456` and `offset 789012` share a key, so the
+    second report "corroborated" the first and promoted a wrong number to a
+    ✓ corroborated fact that every later round was told to build on. audit.py lists
+    exactly this shape as a contradiction, so the two modules disagreed about the
+    same input.
+
+    The previous version of this file asserted the collapsed behaviour for
+    "offset 123456 bytes", which is why the defect shipped: the test encoded it.
+    """
+    assert normalize(a) != normalize(b), f"{a!r} and {b!r} must stay distinct"
+
+
+def test_the_two_normalize_purposes_do_not_conflict() -> None:
+    """Dead-end dedup wants shape ("tried fmtstr" == "tried fmtstr, no write
+    primitive"); corroboration wants value identity. Both read through normalize, so
+    the literal rule has to serve the stricter of the two without breaking the
+    looser one."""
+    # Shape still works for prose without load-bearing numbers.
+    assert normalize("tried fmtstr") == normalize("tried  fmtstr!")
+    # ...while a numeric disagreement is preserved.
+    assert normalize("tried offset 123456") != normalize("tried offset 789012")
 
 
 def test_normalize_keeps_cjk() -> None:

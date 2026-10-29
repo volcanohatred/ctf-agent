@@ -21,26 +21,64 @@ import re
 
 # Keep letters (any script, including CJK) and digits; drop everything else.
 _NON_WORD_RE = re.compile(r"[^\w]", re.UNICODE)
-# Hex addresses and long digit runs vary between rounds for the same finding
-# ("libc base 0x7f8a1c00" vs "0x7f8a2000"). Collapse them so the *shape* of the
-# finding is what gets compared, not the volatile literal.
-_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]{3,}\b")
+# Volatile-literal collapsing, and why it is deliberately narrow.
+#
+# The original rule collapsed EVERY hex literal of 3+ digits and every digit run of
+# 5+, on the reasoning that "libc base 0x7f8a1c00" and "0x7f8a2000" are the same
+# finding under a different ASLR slide. That is true for dead-end dedup, where you
+# want the SHAPE of what was tried. It is false for corroboration, which shares this
+# function: "offset of win() is 123456" and "offset of win() is 789012" collapsed to
+# one key, so two models reporting DIFFERENT offsets were recorded as independently
+# agreeing and promoted to a ✓ corroborated fact that every later round was told to
+# build on. audit.py meanwhile lists "two mutually exclusive concrete values pointing
+# at the same thing" as a contradiction — so the two modules gave opposite answers to
+# the same input.
+#
+# The distinction that actually matters is whether the literal CAN differ between two
+# correct observations:
+#   * a runtime address (mmap/PIE base) necessarily differs per process → collapse
+#   * a static value taken from the artifact must match if both are right → preserve
+# Runtime addresses are recognisable: long, and in the kernel/mmap/PIE ranges.
+_RUNTIME_HEX_PREFIXES = ("7f", "55", "56", "ff")
+_HEX_RE = re.compile(r"\b0x([0-9a-fA-F]{3,})\b")
 _LONG_DIGITS_RE = re.compile(r"\b\d{5,}\b")
+# Digit runs this long are address- or timestamp-scale, not a small static offset or
+# an index. Below it, two models reporting different numbers are disagreeing.
+_DIGIT_COLLAPSE_MIN = 9
+# Hex literals at least this many digits long, with a runtime prefix, are bases.
+_HEX_COLLAPSE_MIN = 10
+
+
+def _collapse_hex(match: re.Match[str]) -> str:
+    """Collapse a runtime address, preserve a static one."""
+    digits = match.group(1)
+    if len(digits) >= _HEX_COLLAPSE_MIN and digits[:2].lower() in _RUNTIME_HEX_PREFIXES:
+        return "0xaddr"
+    return match.group(0)
+
+
+def _collapse_digits(match: re.Match[str]) -> str:
+    return "n" if len(match.group(0)) >= _DIGIT_COLLAPSE_MIN else match.group(0)
+
+
+def normalize(text: str) -> str:
+    """Canonical form used for duplicate detection.
+
+    Case, punctuation and whitespace are always folded. Numeric literals are folded
+    ONLY when they are volatile by nature — see `_RUNTIME_HEX_PREFIXES` and
+    `_DIGIT_COLLAPSE_MIN` for why the blanket version was wrong.
+    """
+    if not text:
+        return ""
+    s = text.strip().lower()
+    s = _HEX_RE.sub(_collapse_hex, s)
+    s = _LONG_DIGITS_RE.sub(_collapse_digits, s)
+    s = _NON_WORD_RE.sub("", s)
+    return s
 
 # A line whose normalized form is contained in an already-recorded line adds
 # nothing; this catches "tried fmtstr" vs "tried fmtstr, no write primitive".
 SUBSUMPTION_MIN_LEN = 12
-
-
-def normalize(text: str) -> str:
-    """Canonical form used for duplicate detection."""
-    if not text:
-        return ""
-    s = text.strip().lower()
-    s = _HEX_RE.sub("0xaddr", s)
-    s = _LONG_DIGITS_RE.sub("n", s)
-    s = _NON_WORD_RE.sub("", s)
-    return s
 
 
 def dedup_lines(lines: list[str]) -> list[str]:

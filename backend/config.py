@@ -175,6 +175,18 @@ class Settings(BaseSettings):
     # 1 = hints join from the first retry. Matches README / .env.example /
     # docker-compose.
     skill_after_bumps: int = 1
+    # Rotate the assigned skill handbook on each retry. This is a SEPARATE mechanism
+    # from the hint injection above, and it used to have no switch of its own —
+    # SKILLS_DIR="" turned off both at once, so there was no way to A/B them and no
+    # way to tell which one was hurting.
+    #
+    # Rotation is the more suspicious of the two: it assigns handbooks in
+    # alphabetical order within a pack, unrelated to what the solver is actually
+    # stuck on, and the bump text is imperative ("本轮专攻新方向…先读再做"). A strong
+    # model ignores an irrelevant instruction; a weaker or quantized one tends to
+    # obey it and spends the round reading. Set false to keep the library mounted
+    # and the hints injected while letting each solver keep its own line of attack.
+    skill_rotate_approaches: bool = True
     # Coordinator model — use your STRONGEST model here (it coaches weaker
     # solvers). Empty = CLI --coordinator-model, else built-in default.
     coordinator_model: str = ""

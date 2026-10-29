@@ -135,6 +135,28 @@ def publishable(text: str) -> bool:
     return classify_api_error(stripped) is None
 
 
+# How the previous round ended, as far as the assigned handbook is concerned.
+#
+# The rotation used to have one outcome — "the solver is back for a bump, so that
+# approach failed" — which is wrong three ways over. A solver comes back for a bump
+# when the wall clock cut it off mid-work, when its context overflowed, when it
+# honestly said still_working, and on an infrastructure error. None of those is
+# evidence against the technique, and with SOLVER_TIME_BUDGET_S=1500 on a hard
+# challenge a solver interrupted 12 times had 12 handbooks recorded as exhausted.
+# That ledger feeds the bump payload ("已试且失败，勿重复"), the escalation briefing,
+# and the Strategist — so the Strategist was told twelve techniques had been tried
+# and failed when in fact the same one had been cut off twelve times, and pivoted
+# the whole swarm away from it.
+APPROACH_FAILED = "failed"          # did real work on it and came back empty
+APPROACH_INTERRUPTED = "interrupted"  # round was cut off — never got a fair trial
+APPROACH_UNENGAGED = "unengaged"    # handed the handbook and never opened it
+
+# Consecutive interrupts tolerated before rotating away anyway. Keeping the
+# direction is right — an interrupt is not a refutation — but unbounded it would
+# retry a genuinely wrong handbook until the round cap.
+MAX_SAME_APPROACH_ROUNDS = 2
+
+
 @dataclass
 class ChallengeSwarm:
     """Parallel solvers racing on one challenge."""
@@ -171,6 +193,9 @@ class ChallengeSwarm:
     # untried technique along with the one that actually failed.
     _failed_approach_paths: list[str] = field(init=False, default_factory=list)
     _assigned_approach: dict[str, str] = field(init=False, default_factory=dict)
+    # Consecutive rounds this solver was cut off while holding the same handbook.
+    # Bounds how long an interrupted direction is kept before rotating anyway.
+    _approach_interrupts: dict[str, int] = field(init=False, default_factory=dict)
     _total_bumps: int = field(init=False, default=0)
     _escalated: bool = field(init=False, default=False)
     _escalation_exhausted: bool = field(init=False, default=False)
@@ -437,40 +462,122 @@ class ChallengeSwarm:
             logger.warning(f"[{self.meta.name}] Skill hint render failed: {e}")
             return ""
 
-    def _next_approach(self, model_spec: str):
-        """Assign the next untried technique to this solver.
+    def _next_approach(self, model_spec: str, outcome: str = APPROACH_FAILED):
+        """Assign this solver's next technique, recording how the last one ended.
 
-        The previously assigned approach is marked as failed (the solver is
-        back for a bump), so retries systematically walk the technique space
-        instead of repeating a dead end.
+        Only a genuine failure is written to the dead-end ledger:
+
+          failed      — the solver did real work on it and came back empty. The
+                        technique was tried and did not pan out; rotate away.
+          interrupted — the round was cut off (wall clock, context overflow, infra).
+                        The technique never got a fair trial, so it is NOT recorded
+                        as failed and the solver KEEPS it, up to
+                        MAX_SAME_APPROACH_ROUNDS consecutive interrupts.
+          unengaged   — the solver was handed the handbook and never opened it.
+                        Rotating is fine, but recording it as a refuted technique
+                        would be a lie, and the Strategist reads this ledger.
+
+        Returns None when rotation is disabled or the queue is exhausted; callers
+        then emit no direction and the solver keeps its own.
         """
+        if not bool(getattr(self.settings, "skill_rotate_approaches", True)):
+            return None
+
         prev_path = self._assigned_approach.get(model_spec)
         if prev_path:
             prev = next((a for a in self._approach_queue if a.path == prev_path), None)
-            if prev and prev.path not in self._failed_approach_paths:
-                self._failed_approach_paths.append(prev.path)
-                if prev.title not in self._failed_approaches:
-                    self._failed_approaches.append(prev.title)
+            if outcome == APPROACH_INTERRUPTED:
+                held = self._approach_interrupts.get(model_spec, 0) + 1
+                self._approach_interrupts[model_spec] = held
+                if prev is not None and held <= MAX_SAME_APPROACH_ROUNDS:
+                    logger.debug(
+                        f"[{self.meta.name}/{model_spec}] round was cut off, not a "
+                        f"failure — keeping approach {prev.title} ({held}/"
+                        f"{MAX_SAME_APPROACH_ROUNDS} consecutive interrupts)"
+                    )
+                    return prev
+            else:
+                self._approach_interrupts[model_spec] = 0
+
+            if outcome == APPROACH_FAILED and prev is not None:
+                if prev.path not in self._failed_approach_paths:
+                    self._failed_approach_paths.append(prev.path)
+                    if prev.title not in self._failed_approaches:
+                        self._failed_approaches.append(prev.title)
+            elif prev is not None and prev.path not in self._failed_approach_paths:
+                # Interrupted past the bound, or never engaged: move on, but do not
+                # add it to the ledger — nothing established that it does not work.
+                logger.debug(
+                    f"[{self.meta.name}/{model_spec}] rotating off {prev.title} "
+                    f"without recording it as failed (outcome={outcome})"
+                )
+
         for a in self._approach_queue:
             if a.path not in self._failed_approach_paths and a.path != prev_path:
                 self._assigned_approach[model_spec] = a.path
                 return a
         return None
 
-    async def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
+    def _approach_outcome(self, solver, model_spec: str, result: SolverResult,
+                          timed_out: bool, overflowed: bool) -> str:
+        """Classify how the last round ended, as far as the assigned handbook goes.
+
+        Order matters: an interrupted or infra round is checked first, because those
+        tell us nothing about the technique. Only a round that ran to completion with
+        real work behind it can be called a failure — and even then only if the solver
+        actually opened the handbook it was handed.
+        """
+        if timed_out or overflowed or result.is_infra_failure or not result.did_work:
+            return APPROACH_INTERRUPTED
+
+        assigned = self._assigned_approach.get(model_spec)
+        if not assigned:
+            return APPROACH_FAILED
+        # Did it ever touch the file? Handing a weak model a handbook path plus
+        # "先读再做" and then recording that handbook as exhausted when the model
+        # never opened it is how the ledger fills up with techniques nobody tried.
+        path = getattr(getattr(solver, "tracer", None), "path", "") or ""
+        if path:
+            try:
+                from backend.trace_read import tool_args_mention
+
+                if not tool_args_mention(path, assigned):
+                    return APPROACH_UNENGAGED
+            except OSError as e:
+                logger.debug(f"[{self.meta.name}/{model_spec}] could not check handbook "
+                             f"engagement: {e}")
+        return APPROACH_FAILED
+
+    async def _build_bump_payload(self, model_spec: str, reason: str, bump_count: int,
+                                  outcome: str = APPROACH_FAILED) -> str:
         """Lean rotation bump: short reason + next untried technique + skill hint
         only from the configured failure threshold onward."""
         parts = [reason]
+
+        # Resolve the rotation FIRST, then render the ledger. The other order made
+        # the message permanently one step behind itself: it announced "本轮专攻新方向 B"
+        # while the 已试且失败 list still did not contain the A that had just failed,
+        # so the solver was told to switch away from a direction nothing said was dead.
+        nxt = self._next_approach(model_spec, outcome)
 
         if self._failed_approaches:
             failed = "、".join(self._failed_approaches)
             parts.append(f"\n🚫 已试且失败（勿重复）：{failed}")
 
-        nxt = self._next_approach(model_spec)
         if nxt:
-            parts.append(
-                f"\n🎯 本轮专攻新方向：【{nxt.title}】（手册 {nxt.path}，先读再做）"
-            )
+            if outcome == APPROACH_INTERRUPTED:
+                # It was cut off, not refuted. Telling a solver to abandon a
+                # direction it was making progress on is how an interrupt becomes a
+                # permanent detour.
+                parts.append(
+                    f"\n🎯 继续上一轮的方向：【{nxt.title}】（手册 {nxt.path}）——"
+                    "上一轮是被时间打断的，不是这个方向错了。这轮用更小的步长推进，"
+                    "把中间结果写进 /challenge/workspace/ 以便再次被打断时能接上。"
+                )
+            else:
+                parts.append(
+                    f"\n🎯 本轮专攻新方向：【{nxt.title}】（手册 {nxt.path}，先读再做）"
+                )
 
         team = await self._team_state(bump_count, model_spec)
         if team:
@@ -1084,7 +1191,8 @@ class ChallengeSwarm:
                 logger.warning(f"[{self.meta.name}] coordinator inbox full — refutation dropped")
 
     async def _fresh_restart(self, solver, model_spec: str, result: SolverResult,
-                             reason: str, bump_count: int) -> None:
+                             reason: str, bump_count: int,
+                             outcome: str = APPROACH_FAILED) -> None:
         """Fresh-restart retry: distill this round into the journal, optionally
         meta-summarize it (dedup) every N rounds, reset the session, and seed a
         clean new attempt carrying ONLY the distilled state — never an
@@ -1128,7 +1236,7 @@ class ChallengeSwarm:
         await self._reset_solver_session(solver)
 
         # 4. build the restart seed and queue it into the fresh session
-        solver.bump(await self._build_restart_payload(model_spec, reason, bump_count))
+        solver.bump(await self._build_restart_payload(model_spec, reason, bump_count, outcome))
 
     @staticmethod
     async def _reset_solver_session(solver) -> None:
@@ -1145,13 +1253,20 @@ class ChallengeSwarm:
             except Exception as e:  # noqa: BLE001 — a failed reset must not kill the round
                 logger.warning("session reset via %s failed: %s", name, e)
 
-    async def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int) -> str:
+    async def _build_restart_payload(self, model_spec: str, reason: str, bump_count: int,
+                                     outcome: str = APPROACH_FAILED) -> str:
         """The seed message for a freshly restarted session.
 
         `reason` explains WHY the previous round ended — time budget exhausted,
         context window exceeded, or simply no flag. It used to be accepted and
         then ignored, so a restarted solver was never told it had timed out or
         blown its context, and could not adjust its behaviour accordingly.
+
+        `outcome` decides whether the handbook it was holding counts as tried-and-
+        failed or as interrupted. A session wipe makes this matter more, not less:
+        the restarted solver no longer remembers the work it was cut off in the
+        middle of, so being told "that direction failed, here is a new one" loses
+        it twice over.
         """
         journal = self._journals.get(model_spec, [])
         state_txt = "\n".join(f"{i+1}. {j}" for i, j in enumerate(journal)) or "(暂无)"
@@ -1168,11 +1283,25 @@ class ChallengeSwarm:
             state_txt,
         ]
         # Rotation: assign the next untried technique
-        nxt = self._next_approach(model_spec)
+        nxt = self._next_approach(model_spec, outcome)
         if nxt:
-            parts.append(
-                f"\n🎯 本轮主攻方向（未试过）：【{nxt.title}】（手册 {nxt.path}，先读再做）"
-            )
+            if outcome == APPROACH_INTERRUPTED:
+                parts.append(
+                    f"\n🎯 接着上一轮的方向做：【{nxt.title}】（手册 {nxt.path}）——"
+                    "上一轮是被时间/上下文打断的，**不是这个方向被否证了**。"
+                    "你的会话已被重置，所以先看上面【探索状态】找回进度，"
+                    "然后用更小的步长继续，中间结果写进 /challenge/workspace/。"
+                )
+            elif outcome == APPROACH_UNENGAGED:
+                parts.append(
+                    f"\n🎯 本轮主攻方向：【{nxt.title}】（手册 {nxt.path}）——"
+                    "上一本手册你并没有真的打开过，所以它不算被否证。"
+                    "这本如果你觉得与当前情况无关，可以跳过它、直接说明理由并按自己的判断走。"
+                )
+            else:
+                parts.append(
+                    f"\n🎯 本轮主攻方向（未试过）：【{nxt.title}】（手册 {nxt.path}，先读再做）"
+                )
         hint = self._skill_hint(bump_count)
         if hint:
             parts += ["", hint]
@@ -1483,16 +1612,23 @@ class ChallengeSwarm:
             # force the distilled fresh-restart path regardless of the setting.
             force_restart = overflowed
 
+            # How the round ended decides whether the handbook this solver was
+            # holding counts as tried-and-failed. Computed here, where timed_out /
+            # overflowed / infra are all in scope, rather than re-derived downstream.
+            outcome = self._approach_outcome(solver, model_spec, result, timed_out, overflowed)
+
             # Fresh-restart mode: distill this round, reset the session, and
             # restart clean carrying only the distilled state (no history bloat).
             # Also forced after a context overflow, where the history is already
             # gone and only the distilled state can carry anything forward.
             if force_restart or int(getattr(self.settings, "fresh_restart_rounds", 5) or 0) > 0:
-                await self._fresh_restart(solver, model_spec, result, reason, bump_count)
+                await self._fresh_restart(solver, model_spec, result, reason, bump_count, outcome)
             else:
-                solver.bump(await self._build_bump_payload(model_spec, reason, bump_count))
+                solver.bump(await self._build_bump_payload(model_spec, reason, bump_count,
+                                                           outcome))
             logger.info(
-                f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
+                f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}, approach={outcome}), "
+                "resuming"
             )
 
         return result, solver

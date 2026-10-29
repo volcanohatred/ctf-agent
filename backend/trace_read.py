@@ -96,6 +96,43 @@ def trace_health(trace_path: str, tail_bytes: int = 65536) -> TraceHealth:
     return health
 
 
+def tool_args_mention(trace_path: str, needle: str, tail_bytes: int = 262144) -> bool:
+    """True when any recorded tool call's arguments contain `needle`.
+
+    Used to tell "the solver tried this handbook and it did not work" from "the
+    solver was handed this handbook and never opened it". The distinction matters
+    because the failed-approach ledger feeds the bump payload, the escalation
+    briefing and the Strategist — recording an unread file as a refuted technique
+    tells all three that a direction was explored and exhausted when nothing of the
+    sort happened, and the Strategist will then pivot away from a paradigm nobody
+    actually tested.
+
+    Matching is on the serialized args of `tool_call` events, so `cat
+    /skills/ctf-pwn/x.md`, `sed -n '1,160p' /skills/...` and a grep of the same
+    path all count. Returns False on any read problem: an unreadable trace must not
+    be taken as proof the file was read, nor as proof it was not — the caller treats
+    False as "no evidence of engagement", which only ever avoids a false accusation.
+    """
+    if not needle:
+        return False
+    want = needle.strip().lower()
+    if not want:
+        return False
+    for ev in _events(trace_path, tail_bytes):
+        if ev.get("type") != "tool_call":
+            continue
+        args = ev.get("args")
+        if args is None:
+            continue
+        try:
+            blob = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            blob = str(args)
+        if want in blob.lower():
+            return True
+    return False
+
+
 def last_model_text(trace_path: str, tail_bytes: int = 65536) -> str:
     """The most recent reasoning text the model produced (model_response event).
 

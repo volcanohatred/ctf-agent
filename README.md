@@ -430,6 +430,74 @@ and distfile extensions; hints are injected on failure bumps at escalating
 levels. If the directory is missing or has no packs, the feature disables
 itself gracefully.
 
+**These are three separable mechanisms, and they are not equally safe.** Whether
+the library helps is an empirical question per model lineup — it is plausible that
+it *hurts* weaker or quantized models, for a concrete reason: handbooks are assigned
+in alphabetical order within a pack, unrelated to what the solver is actually stuck
+on, and the bump text is imperative (`本轮专攻新方向…先读再做`). A strong model judges
+that irrelevant and ignores it; a weaker one tends to obey literally and spends the
+round reading a file that does not apply.
+
+| # | Mechanism | Switch | Risk |
+|---|---|---|---|
+| 1 | Library **mounted** at `/skills` — solver reads only if it chooses | `SKILLS_HOST_DIR` | none; purely opt-in from the model's side |
+| 2 | **Hint injection** — escalating L1 pointer → L2 index excerpt + full file list → L3 similar writeups | `SKILLS_DIR` + `SKILL_AFTER_BUMPS` | context crowding: from L2 every restart payload carries up to ~2.6k chars × 2 packs plus a full file listing, competing with the distilled journal and team digest |
+| 3 | **Approach rotation** — assign the next handbook each retry | `SKILL_ROTATE_APPROACHES` | highest: imperative redirection away from the solver's own line of attack |
+
+Note `SKILL_AFTER_BUMPS=0` does **not** disable hints — the level formula is
+`1 + (bump - N)`, so 0 injects from bump 0. To turn injection off, unset
+`SKILLS_DIR`; the mount (1) is controlled separately by `SKILLS_HOST_DIR`.
+
+Note also that `docker-compose.yml` sets `SKILLS_DIR: /skills`, and compose's
+`environment:` overrides `env_file:`. So (2) and (3) are **active under Docker even
+when `.env` leaves `SKILLS_DIR` empty**, and inactive in host-local mode. If you are
+comparing runs across the two modes, you are not comparing the same configuration.
+
+### Rotation only records a real failure
+
+`_next_approach` used to mark the assigned handbook failed because "the solver is
+back for a bump" — and a solver comes back for a bump when the wall clock cut it off
+mid-work, when its context overflowed, when it honestly said `still_working`, and on
+an infrastructure error. None of those is evidence against the technique. With
+`SOLVER_TIME_BUDGET_S=1500` and a cap of 12, one solver interrupted twelve times
+produced twelve handbooks recorded as exhausted, and that ledger feeds the bump
+payload, the escalation briefing **and the Strategist** — which was therefore told
+twelve techniques had been tried and failed when the same one had been cut off
+twelve times, and pivoted the swarm away from it.
+
+Outcome is now classified three ways, and only the first is recorded:
+
+- `failed` — real work, ran to completion, came back empty, **and the trace shows the
+  handbook was actually opened**. Rotate and record.
+- `interrupted` — cut off. Keep the same direction (the payload says so explicitly:
+  it was interrupted, not refuted) for up to `MAX_SAME_APPROACH_ROUNDS` consecutive
+  interrupts, then rotate **without** recording a failure.
+- `unengaged` — handed the handbook, never opened it. Rotate, but recording it as
+  refuted would be a lie. Absent evidence (an unreadable trace) resolves here too:
+  of the two errors, blacklisting a technique nobody refuted is the worse one.
+
+### A/B recipe
+
+Everything else equal, one variable per arm — `ctf-bench` reports `usable_run`, so
+check that before reading any solve rate:
+
+```bash
+# arm 1: all active                      (current Docker default)
+SKILLS_DIR=/skills SKILL_ROTATE_APPROACHES=true  ctf-bench --challenges-dir challenges
+# arm 2: hints only, solver keeps its own line of attack
+SKILLS_DIR=/skills SKILL_ROTATE_APPROACHES=false ctf-bench --challenges-dir challenges
+# arm 3: passive library — mounted, never injected
+SKILLS_DIR=        SKILLS_HOST_DIR=/host/path    ctf-bench --challenges-dir challenges
+# arm 4: no library at all               (baseline)
+SKILLS_DIR=        SKILLS_HOST_DIR=              ctf-bench --challenges-dir challenges
+```
+
+Arm 1 vs 2 isolates rotation; 2 vs 3 isolates injection; 3 vs 4 asks whether a
+library the model may read on its own initiative is worth anything at all. Use the
+same `--models`, `--time-limit` and challenge set across arms, and run each arm more
+than once if you can — per-challenge variance on a 10-challenge set is large enough
+that a single run's difference is often noise.
+
 ## Offline Challenge Format & Benchmark
 
 Each challenge is a directory with `metadata.yml` (+ optional `distfiles/`):
@@ -459,7 +527,7 @@ conclude harvest can never fire, so every challenge ends as a bare outer timeout
 
 ```bash
 uv sync                      # or: pip install -e ".[dev]"
-uv run pytest -q             # 587 tests, no Docker / no LLM / no network
+uv run pytest -q             # 619 tests, no Docker / no LLM / no network
 uv run ruff check .
 uv run ty check backend
 uv run python tests/import_check.py     # every module imports
@@ -502,7 +570,8 @@ See `.env.example` for all settings (every knob is documented there). Key ones:
 | `CONCLUDE_TIMEOUT_S` | `90` | Independent budget for the phase-2 conclude harvest |
 | `MAX_ATTEMPTS_PER_CHALLENGE` | `12` | Hard cap on retry rounds per solver. 0 = unlimited. Must be ≥ `2×FRESH_RESTART_ROUNDS+1` for two merge cycles |
 | `MAX_INFRA_FAILURES` | `3` | Consecutive infra failures before a swarm retires itself |
-| `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts |
+| `SKILL_AFTER_BUMPS` | `1` | Inject skill hints after N failed attempts. **0 does not disable** (level = 1+bump−N); unset `SKILLS_DIR` for that |
+| `SKILL_ROTATE_APPROACHES` | `true` | Assign the next handbook each retry. Separate switch from hint injection so the two can be A/B'd — see *Skill Library* |
 | `ESCALATE_AFTER_BUMPS` | `8` | Add a stronger solver after N total failed bumps. **0 disables** |
 | `FRESH_RESTART_ROUNDS` | `5` | Meta-summarize the journal every N rounds so carried state stays bounded |
 | `SIBLING_DIGEST_MIN_REPORTS` | `2` | Distinct reports needed before spending a model call on the team digest |
